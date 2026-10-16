@@ -5,6 +5,11 @@ set -euo pipefail
 FW=${1:?plutosdr-fw checkout}; XSA=${2:?system_top.xsa}; HERE=$(cd "$(dirname "$0")" && pwd)
 "$HERE/apply-nano.sh" "$FW"
 mkdir -p "$FW/build" && cp "$XSA" "$FW/build/system_top.xsa"
+# kernel: merge the Nano fragment into the Pluto defconfig
+cat "$HERE/kernel-nano.config" >> "$FW/linux/arch/arm/configs/zynq_pluto_defconfig"
+# buildroot: external tree (aic8800d80) + lean fragment merged into the Pluto defconfig
+cat "$HERE/br-external/configs/pluto_nano_fragment.config" >> "$FW/buildroot/configs/zynq_pluto_defconfig"
+export BR2_EXTERNAL="$HERE/br-external"
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/pluto.frm build/pluto.dfu 2>&1 | tail -30
 ls -la build/pluto.frm build/pluto.dfu; sha256sum build/pluto.frm build/pluto.dfu

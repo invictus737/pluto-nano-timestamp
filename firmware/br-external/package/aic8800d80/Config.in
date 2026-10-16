@@ -1,0 +1,9 @@
+config BR2_PACKAGE_AIC8800D80
+	bool "aic8800d80 (AICSemi AIC8800D80 USB Wi-Fi 6 driver + firmware)"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Out-of-tree kernel modules aic_load_fw and aic8800_fdrv for the
+	  AIC8800D80 USB Wi-Fi adapter (community fork shenmintao/aic8800d80),
+	  plus the firmware blobs installed to /lib/firmware/aic8800D80.
+
+	  https://github.com/shenmintao/aic8800d80

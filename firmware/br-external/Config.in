@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_PLUTO_NANO_PATH/package/aic8800d80/Config.in"
