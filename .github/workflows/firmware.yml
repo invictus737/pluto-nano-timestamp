@@ -1,10 +1,53 @@
-name: firmware (self-hosted Vivado)
-on: { workflow_dispatch: {} }
+name: firmware (GitHub-hosted, Vivado installed in the job)
+on:
+  workflow_dispatch: {}
 jobs:
-  build:
-    runs-on: [self-hosted, vivado-2022.2]
+  hdl:
+    name: Nano bitstream (Vivado 2022.2 on the runner)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - run: source /tools/Xilinx/Vivado/2022.2/settings64.sh && firmware/build.sh
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, swap-storage: true }
+      - run: df -h / /mnt && free -g && nproc
+      - name: Vivado prerequisites
+        run: sudo apt-get update -q && sudo apt-get install -y -q expect libtinfo5 libncurses5 libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 libfontconfig1 locales && sudo locale-gen en_US.UTF-8
+      - name: Fetch the Vivado web installer (private release asset "vivado-installer")
+        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir . && ls -la Xilinx_Unified_2022.2_*_Lin64.bin
+      - name: Install Vivado (Zynq-7000 only)
+        env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}' }
+        run: firmware/vivado-install.sh "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /opt/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /
+      - name: plutosdr-fw v0.38_timestamp (hdl + quantulum IP only)
+        run: |
+          git clone -q -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
+          git -C fw submodule update --init --depth 1 hdl hdl-quantulum
+      - name: Synthesise and implement
+        env: { VIVADO_SETTINGS: /opt/Xilinx/Vivado/2022.2/settings64.sh }
+        run: firmware/build-hdl.sh "$PWD/fw"
       - uses: actions/upload-artifact@v4
-        with: { name: pluto-nano-timestamp-firmware, path: firmware/work/plutosdr-fw/build/pluto.* }
+        with: { name: nano-system_top.xsa, path: fw/build/system_top.xsa, if-no-files-found: error }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: vivado-logs, path: "fw/hdl/projects/pluto/pluto.runs/**/*.log", if-no-files-found: ignore }
+  firmware:
+    name: pluto.frm / pluto.dfu
+    needs: hdl
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with: { tool-cache: false, android: true, dotnet: true, haskell: true, large-packages: true }
+      - name: Build dependencies (as tezuka_fw uses on GitHub-hosted runners)
+        run: sudo apt-get update -q && sudo apt-get install -y -q make gcc g++ zip unzip dfu-util fakeroot u-boot-tools device-tree-compiler mtools bison flex libncurses5-dev libssl-dev bc cpio rsync cmake xz-utils libgmp-dev libmpc-dev libclang-dev libgnutls28-dev curl python3 wget
+      - name: plutosdr-fw v0.38_timestamp (all submodules)
+        run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
+      - uses: actions/download-artifact@v4
+        with: { name: nano-system_top.xsa, path: xsa }
+      - name: Assemble firmware
+        run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
+      - uses: actions/upload-artifact@v4
+        with: { name: pluto-nano-timestamp-firmware, path: "fw/build/pluto.frm\nfw/build/pluto.dfu", if-no-files-found: error }
