@@ -19,6 +19,7 @@ jobs:
           root-reserve-mb: 2048
           temp-reserve-mb: 512
           swap-size-mb: 1024
+          overprovision-lvm: 'true'
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
