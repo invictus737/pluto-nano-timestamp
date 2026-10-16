@@ -49,3 +49,17 @@
 7. **btop** on the device (`btop` over SSH/serial): static ARMv7 musl binary, about 2 MB, built by
    `firmware/build-btop.sh` (Buildroot 2023.02 has no btop package and its GCC 7.3 cannot compile
    btop's C++20). Needs a UTF-8 capable terminal; `TERM=xterm-256color` works over SSH.
+
+8. **musl userland.** The whole rootfs is built with the Bootlin `armv7-eabihf--musl` toolchain instead
+   of ADI's Linaro glibc one: smaller C library, a GCC new enough for C++20, and one ABI for every
+   userland binary. Application binaries target `armv7-unknown-linux-musleabihf` and link
+   dynamically against the rootfs musl and its libraries (SoapySDR loads its device modules with
+   `dlopen`, which a fully static musl binary cannot do). The kernel and U-Boot stay on the
+   plutosdr-fw cross compiler. Packages to verify on musl: libiio/iiod, libad9361, SoapySDR,
+   SoapyPlutoSDR (timestamp fork), wpa_supplicant, dropbear, avahi.
+9. **Room and runtime for one application binary (~16 MB, ~6.5 MB gzip in the initramfs).** No SquashFS:
+   the FIT goes from 12.3 MB to about 19 MB of the 30 MB `firmware` partition, and the unpacked
+   initramfs costs RAM, not flash. Runtime: libSoapySDR + SoapyPlutoSDR module, libiio (local backend),
+   libad9361, libstdc++, `ca-certificates` (TLS with system roots), busybox `ntpd` at boot (no RTC),
+   optional `CONFIG_TUN` + `nftables` + `ip_forward` for IP routing through the application. Persistent
+   state stays in `/mnt/jffs2` (small TOML files only).
