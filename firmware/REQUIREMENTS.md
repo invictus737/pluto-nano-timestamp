@@ -14,7 +14,21 @@
    builds for `ARCH=arm`) plus its firmware blobs for the AIC8800D80 Wi-Fi adapter. Built as a
    buildroot external kernel-module package against the firmware's own kernel; modules are loaded
    on demand so they cost flash, not RAM.
-4. **USB host mode** must stay selectable: the single OTG port is the gadget today (iiod over
-   RNDIS/ECM); a USB adapter needs host mode with external power and a hub, or the second USB
-   port if the board exposes one. The gadget remains the default.
+4. **USB OTG host mode compiled in and selectable at boot (first-rank requirement).** Target
+   setup: a small *powered* USB hub on the Pluto's USB-C port, carrying a Wi-Fi card (AIC8800D80)
+   or a USB Ethernet adapter, with the hub's power also feeding the Pluto through that USB-C port
+   (back-powering the host port). In that mode the station is reached over Wi-Fi/Ethernet, not over
+   the USB gadget. Consequences:
+   - kernel: `CONFIG_USB_CHIPIDEA_HOST` + `UDC`, `USB_EHCI_HCD`, hub support, `USB_NET_*` drivers
+     (`cdc_ether`, `rndis_host`, `r8152`, `asix`, `ax88179_178a`, `cdc_ncm`), `cfg80211`/`mac80211`,
+     the `aic8800d80` out-of-tree modules and their firmware blobs;
+   - device tree: `usb0` stays `dr_mode = "otg"`; the role is chosen by a U-Boot variable
+     (`usb_mode = peripheral|host`, default `peripheral` so iiod over USB keeps working out of the
+     box) applied as a DT fixup at boot; a runtime switch through the ChipIdea role file is kept
+     for tests;
+   - rootfs: `wpa_supplicant` (+ `wpa_cli`), busybox `udhcpc`, a small `/etc/network` policy that
+     brings up `wlan0`/`eth*` when present and starts iiod on them; still no GUI/Python.
+   - electrical: the Nano's USB-C is the only power input; back-powering it from a hub while the
+     Zynq acts as host must be checked on the board (VBUS path, no OTG ID/CC conflict) before relying
+     on it. A hub that does **not** back-power needs a separate 5 V feed to the Pluto.
 5. Keep the vendor's U-Boot and environment (DFU recovery path), replace only `firmware.dfu`.
