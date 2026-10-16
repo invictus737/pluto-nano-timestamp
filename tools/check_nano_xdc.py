@@ -5,7 +5,7 @@ the ADI pluto design must match the pad's configured direction."""
 import csv, re, sys, os
 root = os.path.join(os.path.dirname(__file__), '..')
 xdc = open(os.path.join(root, 'board/nano/system_constr.xdc')).read()
-p2port = {m.group(1): m.group(2) for m in re.finditer(r'PACKAGE_PIN\s+([A-Z]+[0-9]+).*?get_ports\s+\{?\s*([^\s\}\]]+(?:\[[0-9]+\])?)', xdc)}
+p2port = {m.group(1): m.group(2) for m in re.finditer(r'PACKAGE_PIN\s+([A-Z]+[0-9]+).*?get_ports\s+\{?\s*([A-Za-z0-9_]+(?:\[[0-9]+\])?)', xdc)}
 inputs = ('rx_clk_in', 'rx_frame_in', 'rx_data_in', 'spi_miso', 'clk_out')
 outputs = ('tx_clk_out', 'tx_frame_out', 'tx_data_out', 'enable', 'txnrx', 'spi_csn', 'spi_clk', 'spi_mosi')
 bad = 0
