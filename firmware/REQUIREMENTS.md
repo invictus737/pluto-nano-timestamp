@@ -19,15 +19,22 @@
    or a USB Ethernet adapter, with the hub's power also feeding the Pluto through that USB-C port
    (back-powering the host port). In that mode the station is reached over Wi-Fi/Ethernet, not over
    the USB gadget. Consequences:
-   - kernel: `CONFIG_USB_CHIPIDEA_HOST` + `UDC`, `USB_EHCI_HCD`, hub support, `USB_NET_*` drivers
-     (`cdc_ether`, `rndis_host`, `r8152`, `asix`, `ax88179_178a`, `cdc_ncm`), `cfg80211`/`mac80211`,
-     the `aic8800d80` out-of-tree modules and their firmware blobs;
+   - kernel: the v0.38 `zynq_pluto_defconfig` already has `USB_OTG`, `USB_CHIPIDEA_HOST` + `UDC`,
+     `USB_EHCI_HCD`, `USB_USBNET`, `RNDIS_HOST`, `RTL8152`, `SMSC95XX`, `DM9601`, `CFG80211`/`MAC80211`
+     and `MODULES`. To add as modules: `USB_NET_CDCETHER`, `USB_NET_AX8817X`, `USB_NET_AX88179_178A`,
+     `USB_NET_CDC_NCM`; out of tree: `aic8800d80` (`aic_load_fw`, `aic8800_fdrv`) + firmware blobs;
    - device tree: `usb0` stays `dr_mode = "otg"`; the role is chosen by a U-Boot variable
      (`usb_mode = peripheral|host`, default `peripheral` so iiod over USB keeps working out of the
      box) applied as a DT fixup at boot; a runtime switch through the ChipIdea role file is kept
      for tests;
-   - rootfs: `wpa_supplicant` (+ `wpa_cli`), busybox `udhcpc`, a small `/etc/network` policy that
-     brings up `wlan0`/`eth*` when present and starts iiod on them; still no GUI/Python.
+   - rootfs: keep the stock Pluto mechanism, which is already the simplest possible: ADI's
+     firmware ships `wpa_supplicant`, `wpa_cli`, `iw` and reads **`[WLAN] ssid_wlan / pwd_wlan /
+     ipaddr_wlan`** from `config.txt` on the mass-storage drive (or `fw_setenv ssid_wlan ...`),
+     then brings `wlan0` up itself on a USB dongle. No new tooling: the user writes SSID and
+     password in `config.txt`, ejects, done. What changes: add the `aic8800d80` driver and its
+     firmware so the AIC dongle is one of the supported adapters, and drop the stock Ralink/Realtek
+     blobs (`BR2_PACKAGE_LINUX_FIRMWARE_RALINK_*`, `RTL_8*`) that only cost flash. USB Ethernet
+     gets its address by `udhcpc` the same way the stock image handles `eth0`.
    - electrical: the Nano's USB-C is the only power input; back-powering it from a hub while the
      Zynq acts as host must be checked on the board (VBUS path, no OTG ID/CC conflict) before relying
      on it. A hub that does **not** back-power needs a separate 5 V feed to the Pluto.
