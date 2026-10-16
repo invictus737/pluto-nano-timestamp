@@ -7,6 +7,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
+      - name: Nano constraints vs decoded vendor pads
+        run: python3 tools/check_nano_xdc.py
       - name: prjxray + Zynq-7000 database
         run: tools/fetch_db.sh
       - name: official ADI v0.39 Pluto bitstream (CLG225) and constraints
