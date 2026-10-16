@@ -9,10 +9,7 @@ XDC=$HERE/../board/nano/system_constr.xdc
 mkdir -p "$WORK" && cd "$WORK"
 [ -d plutosdr-fw ] || git clone --recursive -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git
 cd plutosdr-fw
-sed -i 's/xc7z010clg225-1/xc7z010clg400-1/' hdl/projects/pluto/system_project.tcl
-cp "$XDC" hdl/projects/pluto/system_constr.xdc
-# device tree: apply the Nano differences (kept as a patch next to this script once finalised)
-[ -f "$HERE/nano-dt.patch" ] && git -C linux apply "$HERE/nano-dt.patch"
+git -C hdl status --short | grep -q . || "$HERE/apply-nano.sh" "$PWD"
 export TARGET=pluto
 make -j"$(nproc)"
 ls -la build/pluto.frm build/pluto.dfu

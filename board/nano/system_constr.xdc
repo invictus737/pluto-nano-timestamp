@@ -227,3 +227,17 @@ set_property PACKAGE_PIN F2 [get_ports ddr_dqs_n[1]]
 set_false_path -from [get_pins {i_system_wrapper/system_i/axi_ad9361/inst/i_rx/i_up_adc_common/up_adc_gpio_out_int_reg[0]/C}]
 set_false_path -from [get_pins {i_system_wrapper/system_i/axi_ad9361/inst/i_tx/i_up_dac_common/up_dac_gpio_out_int_reg[0]/C}]
 set_false_path -from [get_pins {i_system_wrapper/system_i/manual_decim/U0/gpio_core_1/Not_Dual.gpio_Data_Out_reg[0]/C}]
+# --- ADI pluto Rev.C ports the tezuka nano project does not have ------------
+# The ADI/pgreenland system_top keeps clk_out (input) and pl_gpio[4:0] (inout,
+# clock-mux control on Rev.C). The vendor bitstream drives six pads that the
+# tezuka nano design leaves alone: outputs L14 M14 M15 N16, inputs N15 U13.
+# They are assigned here so every top-level port is constrained (Vivado DRC
+# UCIO-1); pl_gpio stay tri-stated inputs unless Linux drives them. Which of
+# the six is which on the PCB is NOT verified: do not drive them from software
+# until measured.
+set_property  -dict {PACKAGE_PIN  N15  IOSTANDARD LVCMOS18} [get_ports clk_out]
+set_property  -dict {PACKAGE_PIN  L14  IOSTANDARD LVCMOS18} [get_ports pl_gpio[0]]
+set_property  -dict {PACKAGE_PIN  M14  IOSTANDARD LVCMOS18} [get_ports pl_gpio[1]]
+set_property  -dict {PACKAGE_PIN  M15  IOSTANDARD LVCMOS18} [get_ports pl_gpio[2]]
+set_property  -dict {PACKAGE_PIN  N16  IOSTANDARD LVCMOS18} [get_ports pl_gpio[3]]
+set_property  -dict {PACKAGE_PIN  U13  IOSTANDARD LVCMOS18} [get_ports pl_gpio[4]]
