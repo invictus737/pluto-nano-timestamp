@@ -36,12 +36,14 @@ assert any(x.endswith('Zynq-7000:1') for x in out), out
 s = s[:m.start(1)] + ','.join(out) + s[m.end(1):]
 open(p, 'w').write(s)
 PY
-sed -i 's/^CreateProgramGroupShortcuts=.*/CreateProgramGroupShortcuts=0/; s/^CreateDesktopShortcuts=.*/CreateDesktopShortcuts=0/; s/^CreateFileAssociation=.*/CreateFileAssociation=0/' "$CFG"
+sed -i 's/^EnableDiskUsageOptimization=.*/EnableDiskUsageOptimization=0/; s/^CreateProgramGroupShortcuts=.*/CreateProgramGroupShortcuts=0/; s/^CreateDesktopShortcuts=.*/CreateDesktopShortcuts=0/; s/^CreateFileAssociation=.*/CreateFileAssociation=0/' "$CFG"
 echo "--- install_config.txt"; cat "$CFG"
 # 3. install (downloads only the selected modules)
 df -h "$DEST" "$HOME" /tmp
 if ! ./xsetup --agree XilinxEULA,3rdPartyEULA --batch Install --config "$CFG"; then
-  echo "--- installer logs"; find "$HOME/.Xilinx" -name '*.log' -newer "$CFG" -exec tail -n 60 {} \; 2>/dev/null | grep -i -E "space|size|require|GB|MB|error" | head -40
+  echo "--- installer log (space check)"
+  LOG=$(ls -t "$HOME"/.Xilinx/xinstall/*.log 2>/dev/null | head -1); echo "log: $LOG"
+  grep -n -i -E "space|size|bytes|free|require|archive|module:|dest:" "$LOG" | tail -80
   exit 1
 fi
 du -sh "$DEST"; ls "$DEST"/Vivado
