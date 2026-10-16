@@ -1,0 +1,11 @@
+#!/bin/sh
+# Both Cortex-A9 cores. The vendor/ADI U-Boot environment boots with maxcpus=1 and this
+# firmware keeps the vendor environment partition (DFU recovery path), so the setting is
+# corrected here once; it takes effect from the next boot. Override: fw_setenv maxcpus 1.
+case "$1" in
+  start)
+    [ "$(fw_printenv -n maxcpus 2>/dev/null)" = "1" ] && [ ! -e /mnt/jffs2/.maxcpus_user ] && \
+      fw_setenv maxcpus 2 && echo "maxcpus set to 2 (active after reboot)"
+    ;;
+esac
+exit 0

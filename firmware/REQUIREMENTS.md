@@ -39,3 +39,9 @@
      Zynq acts as host must be checked on the board (VBUS path, no OTG ID/CC conflict) before relying
      on it. A hub that does **not** back-power needs a separate 5 V feed to the Pluto.
 5. Keep the vendor's U-Boot and environment (DFU recovery path), replace only `firmware.dfu`.
+
+6. **Both CPU cores, stock clock.** `maxcpus=2` (vendor environment boots with 1; `S05cpus` fixes it
+   once, override with `fw_setenv maxcpus 1`). CPU stays at 667 MHz (BogoMIPS 333.33 per core is the
+   global-timer rate, CPU/2), DDR untouched: tezuka documents marginal DDR on Nano boards, so no
+   DDR increase. A CPU-only overclock FSBL (`boot.dfu`) is a separate, opt-in image after a
+   `memtester` run; a bad FSBL disables DFU recovery (JTAG only).
