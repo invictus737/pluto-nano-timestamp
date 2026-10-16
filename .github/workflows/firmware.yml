@@ -32,20 +32,21 @@ jobs:
       # although Zynq-7000 only writes far less. Root (~42 GB free after cleanup) and the temp
       # disk (~70 GB) are joined into one LVM volume backed by sparse files, so the reported size
       # passes the check while real usage stays within the physical space of both disks.
-      - name: Build volume (sparse LVM over root + temp disk at /mnt/build)
+      - name: Build volume (sparse, on the temp disk only; the root disk keeps the runner's own space)
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: |
           sudo swapoff -a || true; sudo rm -f /mnt/swapfile /swapfile
-          ROOT_FREE=$(df --output=avail -BG / | tail -1 | tr -dc 0-9); TMP_FREE=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)
-          echo "root free ${ROOT_FREE}G, temp free ${TMP_FREE}G"
-          # temp disk first: a linear LV fills its first PV first, so the root disk (which also holds
-          # the runner's own logs) is only touched once the temp disk is full; 8 GB stay free on root.
-          sudo truncate -s $((ROOT_FREE - 8))G /pv-root.img
-          sudo truncate -s $((TMP_FREE - 1))G /mnt/pv-tmp.img
-          A=$(sudo losetup --find --show /mnt/pv-tmp.img); B=$(sudo losetup --find --show /pv-root.img)
-          sudo pvcreate -q "$A" "$B" && sudo vgcreate -q buildvg "$A" "$B" && sudo lvcreate -q -l 100%FREE -n buildlv buildvg "$A" "$B"
-          sudo mkfs.ext4 -q -m0 -E lazy_itable_init=1,nodiscard /dev/buildvg/buildlv
-          sudo mkdir -p /mnt/build && sudo mount -o noatime /dev/buildvg/buildlv /mnt/build
+          TMP_FREE=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9); echo "temp free ${TMP_FREE}G"
+          # declared size is twice the physical free space: the Vivado installer insists on 55 GB
+          # free although a Zynq-7000-only install plus its download is far smaller
+          sudo truncate -s $((TMP_FREE * 2))G /mnt/pv-tmp.img
+          A=$(sudo losetup --find --show /mnt/pv-tmp.img)
+          sudo mkfs.ext4 -q -m0 -E lazy_itable_init=1,nodiscard "$A"
+          sudo mkdir -p /mnt/build && sudo mount -o noatime "$A" /mnt/build && sudo chown runner:runner /mnt/build
+          # everything the installer writes goes there: home cache, temp, download staging
+          mkdir -p /mnt/build/home-xilinx /mnt/build/tmp && rm -rf ~/.Xilinx && ln -s /mnt/build/home-xilinx ~/.Xilinx
+          echo "TMPDIR=/mnt/build/tmp" >> "$GITHUB_ENV"
+          echo "_JAVA_OPTIONS=-Djava.io.tmpdir=/mnt/build/tmp" >> "$GITHUB_ENV"
           df -h / /mnt /mnt/build
       - if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: df -h / /mnt/build && free -g && nproc && sudo mkdir -p /mnt/build/Xilinx /mnt/build/work && sudo chown -R runner:runner /mnt/build
