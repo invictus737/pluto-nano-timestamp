@@ -15,7 +15,7 @@ export BR2_EXTERNAL="$HERE/br-external"
 LINARO=gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf
 if [ ! -x "$HERE/work-linaro/$LINARO/bin/arm-linux-gnueabihf-gcc" ]; then
   mkdir -p "$HERE/work-linaro"
-  curl -sL "https://releases.linaro.org/components/toolchain/binaries/7.3-2018.05/arm-linux-gnueabihf/$LINARO.tar.xz" | tar xJ -C "$HERE/work-linaro"
+  curl -sL "https://sources.buildroot.net/toolchain-external-linaro-arm/$LINARO.tar.xz" | tar xJ -C "$HERE/work-linaro"
 fi
 export PATH="$HERE/work-linaro/$LINARO/bin:$PATH"
 arm-linux-gnueabihf-gcc --version | head -1
