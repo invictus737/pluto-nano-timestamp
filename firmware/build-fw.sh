@@ -10,6 +10,15 @@ cat "$HERE/kernel-nano.config" >> "$FW/linux/arch/arm/configs/zynq_pluto_defconf
 # buildroot: external tree (aic8800d80) + lean fragment merged into the Pluto defconfig
 cat "$HERE/br-external/configs/pluto_nano_fragment.config" >> "$FW/buildroot/configs/zynq_pluto_defconfig"
 export BR2_EXTERNAL="$HERE/br-external"
+# Kernel and U-Boot keep ADI's compiler (Linaro GCC 7.3 arm-linux-gnueabihf). plutosdr-fw used to take
+# it from Buildroot's external toolchain; the rootfs is musl now, so provide it separately on PATH.
+LINARO=gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf
+if [ ! -x "$HERE/work-linaro/$LINARO/bin/arm-linux-gnueabihf-gcc" ]; then
+  mkdir -p "$HERE/work-linaro"
+  curl -sL "https://releases.linaro.org/components/toolchain/binaries/7.3-2018.05/arm-linux-gnueabihf/$LINARO.tar.xz" | tar xJ -C "$HERE/work-linaro"
+fi
+export PATH="$HERE/work-linaro/$LINARO/bin:$PATH"
+arm-linux-gnueabihf-gcc --version | head -1
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/pluto.frm build/pluto.dfu 2>&1 | tail -30
 ls -la build/pluto.frm build/pluto.dfu; sha256sum build/pluto.frm build/pluto.dfu
