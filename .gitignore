@@ -1,0 +1,12 @@
+# bitstreams, firmware images and vendor binaries never go in this repo
+*.bit
+*.bin
+*.dfu
+*.frm
+*.xsa
+*.zip
+*.tar.gz
+tools/venv/
+tools/db/
+__pycache__/
+work/

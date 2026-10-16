@@ -1,0 +1,10 @@
+name: firmware (self-hosted Vivado)
+on: { workflow_dispatch: {} }
+jobs:
+  build:
+    runs-on: [self-hosted, vivado-2022.2]
+    steps:
+      - uses: actions/checkout@v4
+      - run: source /tools/Xilinx/Vivado/2022.2/settings64.sh && firmware/build.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: pluto-nano-timestamp-firmware, path: firmware/work/plutosdr-fw/build/pluto.* }

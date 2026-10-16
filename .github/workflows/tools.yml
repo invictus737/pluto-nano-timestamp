@@ -1,0 +1,22 @@
+name: tools
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  validate-decoder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: prjxray + Zynq-7000 database
+        run: tools/fetch_db.sh
+      - name: official ADI v0.39 Pluto bitstream (CLG225) and constraints
+        run: |
+          mkdir -p work && cd work
+          curl -sL -o fw.zip https://github.com/analogdevicesinc/plutosdr-fw/releases/download/v0.39/plutosdr-fw-v0.39.zip
+          unzip -q fw.zip pluto.dfu
+          curl -sL -o pluto_system_constr.xdc https://raw.githubusercontent.com/analogdevicesinc/hdl/main/projects/pluto/system_constr.xdc
+      - name: extract the FIT bitstream and decode it
+        run: |
+          python3 tools/fit_extract.py work/pluto.dfu fpga@1 work/adi.bit
+          tools/venv/bin/python tools/iob_decode.py work/adi.bit tools/db xc7z010clg225-1 > work/adi.txt
+          tools/venv/bin/python tools/validate_adi.py work/adi.bit.iob.json work/pluto_system_constr.xdc tools/db/zynq7/xc7z010clg225-1/package_pins.csv
