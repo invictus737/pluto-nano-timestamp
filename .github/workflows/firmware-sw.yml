@@ -1,0 +1,33 @@
+name: firmware software check (stand-in bitstream, NOT for flashing)
+# Builds kernel + musl rootfs + FIT exactly like firmware.yml, but with pgreenland's CLG225
+# system_top.xsa as a stand-in, so the software side can be validated without Vivado.
+# The output does not match the Nano's pinout and must never be flashed.
+on: { workflow_dispatch: {} }
+jobs:
+  software:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with: { tool-cache: false, android: true, dotnet: true, haskell: true, large-packages: true }
+      - name: Build dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q make gcc g++ zip unzip dfu-util fakeroot u-boot-tools device-tree-compiler mtools bison flex libncurses5-dev libssl-dev bc cpio rsync cmake xz-utils libgmp-dev libmpc-dev libclang-dev libgnutls28-dev curl python3 wget
+      - name: plutosdr-fw v0.38_timestamp (all submodules)
+        run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
+      - name: Stand-in xsa (pgreenland release, CLG225)
+        run: mkdir -p xsa && curl -sL -o xsa/system_top.xsa https://github.com/pgreenland/plutosdr-fw/releases/download/v0.38_with_timestamping/system_top.xsa && ls -la xsa
+      - name: btop (static ARMv7 musl, into the rootfs overlay)
+        run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay
+      - name: Assemble firmware
+        run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
+      - name: Image report
+        if: always()
+        run: |
+          ls -la fw/build/ || true
+          du -sh fw/buildroot/output/target 2>/dev/null || true
+          ls -la fw/buildroot/output/target/usr/bin/btop fw/buildroot/output/target/lib/firmware/aic8800D80 2>/dev/null | head || true
+          find fw/buildroot/output/target -name '*.ko' 2>/dev/null | head -20 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: software-check-DO-NOT-FLASH, path: "fw/build/pluto.frm\nfw/build/pluto.dfu\nfw/buildroot/output/build/*/build.log", if-no-files-found: ignore }
