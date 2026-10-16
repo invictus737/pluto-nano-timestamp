@@ -13,19 +13,22 @@ jobs:
       - name: Free disk space (preinstalled SDKs, tool cache, large packages)
         uses: jlumbroso/free-disk-space@v1.3.1
         with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, docker-images: true, swap-storage: true }
-      - name: Maximize build space (root + temp disk merged into one LVM volume at /mnt/build)
-        uses: easimon/maximize-build-space@v10
-        with:
-          root-reserve-mb: 2048
-          temp-reserve-mb: 512
-          swap-size-mb: 1024
-          overprovision-lvm: 'true'
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          build-mount-path: /mnt/build
+      # The Vivado 2022.2 web installer refuses to start below 55 GB free on the destination,
+      # although Zynq-7000 only writes far less. Root (~42 GB free after cleanup) and the temp
+      # disk (~70 GB) are joined into one LVM volume backed by sparse files, so the reported size
+      # passes the check while real usage stays within the physical space of both disks.
+      - name: Build volume (sparse LVM over root + temp disk at /mnt/build)
+        run: |
+          sudo swapoff -a || true; sudo rm -f /mnt/swapfile /swapfile
+          ROOT_FREE=$(df --output=avail -BG / | tail -1 | tr -dc 0-9); TMP_FREE=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)
+          echo "root free ${ROOT_FREE}G, temp free ${TMP_FREE}G"
+          sudo truncate -s $((ROOT_FREE - 3))G /pv-root.img
+          sudo truncate -s $((TMP_FREE - 1))G /mnt/pv-tmp.img
+          A=$(sudo losetup --find --show /pv-root.img); B=$(sudo losetup --find --show /mnt/pv-tmp.img)
+          sudo pvcreate -q "$A" "$B" && sudo vgcreate -q buildvg "$A" "$B" && sudo lvcreate -q -l 100%FREE -n buildlv buildvg
+          sudo mkfs.ext4 -q -m0 -E lazy_itable_init=1,nodiscard /dev/buildvg/buildlv
+          sudo mkdir -p /mnt/build && sudo mount -o noatime /dev/buildvg/buildlv /mnt/build
+          df -h / /mnt /mnt/build
       - uses: actions/checkout@v4
       - run: df -h / /mnt/build && free -g && nproc && sudo mkdir -p /mnt/build/Xilinx /mnt/build/work && sudo chown -R runner:runner /mnt/build
       - name: Vivado prerequisites
