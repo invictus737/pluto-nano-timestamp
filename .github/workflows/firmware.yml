@@ -28,6 +28,16 @@ jobs:
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         uses: jlumbroso/free-disk-space@v1.3.1
         with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, docker-images: true, swap-storage: true }
+      - name: Free more disk space (the Vivado install needs about 48 GB on this single 75 GB disk)
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/node_modules /usr/local/share/powershell /usr/local/share/chromium /usr/local/julia* \
+            /usr/share/swift /usr/share/miniconda /usr/lib/jvm /usr/lib/google-cloud-sdk /usr/lib/firefox \
+            /opt/microsoft /opt/google /opt/az /opt/pipx /opt/hostedtoolcache /home/linuxbrew /usr/local/aws-cli \
+            /usr/local/share/vcpkg /usr/local/.ghcup /usr/share/kotlinc /usr/local/bin/{minikube,kind,kubectl,helm,pulumi*,terraform,packer} || true
+          sudo apt-get clean; sudo journalctl --vacuum-size=20M >/dev/null 2>&1 || true
+          df -h /
       # The Vivado 2022.2 web installer refuses to start below 55 GB free on the destination,
       # although Zynq-7000 only writes far less. Root (~42 GB free after cleanup) and the temp
       # disk (~70 GB) are joined into one LVM volume backed by sparse files, so the reported size

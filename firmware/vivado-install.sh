@@ -36,7 +36,7 @@ assert any(x.endswith('Zynq-7000:1') for x in out), out
 s = s[:m.start(1)] + ','.join(out) + s[m.end(1):]
 open(p, 'w').write(s)
 PY
-sed -i 's/^EnableDiskUsageOptimization=.*/EnableDiskUsageOptimization=0/; s/^CreateProgramGroupShortcuts=.*/CreateProgramGroupShortcuts=0/; s/^CreateDesktopShortcuts=.*/CreateDesktopShortcuts=0/; s/^CreateFileAssociation=.*/CreateFileAssociation=0/' "$CFG"
+sed -i 's/^EnableDiskUsageOptimization=.*/EnableDiskUsageOptimization=1/; s/^CreateProgramGroupShortcuts=.*/CreateProgramGroupShortcuts=0/; s/^CreateDesktopShortcuts=.*/CreateDesktopShortcuts=0/; s/^CreateFileAssociation=.*/CreateFileAssociation=0/' "$CFG"
 echo "--- install_config.txt"; cat "$CFG"
 # 3. install (downloads only the selected modules)
 df -h "$DEST" "$HOME" /tmp
