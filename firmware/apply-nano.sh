@@ -29,9 +29,20 @@ for dts in "$FW"/linux/arch/arm/boot/dts/zynq-pluto-sdr.dtsi; do
   need "$dts" 'xlnx,phy-reset-gpio = <&gpio0 52 0>'
   sed -i 's/xlnx,phy-reset-gpio = <&gpio0 52 0>/xlnx,phy-reset-gpio = <\&gpio0 46 0>/' "$dts"
 done
-# the Rev.B/C DTs add an ADM1177 current limiter the Nano does not have
-for dts in "$FW"/linux/arch/arm/boot/dts/zynq-pluto-sdr-revb.dts "$FW"/linux/arch/arm/boot/dts/zynq-pluto-sdr-revc.dts; do
-  [ -f "$dts" ] && sed -i '/current_limiter@5a {/,/^\t\t};/d' "$dts" || true
-done
+# remove the ADM1177 current-limiter node (the Nano has none): exact brace-matched node removal
+python3 - "$FW"/linux/arch/arm/boot/dts/zynq-pluto-sdr*.dts <<'PY'
+import sys, re
+for path in sys.argv[1:]:
+    s = open(path).read()
+    m = re.search(r'\n[ \t]*current_limiter@5a\s*\{', s)
+    if not m: continue
+    i = s.index('{', m.start()); depth = 0
+    for j in range(i, len(s)):
+        depth += {'{': 1, '}': -1}.get(s[j], 0)
+        if depth == 0: break
+    end = s.index(';', j) + 1
+    s = s[:m.start()] + s[end:]
+    open(path, 'w').write(s); print('removed current_limiter@5a from', path)
+PY
 echo "nano retarget applied to $FW"
 grep -n 'clg400\|BANK0_VOLTAGE\|USB0_RESET_IO\|DDR_FREQ' "$B" | head -5
