@@ -4,7 +4,7 @@
 # btop's C++20, so it is built here and dropped into the rootfs overlay.
 # usage: build-btop.sh <rootfs-overlay dir>
 set -euo pipefail
-OVL=${1:?overlay dir}; HERE=$(cd "$(dirname "$0")" && pwd); WORK=${WORK:-$HERE/work-btop}
+OVL=$(mkdir -p "${1:?overlay dir}" && cd "$1" && pwd); HERE=$(cd "$(dirname "$0")" && pwd); WORK=${WORK:-$HERE/work-btop}
 TC=armv7-eabihf--musl--stable-2024.05-1
 BTOP=v1.4.0
 mkdir -p "$WORK" && cd "$WORK"
