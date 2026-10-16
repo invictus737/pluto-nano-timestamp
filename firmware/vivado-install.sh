@@ -5,7 +5,7 @@
 # the download). Prints the installed size; fails loudly on any step.
 set -euo pipefail
 BIN=${1:?installer}; DEST=${2:-/opt/Xilinx}
-chmod +x "$BIN"; mkdir -p "$DEST" work-vivado && cd work-vivado
+chmod +x "$BIN"; mkdir -p "$DEST" work-vivado && export TMPDIR=$PWD/work-vivado && cd work-vivado
 "../$BIN" --keep --noexec --target xsetup >/dev/null
 cd xsetup
 : "${AMD_USER:?}" "${AMD_PASS:?}"
