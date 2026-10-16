@@ -40,7 +40,10 @@ sed -i 's/^EnableDiskUsageOptimization=.*/EnableDiskUsageOptimization=0/; s/^Cre
 echo "--- install_config.txt"; cat "$CFG"
 # 3. install (downloads only the selected modules)
 df -h "$DEST" "$HOME" /tmp
-if ! ./xsetup --agree XilinxEULA,3rdPartyEULA --batch Install --config "$CFG"; then
+# the installer redraws a progress line ten times a second; keep one line per minute
+if ! ./xsetup --agree XilinxEULA,3rdPartyEULA --batch Install --config "$CFG" 2>&1 | \
+     awk '/Downloading files|Installing files|Extracting/ { t = systime(); if (t - last < 60) next; last = t } { print; fflush() }' \
+     ; [ "${PIPESTATUS[0]}" -eq 0 ] || false; then
   echo "--- installer log (space check)"
   LOG=$(ls -t "$HOME"/.Xilinx/xinstall/*.log 2>/dev/null | head -1); echo "log: $LOG"
   grep -n -i -E "space|size|bytes|free|require|archive|module:|dest:" "$LOG" | tail -80

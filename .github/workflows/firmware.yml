@@ -22,10 +22,12 @@ jobs:
           sudo swapoff -a || true; sudo rm -f /mnt/swapfile /swapfile
           ROOT_FREE=$(df --output=avail -BG / | tail -1 | tr -dc 0-9); TMP_FREE=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)
           echo "root free ${ROOT_FREE}G, temp free ${TMP_FREE}G"
-          sudo truncate -s $((ROOT_FREE - 3))G /pv-root.img
+          # temp disk first: a linear LV fills its first PV first, so the root disk (which also holds
+          # the runner's own logs) is only touched once the temp disk is full; 8 GB stay free on root.
+          sudo truncate -s $((ROOT_FREE - 8))G /pv-root.img
           sudo truncate -s $((TMP_FREE - 1))G /mnt/pv-tmp.img
-          A=$(sudo losetup --find --show /pv-root.img); B=$(sudo losetup --find --show /mnt/pv-tmp.img)
-          sudo pvcreate -q "$A" "$B" && sudo vgcreate -q buildvg "$A" "$B" && sudo lvcreate -q -l 100%FREE -n buildlv buildvg
+          A=$(sudo losetup --find --show /mnt/pv-tmp.img); B=$(sudo losetup --find --show /pv-root.img)
+          sudo pvcreate -q "$A" "$B" && sudo vgcreate -q buildvg "$A" "$B" && sudo lvcreate -q -l 100%FREE -n buildlv buildvg "$A" "$B"
           sudo mkfs.ext4 -q -m0 -E lazy_itable_init=1,nodiscard /dev/buildvg/buildlv
           sudo mkdir -p /mnt/build && sudo mount -o noatime /dev/buildvg/buildlv /mnt/build
           df -h / /mnt /mnt/build
