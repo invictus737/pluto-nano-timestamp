@@ -1,0 +1,54 @@
+pin,bank,site,vendor_direction,port_in_tezuka_nano
+A20,35,IOB_X0Y95,in,rx_data_in[8
+B19,35,IOB_X0Y96,in,rx_data_in[10
+B20,35,IOB_X0Y97,in,rx_data_in[4
+C20,35,IOB_X0Y98,in,rx_data_in[7
+D18,35,IOB_X0Y93,out,tx_data_out[4
+D19,35,IOB_X0Y92,in,rx_data_in[9
+D20,35,IOB_X0Y91,out,tx_frame_out
+E17,35,IOB_X0Y94,in,rx_data_in[0
+E18,35,IOB_X0Y90,in,rx_data_in[2
+E19,35,IOB_X0Y89,out,tx_data_out[10
+F20,35,IOB_X0Y69,in,rx_data_in[5
+G17,35,IOB_X0Y68,out,tx_data_out[0
+G18,35,IOB_X0Y67,in,rx_data_in[1
+G19,35,IOB_X0Y64,in,rx_data_in[3
+G20,35,IOB_X0Y63,out,tx_data_out[2
+H16,35,IOB_X0Y74,in,rx_clk_in
+H18,35,IOB_X0Y71,out,tx_data_out[1
+H20,35,IOB_X0Y65,in,rx_data_in[6
+J18,35,IOB_X0Y72,out,tx_data_out[3
+J19,35,IOB_X0Y79,out,tx_data_out[5
+J20,35,IOB_X0Y66,in,rx_data_in[11
+K16,35,IOB_X0Y52,out,tx_data_out[6
+K17,35,IOB_X0Y76,out,tx_clk_out
+K18,35,IOB_X0Y75,out,tx_data_out[7
+K19,35,IOB_X0Y80,in,rx_frame_in
+L14,35,IOB_X0Y56,out,(not in tezuka nano)
+L16,35,IOB_X0Y78,out,tx_data_out[11
+L19,35,IOB_X0Y82,out,tx_data_out[9
+L20,35,IOB_X0Y81,out,tx_data_out[8
+M14,35,IOB_X0Y54,out,(not in tezuka nano)
+M15,35,IOB_X0Y53,out,(not in tezuka nano)
+N15,35,IOB_X0Y58,in,(not in tezuka nano)
+N16,35,IOB_X0Y57,out,(not in tezuka nano)
+N17,34,IOB_X0Y4,out,gpio_status[5
+N18,34,IOB_X0Y24,out,gpio_status[3
+N20,34,IOB_X0Y22,out,gpio_ctl[0
+P14,34,IOB_X0Y38,out,gpio_ctl[2
+P15,34,IOB_X0Y2,out,gpio_ctl[1
+P16,34,IOB_X0Y1,out,gpio_ctl[3
+P20,34,IOB_X0Y21,out,gpio_status[0
+R17,34,IOB_X0Y11,out,gpio_status[2
+R18,34,IOB_X0Y9,out,gpio_status[1
+T17,34,IOB_X0Y10,out,gpio_status[4
+T19,34,IOB_X0Y0,in,gpio_status[7
+T20,34,IOB_X0Y20,out,enable
+U13,34,IOB_X0Y44,in,(not in tezuka nano)
+U18,34,IOB_X0Y26,out,gpio_en_agc
+U20,34,IOB_X0Y19,out,txnrx
+V20,34,IOB_X0Y18,out,spi_mosi
+W19,34,IOB_X0Y5,out,gpio_resetb
+W20,34,IOB_X0Y17,out,spi_clk
+Y18,34,IOB_X0Y16,in,spi_miso
+Y19,34,IOB_X0Y15,out,spi_csn

@@ -15,8 +15,8 @@ This repository exists because the vendor ships no schematic, no XDC and no sour
 | Step | State |
 |---|---|
 | Identify the board and its FPGA pinout from the vendor bitstream | **done** (see below) |
-| Nano device tree (USB PHY reset GPIO 46, 40 MHz refclk, LED on gpio0 15) | taken from tezuka `board/tezuka/nano` |
-| Port-name → ball constraint file (`system_constr.xdc`) for the Nano | **in progress** (pins known, names being assigned) |
+| Nano device tree (USB PHY reset GPIO 46, 40 MHz refclk, LED on gpio0 15) and PS7 settings (clg400, USB reset MIO 46, UART1 MIO 12/13, DDR MT41K256M16 x16) | taken from tezuka / F5OEO maia-sdr `nano` |
+| Port-name → ball constraint file (`system_constr.xdc`) for the Nano | **done**: `board/nano/system_constr.xdc` from F5OEO/maia-sdr (refactor, `boards/nano`), 47 of the vendor's 53 pads mapped to ADI port names with matching direction (`data/vendor-nano-port-map.csv`); 6 vendor-only pads unconstrained |
 | ADI `hdl` pluto project retargeted to `xc7z010clg400-1` + Quantulum timestamp IP | todo |
 | `plutosdr-fw` v0.38_timestamp build with the Nano bitstream and DT | todo (needs Vivado 2022.2 host) |
 | DFU flash and `SoapySDRUtil --probe ... Timestamps: YES` | todo |
@@ -53,7 +53,7 @@ tree also matches the vendor's: USB PHY reset on GPIO 46 (ADI uses 52), no ADM11
 - `tools/` — bitstream frame reader, IOB decoder, pin comparison, database fetch script.
 - `data/` — decoded vendor pad configuration and the candidate comparison. No bitstreams.
 - `board/nano/dts/` — Nano device tree from tezuka_fw (GPL, see that repository).
-- `firmware/` — the build recipe: ADI HDL + Quantulum timestamp IP + Nano constraints, in pgreenland's
+- `firmware/` — `REQUIREMENTS.md` (lean image, timestamps, USB network drivers incl. aic8800d80) and the build recipe: ADI HDL + Quantulum timestamp IP + Nano constraints, in pgreenland's
   `plutosdr-fw` tree.
 - `.github/workflows/` — `tools.yml` re-validates the decoder against the official ADI bitstream on
   every push; `firmware.yml` builds the firmware on a self-hosted runner that has Vivado 2022.2
