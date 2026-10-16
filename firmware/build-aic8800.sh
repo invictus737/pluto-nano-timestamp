@@ -6,6 +6,9 @@ set -euo pipefail
 FW=$(cd "${1:?fw}" && pwd); OVL=$(mkdir -p "${2:?overlay}" && cd "$2" && pwd); HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$HERE/work-aic8800; mkdir -p "$WORK"
 [ -d "$WORK/aic8800d80" ] || git clone -q --depth 1 https://github.com/shenmintao/aic8800d80.git "$WORK/aic8800d80"
+# the Pluto flow builds only zImage; external modules need Module.symvers and scripts/module.lds
+make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules_prepare -j"$(nproc)" >/dev/null
+make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules -j"$(nproc)" >/dev/null
 KREL=$(make -s -C "$FW/linux" ARCH=arm kernelrelease)
 for sub in aic_load_fw aic8800_fdrv; do
   make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- M="$WORK/aic8800d80/drivers/aic8800/$sub" \
