@@ -6,11 +6,25 @@ jobs:
     name: Nano bitstream (Vivado 2022.2 on the runner)
     runs-on: ubuntu-22.04
     timeout-minutes: 350
+    outputs:
+      cache-hit: ${{ steps.xsa-cache.outputs.cache-hit }}
     steps:
+      - uses: actions/checkout@v4
+      - name: Bitstream cache key (Nano HDL inputs + pgreenland plutosdr-fw commit)
+        id: key
+        run: |
+          FW=$(git ls-remote https://github.com/pgreenland/plutosdr-fw.git refs/heads/v0.38_timestamp | cut -f1)
+          IN=$(cat board/nano/system_constr.xdc board/nano/ps7.tcl firmware/apply-nano.sh firmware/build-hdl.sh | sha256sum | cut -c1-16)
+          echo "key=nano-xsa-v1-${FW:0:12}-${IN}" >> "$GITHUB_OUTPUT"
+      - name: Restore Nano bitstream
+        id: xsa-cache
+        uses: actions/cache/restore@v4
+        with: { path: xsa-cache/system_top.xsa, key: '${{ steps.key.outputs.key }}' }
       # Two passes: first strip the preinstalled toolchains from the 73 GB root disk (frees 25-30 GB),
       # then merge what is left with the temp disk into one LVM volume. A single pass gave 28 GB,
       # Vivado with Zynq-7000 only needs about 35 GB (download staging + install).
       - name: Free disk space (preinstalled SDKs, tool cache, large packages)
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         uses: jlumbroso/free-disk-space@v1.3.1
         with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, docker-images: true, swap-storage: true }
       # The Vivado 2022.2 web installer refuses to start below 55 GB free on the destination,
@@ -18,6 +32,7 @@ jobs:
       # disk (~70 GB) are joined into one LVM volume backed by sparse files, so the reported size
       # passes the check while real usage stays within the physical space of both disks.
       - name: Build volume (sparse LVM over root + temp disk at /mnt/build)
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: |
           sudo swapoff -a || true; sudo rm -f /mnt/swapfile /swapfile
           ROOT_FREE=$(df --output=avail -BG / | tail -1 | tr -dc 0-9); TMP_FREE=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)
@@ -31,27 +46,41 @@ jobs:
           sudo mkfs.ext4 -q -m0 -E lazy_itable_init=1,nodiscard /dev/buildvg/buildlv
           sudo mkdir -p /mnt/build && sudo mount -o noatime /dev/buildvg/buildlv /mnt/build
           df -h / /mnt /mnt/build
-      - uses: actions/checkout@v4
-      - run: df -h / /mnt/build && free -g && nproc && sudo mkdir -p /mnt/build/Xilinx /mnt/build/work && sudo chown -R runner:runner /mnt/build
+      - if: steps.xsa-cache.outputs.cache-hit != 'true'
+        run: df -h / /mnt/build && free -g && nproc && sudo mkdir -p /mnt/build/Xilinx /mnt/build/work && sudo chown -R runner:runner /mnt/build
       - name: Vivado prerequisites
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: sudo apt-get update -q && sudo apt-get install -y -q expect libtinfo5 libncurses5 libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 libfontconfig1 locales && sudo locale-gen en_US.UTF-8
       - name: Fetch the Vivado web installer (private release asset "vivado-installer")
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && ls -la /mnt/build/work/Xilinx_Unified_2022.2_*_Lin64.bin
       - name: Install Vivado (Zynq-7000 only)
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}' }
         run: cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
       - name: plutosdr-fw v0.38_timestamp (hdl + quantulum IP only)
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: |
           git clone -q -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git /mnt/build/work/fw
           git -C /mnt/build/work/fw submodule update --init --depth 1 hdl hdl-quantulum
       - name: Synthesise and implement
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
         env: { VIVADO_SETTINGS: /mnt/build/Xilinx/Vivado/2022.2/settings64.sh }
         run: firmware/build-hdl.sh /mnt/build/work/fw
+      - name: Collect bitstream
+        run: |
+          mkdir -p xsa-cache
+          [ -f xsa-cache/system_top.xsa ] || cp /mnt/build/work/fw/build/system_top.xsa xsa-cache/
+          ls -la xsa-cache/system_top.xsa
+      - name: Save Nano bitstream
+        if: steps.xsa-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with: { path: xsa-cache/system_top.xsa, key: '${{ steps.key.outputs.key }}' }
       - uses: actions/upload-artifact@v4
-        with: { name: nano-system_top.xsa, path: /mnt/build/work/fw/build/system_top.xsa, if-no-files-found: error }
+        with: { name: nano-system_top.xsa, path: xsa-cache/system_top.xsa, if-no-files-found: error }
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.xsa-cache.outputs.cache-hit != 'true'
         with: { name: vivado-logs, path: "/mnt/build/work/fw/hdl/projects/pluto/pluto.runs/**/*.log", if-no-files-found: ignore }
   firmware:
     name: pluto.frm / pluto.dfu
@@ -68,6 +97,7 @@ jobs:
         run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
       - uses: actions/download-artifact@v4
         with: { name: nano-system_top.xsa, path: xsa }
+      - uses: ./.github/actions/fw-caches
       - name: btop (static ARMv7 musl, into the rootfs overlay)
         run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay
       - name: Assemble firmware

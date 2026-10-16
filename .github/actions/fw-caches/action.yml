@@ -1,0 +1,23 @@
+name: firmware build caches
+description: Restore toolchains, btop, Buildroot downloads and ccache for the firmware job
+runs:
+  using: composite
+  steps:
+    - name: Linaro 7.3 (kernel + U-Boot compiler)
+      uses: actions/cache@v4
+      with: { path: firmware/work-linaro, key: linaro-7.3.1-2018.05 }
+    - name: btop static binary + its musl toolchain
+      uses: actions/cache@v4
+      with: { path: firmware/work-btop, key: "btop-${{ hashFiles('firmware/build-btop.sh') }}" }
+    - name: Buildroot downloads (sources and the Bootlin musl toolchain)
+      uses: actions/cache@v4
+      with:
+        path: ~/br-dl
+        key: "br-dl-${{ hashFiles('firmware/br-external/**', 'firmware/kernel-nano.config') }}"
+        restore-keys: br-dl-
+    - name: ccache (Buildroot packages)
+      uses: actions/cache@v4
+      with:
+        path: ~/.buildroot-ccache
+        key: "br-ccache-${{ github.run_id }}"
+        restore-keys: br-ccache-

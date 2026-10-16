@@ -9,6 +9,7 @@ TC=armv7-eabihf--musl--stable-2024.05-1
 BTOP=v1.4.0
 mkdir -p "$WORK" && cd "$WORK"
 [ -d "$TC" ] || curl -sL "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/$TC.tar.xz" | tar xJ
+if [ -x btop/bin/btop ]; then install -D -m 0755 btop/bin/btop "$OVL/usr/bin/btop"; ls -la "$OVL/usr/bin/btop"; exit 0; fi
 [ -d btop ] || git clone -q --depth 1 -b "$BTOP" https://github.com/aristocratos/btop.git
 CXX=$PWD/$TC/bin/arm-linux-g++
 STRIP=$PWD/$TC/bin/arm-linux-strip

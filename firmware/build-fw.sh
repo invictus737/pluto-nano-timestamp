@@ -10,6 +10,13 @@ cat "$HERE/kernel-nano.config" >> "$FW/linux/arch/arm/configs/zynq_pluto_defconf
 # buildroot: external tree (aic8800d80) + lean fragment merged into the Pluto defconfig
 cat "$HERE/br-external/configs/pluto_nano_fragment.config" >> "$FW/buildroot/configs/zynq_pluto_defconfig"
 export BR2_EXTERNAL="$HERE/br-external"
+# cached across runs by .github/actions/fw-caches
+cat >> "$FW/buildroot/configs/zynq_pluto_defconfig" <<BR
+BR2_DL_DIR="$HOME/br-dl"
+BR2_CCACHE=y
+BR2_CCACHE_DIR="$HOME/.buildroot-ccache"
+BR2_CCACHE_USE_BASEDIR=y
+BR
 # Kernel and U-Boot keep ADI's compiler (Linaro GCC 7.3 arm-linux-gnueabihf). plutosdr-fw used to take
 # it from Buildroot's external toolchain; the rootfs is musl now, so provide it separately on PATH.
 LINARO=gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf

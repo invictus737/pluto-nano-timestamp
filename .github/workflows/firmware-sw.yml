@@ -17,6 +17,7 @@ jobs:
         run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
       - name: Stand-in xsa (pgreenland release, CLG225)
         run: mkdir -p xsa && curl -sL -o xsa/system_top.xsa https://github.com/pgreenland/plutosdr-fw/releases/download/v0.38_with_timestamping/system_top.xsa && ls -la xsa
+      - uses: ./.github/actions/fw-caches
       - name: btop (static ARMv7 musl, into the rootfs overlay)
         run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay
       - name: Assemble firmware
