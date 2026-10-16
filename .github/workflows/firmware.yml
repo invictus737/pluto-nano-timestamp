@@ -72,10 +72,13 @@ jobs:
           export _JAVA_OPTIONS="-Djava.io.tmpdir=/mnt/build/tmp" TMPDIR=/mnt/build/tmp
           # Guard: if the root disk still runs low, stop the installer while the runner can still
           # log, and show what grew (a full root disk kills the runner and loses the whole log).
-          ( while sleep 60; do FREE=$(df --output=avail -BM / | tail -1 | tr -dc 0-9)
-              echo "[disk] root free ${FREE}M | build used $(df -h /mnt/build | tail -1 | awk '{print $3}')"
-              if [ "$FREE" -lt 2500 ]; then echo "[disk] root disk low: stopping the installer"
-                sudo du -xh --max-depth=3 / 2>/dev/null | sort -rh | head -25
+          df -hT; lsblk -o NAME,SIZE,MOUNTPOINT | head -20
+          # Every 10 s; stop at 8 GB free on the root disk or on the temp disk under the sparse volume.
+          ( n=0; while sleep 10; do n=$((n+1))
+              R=$(df --output=avail -BM / | tail -1 | tr -dc 0-9); M=$(df --output=avail -BM /mnt | tail -1 | tr -dc 0-9)
+              [ $((n % 6)) -eq 0 ] && echo "[disk] root free ${R}M, /mnt free ${M}M, build used $(df -h /mnt/build | tail -1 | awk '{print $3}')"
+              if [ "$R" -lt 8000 ] || [ "$M" -lt 8000 ]; then echo "[disk] LOW: root ${R}M /mnt ${M}M, stopping the installer"
+                sudo du -xh --max-depth=3 / 2>/dev/null | sort -rh | head -20; sudo du -h --max-depth=3 /mnt/build 2>/dev/null | sort -rh | head -15
                 pkill -f xsetup; pkill -f java; exit 0; fi; done ) &
           gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
       - name: Publish the installed Vivado as a SquashFS image (once)
