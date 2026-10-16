@@ -7,12 +7,18 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 350
     steps:
+      # Two passes: first strip the preinstalled toolchains from the 73 GB root disk (frees 25-30 GB),
+      # then merge what is left with the temp disk into one LVM volume. A single pass gave 28 GB,
+      # Vivado with Zynq-7000 only needs about 35 GB (download staging + install).
+      - name: Free disk space (preinstalled SDKs, tool cache, large packages)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true, large-packages: true, docker-images: true, swap-storage: true }
       - name: Maximize build space (root + temp disk merged into one LVM volume at /mnt/build)
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 4096
-          temp-reserve-mb: 1024
-          swap-size-mb: 2048
+          root-reserve-mb: 2048
+          temp-reserve-mb: 512
+          swap-size-mb: 1024
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
