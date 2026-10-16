@@ -10,9 +10,13 @@ WORK=$HERE/work-aic8800; mkdir -p "$WORK"
 make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules_prepare -j"$(nproc)" >/dev/null
 make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules -j"$(nproc)" >/dev/null
 KREL=$(make -s -C "$FW/linux" ARCH=arm kernelrelease)
+# aic8800_fdrv calls symbols exported by aic_load_fw: hand it that module's Module.symvers
+SYMS=""
 for sub in aic_load_fw aic8800_fdrv; do
   make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- M="$WORK/aic8800d80/drivers/aic8800/$sub" \
-    CONFIG_AIC_LOADFW_SUPPORT=m CONFIG_AIC8800_WLAN_SUPPORT=m CONFIG_PLATFORM_UBUNTU=n modules -j"$(nproc)"
+    CONFIG_AIC_LOADFW_SUPPORT=m CONFIG_AIC8800_WLAN_SUPPORT=m CONFIG_PLATFORM_UBUNTU=n \
+    ${SYMS:+KBUILD_EXTRA_SYMBOLS="$SYMS"} modules -j"$(nproc)"
+  SYMS="$WORK/aic8800d80/drivers/aic8800/$sub/Module.symvers"
 done
 D=$OVL/lib/modules/$KREL/extra; mkdir -p "$D"
 find "$WORK/aic8800d80/drivers/aic8800" -name '*.ko' -exec arm-linux-gnueabihf-strip --strip-debug {} \; -exec install -m 0644 {} "$D/" \;
