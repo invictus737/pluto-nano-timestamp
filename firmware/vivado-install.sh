@@ -21,7 +21,21 @@ EXP
 ./xsetup -b ConfigGen <<< $'2\n1\n' || true   # 2 = Vivado, 1 = ML Standard (installer menus)
 CFG=$(ls ~/.Xilinx/install_config.txt)
 sed -i "s|^Destination=.*|Destination=$DEST|" "$CFG"
-sed -i 's/^Modules=.*/Modules=Zynq-7000:1,Vivado Design Suite:1,Vitis Model Composer (Simulink):0,Zynq UltraScale+ MPSoC:0,Zynq UltraScale+ RFSoC:0,Virtex UltraScale+:0,Kintex UltraScale+:0,Kintex UltraScale:0,Virtex UltraScale:0,Versal:0,Artix UltraScale+:0,Artix-7:0,Kintex-7:0,Virtex-7:0,Spartan-7:0,Install Cable Drivers:0,DocNav:0,Engineering Sample Devices:0/' "$CFG"
+# keep the installer's own module list (names differ between releases): everything off,
+# then Zynq-7000 on. Product=Vivado already selects the design tools.
+echo "--- generated Modules: $(grep '^Modules=' "$CFG")"
+python3 - "$CFG" <<'PY'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+m = re.search(r'^Modules=(.*)$', s, re.M); mods = m.group(1).split(',')
+out = []
+for mod in mods:
+    name = mod.rsplit(':', 1)[0]
+    out.append(f"{name}:{1 if name.strip() == 'Zynq-7000' else 0}")
+assert any(x.endswith('Zynq-7000:1') for x in out), out
+s = s[:m.start(1)] + ','.join(out) + s[m.end(1):]
+open(p, 'w').write(s)
+PY
 sed -i 's/^CreateProgramGroupShortcuts=.*/CreateProgramGroupShortcuts=0/; s/^CreateDesktopShortcuts=.*/CreateDesktopShortcuts=0/; s/^CreateFileAssociation=.*/CreateFileAssociation=0/' "$CFG"
 echo "--- install_config.txt"; cat "$CFG"
 # 3. install (downloads only the selected modules)
