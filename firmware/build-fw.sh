@@ -29,5 +29,5 @@ arm-linux-gnueabihf-gcc --version | head -1
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/zImage 2>&1 | tail -5
 "$HERE/build-aic8800.sh" "$FW" "$HERE/br-external/board/nano/rootfs-overlay"
-make build/pluto.frm build/pluto.dfu 2>&1 | tail -30
-ls -la build/pluto.frm build/pluto.dfu; sha256sum build/pluto.frm build/pluto.dfu
+make build/pluto.frm 2>&1 | tail -30
+ls -la build/pluto.frm; sha256sum build/pluto.frm
