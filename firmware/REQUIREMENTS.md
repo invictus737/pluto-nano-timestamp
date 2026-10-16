@@ -45,3 +45,7 @@
    global-timer rate, CPU/2), DDR untouched: tezuka documents marginal DDR on Nano boards, so no
    DDR increase. A CPU-only overclock FSBL (`boot.dfu`) is a separate, opt-in image after a
    `memtester` run; a bad FSBL disables DFU recovery (JTAG only).
+
+7. **btop** on the device (`btop` over SSH/serial): static ARMv7 musl binary, about 2 MB, built by
+   `firmware/build-btop.sh` (Buildroot 2023.02 has no btop package and its GCC 7.3 cannot compile
+   btop's C++20). Needs a UTF-8 capable terminal; `TERM=xterm-256color` works over SSH.

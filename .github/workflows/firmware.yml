@@ -66,6 +66,8 @@ jobs:
         run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
       - uses: actions/download-artifact@v4
         with: { name: nano-system_top.xsa, path: xsa }
+      - name: btop (static ARMv7 musl, into the rootfs overlay)
+        run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay
       - name: Assemble firmware
         run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
       - uses: actions/upload-artifact@v4

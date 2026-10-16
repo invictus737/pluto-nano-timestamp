@@ -10,3 +10,4 @@ tools/venv/
 tools/db/
 __pycache__/
 work/
+firmware/work-btop/
