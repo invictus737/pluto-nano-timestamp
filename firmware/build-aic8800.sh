@@ -17,16 +17,56 @@ done
 D=$OVL/lib/modules/$KREL/extra; mkdir -p "$D"
 find "$WORK/aic8800d80/drivers/aic8800" -name '*.ko' -exec arm-linux-gnueabihf-strip --strip-debug {} \; -exec install -m 0644 {} "$D/" \;
 mkdir -p "$OVL/lib/firmware/aic8800D80" && cp -a "$WORK/aic8800d80/fw/aic8800D80/." "$OVL/lib/firmware/aic8800D80/"
-# load on demand when the adapter appears (mdev), aic_load_fw first
+# AIC8800 adapters enumerate first as a USB stick (mass storage with the Windows driver CD):
+# a69c:5721..572f, or 1111:1111 on "Pandora" clones. mdev ejects / mode-switches them, the adapter
+# re-enumerates as a69c:8d80 (Wi-Fi) and the driver is loaded then. Same IDs as the driver's udev rules.
+mkdir -p "$OVL/etc/usb_modeswitch.d" "$OVL/lib/mdev"
+cp "$WORK/aic8800d80/usb_modeswitch/1111_1111" "$OVL/etc/usb_modeswitch.d/1111:1111"
+cat > "$OVL/lib/mdev/aic8800.sh" <<'S'
+#!/bin/sh
+# mdev helper. $1 = disk: called for every sd* device; $1 = wifi: called for usb:va69cp8d80 interfaces.
+usbdev() { d=$(readlink -f /sys/class/block/$MDEV/device 2>/dev/null); while [ -n "$d" ] && [ "$d" != / ]; do [ -f "$d/idVendor" ] && { echo "$d"; return; }; d=${d%/*}; done; }
+case "$1" in
+disk)
+  [ "$ACTION" = add ] || exit 0
+  u=$(usbdev); [ -n "$u" ] || exit 0
+  vid=$(cat "$u/idVendor"); pid=$(cat "$u/idProduct")
+  case "$vid:$pid" in
+    a69c:572[1-7]|a69c:572[acf]) logger -t aic8800 "eject $MDEV ($vid:$pid, driver CD mode)"; eject /dev/$MDEV; exit 0 ;;
+  esac
+  exec /lib/mdev/automounter.sh ;;
+wifi)
+  [ "$ACTION" = add ] || exit 0
+  lsmod | grep -q '^aic8800_fdrv' && exit 0
+  logger -t aic8800 "AIC8800D80 Wi-Fi present, loading driver"
+  insmod /lib/modules/$(uname -r)/extra/aic_load_fw.ko 2>/dev/null
+  insmod /lib/modules/$(uname -r)/extra/aic8800_fdrv.ko 2>/dev/null ;;
+clone)
+  [ "$ACTION" = add ] && usb_modeswitch -v 0x1111 -p 0x1111 -c /etc/usb_modeswitch.d/1111:1111 ;;
+esac
+exit 0
+S
+chmod +x "$OVL/lib/mdev/aic8800.sh"
+# mdev.conf: the stock Pluto rules, with sd* routed through the AIC helper first (it chains to the automounter)
+cat > "$OVL/etc/mdev.conf" <<'M'
+$MODALIAS=usb:v1111p1111.*   root:root 660 @/lib/mdev/aic8800.sh clone
+$MODALIAS=usb:va69cp8d80.*   root:root 660 @/lib/mdev/aic8800.sh wifi
+sd[a-z]           root:root 660 */lib/mdev/aic8800.sh disk
+sd[a-z][0-9]      root:root 660 */lib/mdev/automounter.sh
+wlan[0-9]         root:root 660 */lib/mdev/ifupdown.sh
+usb[0-9]          root:root 660 */lib/mdev/ifupdown.sh
+eth[0-9]          root:root 660 */lib/mdev/ifupdown.sh
+M
+# adapter already plugged at boot: replay its uevents once mdev is running
 mkdir -p "$OVL/etc/init.d"
 cat > "$OVL/etc/init.d/S36aic8800" <<'S'
 #!/bin/sh
-# AIC8800D80 USB Wi-Fi: load the driver only if such an adapter is present (VID a69c).
 case "$1" in start)
-  if grep -qi '^PRODUCT=a69c/' /sys/bus/usb/devices/*/uevent 2>/dev/null; then
-    insmod /lib/modules/$(uname -r)/extra/aic_load_fw.ko 2>/dev/null
-    insmod /lib/modules/$(uname -r)/extra/aic8800_fdrv.ko 2>/dev/null
-  fi;;
+  for u in /sys/bus/usb/devices/*; do
+    [ -f "$u/idVendor" ] || continue
+    case "$(cat $u/idVendor):$(cat $u/idProduct)" in a69c:*|1111:1111) echo add > "$u/uevent"; for i in "$u"/*:*; do [ -f "$i/uevent" ] && echo add > "$i/uevent"; done ;; esac
+  done
+  for b in /sys/class/block/sd[a-z]; do [ -e "$b/uevent" ] && echo add > "$b/uevent"; done ;;
 esac
 exit 0
 S
