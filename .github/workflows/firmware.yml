@@ -44,7 +44,10 @@ jobs:
           sudo mkfs.ext4 -q -m0 -E lazy_itable_init=1,nodiscard "$A"
           sudo mkdir -p /mnt/build && sudo mount -o noatime "$A" /mnt/build && sudo chown runner:runner /mnt/build
           # everything the installer writes goes there: home cache, temp, download staging
-          mkdir -p /mnt/build/home-xilinx /mnt/build/tmp && rm -rf ~/.Xilinx && ln -s /mnt/build/home-xilinx ~/.Xilinx
+          mkdir -p /mnt/build/home-xilinx /mnt/build/tmp /mnt/build/tools /mnt/build/vartmp && rm -rf ~/.Xilinx && ln -s /mnt/build/home-xilinx ~/.Xilinx
+          # the installer also defaults some modules (Information Center) to /tools/Xilinx on the root disk
+          sudo rm -rf /tools && sudo ln -s /mnt/build/tools /tools
+          sudo mount --bind /mnt/build/vartmp /var/tmp && sudo chmod 1777 /mnt/build/vartmp /mnt/build/tmp
           echo "TMPDIR=/mnt/build/tmp" >> "$GITHUB_ENV"
           echo "_JAVA_OPTIONS=-Djava.io.tmpdir=/mnt/build/tmp" >> "$GITHUB_ENV"
           df -h / /mnt /mnt/build
@@ -63,7 +66,9 @@ jobs:
       - name: Install Vivado (Zynq-7000 only)
         if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
         env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}', GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
-        run: gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
+        run: |
+          ( while true; do sleep 120; echo "[disk] $(df -h / | tail -1 | awk '{print "root used "$3" free "$4}') | $(df -h /mnt/build | tail -1 | awk '{print "build used "$3}')"; sudo du -xsh /home /tmp /var /opt /usr /root /tools 2>/dev/null | tr '\n' ' '; echo; done ) &
+          gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
       - name: Publish the installed Vivado as a SquashFS image (once)
         if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
