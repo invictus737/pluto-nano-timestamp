@@ -67,7 +67,16 @@ jobs:
         if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
         env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}', GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: |
-          ( while true; do sleep 120; echo "[disk] $(df -h / | tail -1 | awk '{print "root used "$3" free "$4}') | $(df -h /mnt/build | tail -1 | awk '{print "build used "$3}')"; sudo du -xsh /home /tmp /var /opt /usr /root /tools 2>/dev/null | tr '\n' ' '; echo; done ) &
+          # Java (xsetup) ignores TMPDIR and writes to /tmp on the root disk: move /tmp itself.
+          sudo mount --bind /mnt/build/tmp /tmp && sudo chmod 1777 /tmp
+          export _JAVA_OPTIONS="-Djava.io.tmpdir=/mnt/build/tmp" TMPDIR=/mnt/build/tmp
+          # Guard: if the root disk still runs low, stop the installer while the runner can still
+          # log, and show what grew (a full root disk kills the runner and loses the whole log).
+          ( while sleep 60; do FREE=$(df --output=avail -BM / | tail -1 | tr -dc 0-9)
+              echo "[disk] root free ${FREE}M | build used $(df -h /mnt/build | tail -1 | awk '{print $3}')"
+              if [ "$FREE" -lt 2500 ]; then echo "[disk] root disk low: stopping the installer"
+                sudo du -xh --max-depth=3 / 2>/dev/null | sort -rh | head -25
+                pkill -f xsetup; pkill -f java; exit 0; fi; done ) &
           gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
       - name: Publish the installed Vivado as a SquashFS image (once)
         if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
