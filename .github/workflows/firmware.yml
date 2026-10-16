@@ -1,6 +1,7 @@
 name: firmware (GitHub-hosted, Vivado installed in the job)
 on:
   workflow_dispatch: {}
+permissions: { contents: write, actions: read }
 jobs:
   hdl:
     name: Nano bitstream (Vivado 2022.2 on the runner)
@@ -51,14 +52,21 @@ jobs:
       - name: Vivado prerequisites
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: sudo apt-get update -q && sudo apt-get install -y -q expect libtinfo5 libncurses5 libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 libfontconfig1 locales && sudo locale-gen en_US.UTF-8
-      - name: Fetch the Vivado web installer (private release asset "vivado-installer")
+      - name: Vivado from the SquashFS image (fast path)
+        id: vimg
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
-        run: gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && ls -la /mnt/build/work/Xilinx_Unified_2022.2_*_Lin64.bin
+        run: |
+          set +e; firmware/vivado-image.sh fetch /mnt/build/Xilinx; rc=$?; set -e
+          if [ $rc -eq 0 ]; then echo "mounted=true" >> "$GITHUB_OUTPUT"; elif [ $rc -eq 3 ]; then echo "mounted=false" >> "$GITHUB_OUTPUT"; else exit $rc; fi
       - name: Install Vivado (Zynq-7000 only)
-        if: steps.xsa-cache.outputs.cache-hit != 'true'
-        env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}' }
-        run: cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
+        if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
+        env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}', GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
+      - name: Publish the installed Vivado as a SquashFS image (once)
+        if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
+        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: firmware/vivado-image.sh publish /mnt/build/Xilinx
       - name: plutosdr-fw v0.38_timestamp (hdl + quantulum IP only)
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: |
