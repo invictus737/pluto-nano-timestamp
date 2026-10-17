@@ -3,7 +3,7 @@
 # usage: build-hdl.sh <plutosdr-fw checkout> ; needs vivado on PATH (or VIVADO_SETTINGS).
 set -euo pipefail
 FW=${1:?plutosdr-fw checkout}; HERE=$(cd "$(dirname "$0")" && pwd)
-"$HERE/apply-nano.sh" "$FW"
+"$HERE/apply-nano.sh" "$FW" --hdl-only
 [ -n "${VIVADO_SETTINGS:-}" ] && source "$VIVADO_SETTINGS"
 vivado -version | head -1
 unset MAKEFLAGS

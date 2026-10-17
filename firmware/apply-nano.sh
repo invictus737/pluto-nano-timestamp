@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Retarget a pgreenland plutosdr-fw (v0.38_timestamp) checkout to the HamGeek NanoSDR.
-# usage: firmware/apply-nano.sh <path/to/plutosdr-fw>
+# usage: firmware/apply-nano.sh <path/to/plutosdr-fw> [--hdl-only]
+# --hdl-only: bitstream job, which checks out only hdl/ (no linux/ tree): skip the device tree.
 # Edits are minimal and asserted: part, PS7 package/bank/USB-reset/DDR, constraints, device tree.
 set -euo pipefail
 FW=${1:?plutosdr-fw checkout}
@@ -23,6 +24,7 @@ ad_ip_parameter sys_ps7 CONFIG.PCW_UIPARAM_DDR_FREQ_MHZ 400.000000\
 ad_ip_parameter sys_ps7 CONFIG.PCW_UIPARAM_DDR_DQS_TO_CLK_DELAY_0 0.025' "$B"
 # 3. Constraints
 cp "$BOARD/system_constr.xdc" "$P/system_constr.xdc"
+if [ "${2:-}" = --hdl-only ]; then echo "nano retarget (HDL only) applied to $FW"; exit 0; fi
 # 4. Device tree: Nano differences in the three Pluto DTs the FIT carries
 for dts in "$FW"/linux/arch/arm/boot/dts/zynq-pluto-sdr.dtsi; do
   [ -f "$dts" ] || { echo "missing $dts"; exit 1; }

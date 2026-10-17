@@ -74,6 +74,7 @@ jobs:
           set +e; firmware/vivado-image.sh fetch /mnt/build/Xilinx; rc=$?; set -e
           if [ $rc -eq 0 ]; then echo "mounted=true" >> "$GITHUB_OUTPUT"; elif [ $rc -eq 3 ]; then echo "mounted=false" >> "$GITHUB_OUTPUT"; else exit $rc; fi
       - name: Install Vivado (Zynq-7000 only)
+        id: install
         if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
         env: { AMD_USER: '${{ secrets.AMD_USER }}', AMD_PASS: '${{ secrets.AMD_PASS }}', GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: |
@@ -110,7 +111,8 @@ jobs:
         uses: actions/cache/save@v4
         with: { path: xsa-cache/system_top.xsa, key: '${{ steps.key.outputs.key }}' }
       - name: Publish the installed Vivado image (once, after the bitstream; streamed parts)
-        if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
+        # also after a failed synthesis: the next run then skips the one-hour install
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         continue-on-error: true
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: rm -rf /mnt/build/work/fw/build; firmware/vivado-image.sh publish /mnt/build/Xilinx
