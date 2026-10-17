@@ -1,10 +1,11 @@
 #!/bin/sh
-# USB-C role. fw_setenv usb_mode auto|peripheral|host   (default auto)
+# USB-C role. fw_setenv usb_mode auto|peripheral|host   (default peripheral = stock Pluto)
 #   peripheral: stock Pluto, a computer is the USB host (iiod, USB network, mass storage).
 #   host:       the Pluto is the host, for a powered hub with a Wi-Fi card or a USB Ethernet adapter.
 #   auto:       start as a peripheral; when no computer configures the port within 20 s, become
 #               host; as host, return to peripheral when nothing has enumerated for 30 s. Plugged into
 #               a computer it behaves exactly like the stock Pluto; plugged into a hub it goes on Wi-Fi.
+# Auto is opt-in: a role switch that misjudges the host leaves the Pluto unreachable over USB.
 ROLE=$(ls /sys/devices/soc0/amba/*.usb/ci_hdrc.0/role 2>/dev/null | head -1)
 UDC=/sys/class/udc/ci_hdrc.0/state
 devices() { ls -d /sys/bus/usb/devices/[0-9]*-[0-9]* 2>/dev/null | grep -v ':' | wc -l; }
@@ -26,11 +27,11 @@ loop() {
 case "$1" in
 start)
   [ -n "$ROLE" ] || exit 0
-  M=$(fw_printenv -n usb_mode 2>/dev/null || echo auto)
+  M=$(fw_printenv -n usb_mode 2>/dev/null || echo peripheral)
   case "$M" in
   host) set_role host ;;
-  peripheral) ;;
-  *) (loop) > /dev/null 2>&1 & echo $! > /var/run/usbrole.pid ;;
+  auto) (loop) > /dev/null 2>&1 & echo $! > /var/run/usbrole.pid ;;
+  *) ;;
   esac ;;
 stop) [ -f /var/run/usbrole.pid ] && kill "$(cat /var/run/usbrole.pid)" 2>/dev/null; rm -f /var/run/usbrole.pid ;;
 esac

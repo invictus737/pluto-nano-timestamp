@@ -48,3 +48,5 @@ if ! make build/pluto.frm > "$HERE/../fw-build.log" 2>&1; then
 fi
 tail -5 "$HERE/../fw-build.log"
 ls -la build/pluto.frm; sha256sum build/pluto.frm
+# the application slot (S97app) starts 16 MiB into the firmware partition: the FIT must end before it
+[ "$(stat -c %s build/pluto.frm)" -lt $((16 * 1024 * 1024)) ] || { echo "pluto.frm reaches the application slot at 16 MiB"; exit 1; }
