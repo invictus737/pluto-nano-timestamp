@@ -44,8 +44,15 @@ assert n == 1, "ramdisk@1 node not found in " + p
 open(p, 'w').write(s)
 PY
 grep -n -A6 'ramdisk@1 {' "$FW/scripts/pluto.its" | head -8
-# no LICENSE.html / legal-info in the image
+# no generated legal-info in the image; the mass-storage layout (genimage-msd.cfg) still lists a
+# LICENSE.html, so a short one points to the sources instead
 export SKIP_LEGAL=1
+cat > "$FW/buildroot/board/pluto/msd/LICENSE.html" <<'HTML'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Licenses</title></head><body>
+<p>This firmware contains free software (Linux, U-Boot, Buildroot packages, libiio, SoapySDR and others)
+under their own licenses, mostly GPL-2.0 and LGPL. Sources: https://github.com/analogdevicesinc/plutosdr-fw,
+https://github.com/pgreenland/plutosdr-fw and the package URLs in Buildroot 2023.02.</p></body></html>
+HTML
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/zImage 2>&1 | tail -5
 "$HERE/build-aic8800.sh" "$FW" "$HERE/br-external/board/nano/rootfs-overlay"
