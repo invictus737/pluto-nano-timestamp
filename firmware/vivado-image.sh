@@ -12,7 +12,7 @@ case "$CMD" in
 fetch)
   # streamed: each part is downloaded to stdout and unpacked on the fly, never stored whole
   gh release view "$TAG" >/dev/null 2>&1 || { echo "no Vivado image release yet"; exit 3; }
-  PARTS=$(gh release view "$TAG" --json assets -q '.assets[].name' | grep '^vivado.tar.zst.part' | sort)
+  PARTS=$(gh release view "$TAG" --json assets -q '.assets[].name' | { grep '^vivado.tar.zst.part' || true; } | sort)
   [ -n "$PARTS" ] || { echo "Vivado image release has no parts"; exit 3; }
   gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx 'vivado.complete' || { echo "Vivado image upload incomplete"; exit 3; }
   mkdir -p "$DIR"
