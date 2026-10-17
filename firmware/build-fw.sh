@@ -16,7 +16,15 @@ BR2_DL_DIR="$HOME/br-dl"
 BR2_CCACHE=y
 BR2_CCACHE_DIR="$HOME/.buildroot-ccache"
 BR2_CCACHE_USE_BASEDIR=y
+BR2_PER_PACKAGE_DIRECTORIES=y
 BR
+# top-level parallel Buildroot (independent packages at the same time; needs per-package directories)
+python3 - "$FW/Makefile" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read(); old = "\tmake -C buildroot BUSYBOX_CONFIG_FILE="
+assert s.count(old) == 1, "plutosdr-fw Makefile: buildroot 'all' call not found"
+open(p, "w").write(s.replace(old, "\tmake -C buildroot -j$$(nproc) BUSYBOX_CONFIG_FILE="))
+PY
 # Kernel and U-Boot keep ADI's compiler (Linaro GCC 7.3 arm-linux-gnueabihf). plutosdr-fw used to take
 # it from Buildroot's external toolchain; the rootfs is musl now, so provide it separately on PATH.
 LINARO=gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf
