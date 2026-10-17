@@ -139,9 +139,6 @@ jobs:
       - uses: ./.github/actions/fw-caches
       - name: btop (static ARMv7 musl, into the rootfs overlay)
         run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay
-      - name: Application (optional, release "app" of this repository)
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: firmware/fetch-app.sh firmware/br-external/board/nano/rootfs-overlay
       - name: Assemble firmware
         run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
       - uses: actions/upload-artifact@v4

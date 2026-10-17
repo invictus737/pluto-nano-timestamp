@@ -26,6 +26,18 @@ if [ ! -x "$HERE/work-linaro/$LINARO/bin/arm-linux-gnueabihf-gcc" ]; then
 fi
 export PATH="$HERE/work-linaro/$LINARO/bin:$PATH"
 arm-linux-gnueabihf-gcc --version | head -1
+# zstd ramdisk: the plutosdr-fw Makefile and FIT source name rootfs.cpio.gz and mark it gzip
+sed -i 's#rootfs\.cpio\.gz#rootfs.cpio.zst#g' "$FW/Makefile"
+python3 - "$FW/scripts/pluto.its" <<'PY'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+s, n = re.subn(r'(ramdisk@1 \{[^}]*?)rootfs\.cpio\.gz("\);[^}]*?compression = )"gzip"', r'\1rootfs.cpio.zst\2"none"', s, flags=re.S)
+assert n == 1, "ramdisk@1 node not found in " + p
+open(p, 'w').write(s)
+PY
+grep -n -A6 'ramdisk@1 {' "$FW/scripts/pluto.its" | head -8
+# no LICENSE.html / legal-info in the image
+export SKIP_LEGAL=1
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/zImage 2>&1 | tail -5
 "$HERE/build-aic8800.sh" "$FW" "$HERE/br-external/board/nano/rootfs-overlay"

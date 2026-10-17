@@ -13,4 +13,12 @@ if [ -f "$T/usr/bin/btop" ] && ! head -c 2 "$T/usr/bin/btop" | grep -q '#!'; the
 fi
 # the SoapyPlutoSDR module and SoapySDRUtil are the only users of these; keep headers/cmake out
 rm -rf "$T/usr/share/cmake" "$T/usr/lib/cmake" "$T/usr/lib/pkgconfig" "$T/usr/include" 2>/dev/null || true
+# macOS metadata copied in with overlay files
+find "$T" -name '._*' -delete
+# libraries nothing links against (pulled in by the toolchain's OpenMP/Fortran runtime and fftw's
+# threaded variants; ad936x_ref_cal only needs libfftw3), and the fftw wisdom tools
+rm -f "$T"/usr/bin/fftw*-wisdom* "$T"/usr/lib/libfftw3*_omp.so* "$T"/usr/lib/libfftw3*_threads.so*
+for lib in libgfortran libgomp; do
+  if ! grep -rlsq --exclude="$lib.so*" "$lib.so" "$T/usr" "$T/lib" "$T/bin" "$T/sbin"; then rm -f "$T"/usr/lib/$lib.so* "$T"/lib/$lib.so*; fi
+done
 chmod 0755 "$T"/etc/init.d/S*
