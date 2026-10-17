@@ -1,0 +1,34 @@
+Plain IIO streamers: reset the FPGA timestamp_every GPIO (0xBC) to 0. After a timestamped session
+it stays set and the TX timestamp logic waits for headers the plain stream never sends (DMA push
+blocks in the kernel).
+
+
+diff --git a/PlutoSDR_Streaming.cpp b/PlutoSDR_Streaming.cpp
+index fccb8d7..3d87ce0 100644
+--- a/PlutoSDR_Streaming.cpp
++++ b/PlutoSDR_Streaming.cpp
+@@ -1,3 +1,4 @@
++#include "PlutoSDR_TimestampEvery.hpp"
+ #include "SoapyPlutoSDR.hpp"
+ #include <memory>
+ #include <iostream>
+@@ -372,6 +373,9 @@ rx_streamer_iio::rx_streamer_iio(const iio_device *_dev, const plutosdrStreamFor
+ 		channel_list.push_back(chn);
+ 	}
+ 
++	// Plain stream: no timestamps (a previous timestamped session may have left them on).
++	SoapyPlutoSDR_TimestampEvery::update_device_timestamp_every(dev, 0, channel_list.size() / 2);
++
+ 	if ( args.count( "bufflen" ) != 0 ){
+ 
+ 		try
+@@ -655,6 +659,9 @@ tx_streamer_iio::tx_streamer_iio(const iio_device *_dev, const plutosdrStreamFor
+ 		channel_list.push_back(chn);
+ 	}
+ 
++	// Plain stream: no timestamps (a previous timestamped session may have left them on).
++	SoapyPlutoSDR_TimestampEvery::update_device_timestamp_every(dev, 0, channel_list.size() / 2);
++
+ 	buf_size = 4096;
+ 	items_in_buf = 0;
+ 	buf = iio_device_create_buffer(dev, buf_size, false);

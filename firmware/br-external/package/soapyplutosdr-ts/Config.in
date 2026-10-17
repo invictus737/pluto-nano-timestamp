@@ -1,0 +1,12 @@
+config BR2_PACKAGE_SOAPYPLUTOSDR_TS
+	bool "soapyplutosdr-ts"
+	depends on BR2_PACKAGE_SOAPYSDR
+	select BR2_PACKAGE_LIBIIO
+	select BR2_PACKAGE_LIBAD9361_IIO
+	select BR2_PACKAGE_LIBUSB
+	help
+	  SoapyPlutoSDR with pgreenland's sample timestamping
+	  (sdr_gadget_timestamping, direct=1 over the USB and IP
+	  gadgets), for applications that run on the Pluto itself.
+
+	  https://github.com/pgreenland/SoapyPlutoSDR

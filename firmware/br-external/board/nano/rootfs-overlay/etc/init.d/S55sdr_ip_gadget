@@ -1,0 +1,11 @@
+#!/bin/sh
+# pgreenland UDP IIO gadget (control 30432, data 30433): timestamped streams for uri=ip:<pluto>
+# from the network and uri=ip:127.0.0.1 for an application on the Pluto itself.
+D=/usr/sbin/sdr_ip_gadget
+[ -x $D ] || exit 0
+case "$1" in
+start) start-stop-daemon -S -q -b -m -p /var/run/sdr_ip_gadget.pid -x $D && echo "sdr_ip_gadget started" ;;
+stop) start-stop-daemon -K -q -p /var/run/sdr_ip_gadget.pid ;;
+restart) $0 stop; sleep 1; $0 start ;;
+esac
+exit 0

@@ -1,0 +1,29 @@
+SoapyPlutoSDR gadget TX streamers: std::min(uint64_t, size_t) has no common type on 32-bit ARM.
+
+
+diff --git a/PlutoSDR_TXStreamerIPGadget.cpp b/PlutoSDR_TXStreamerIPGadget.cpp
+index f97f38e..35788ab 100644
+--- a/PlutoSDR_TXStreamerIPGadget.cpp
++++ b/PlutoSDR_TXStreamerIPGadget.cpp
+@@ -126,7 +126,7 @@ int tx_streamer_ip_gadget::send(const void * const *buffs,
+ 
+ 		// Calculate how many samples to add to buffer
+ 		// No need to reset samples as buffer is zero initialized when created
+-		size_t samples_to_fill = std::min(timestamp_diff, curr_buffer_free_samples);
++		size_t samples_to_fill = (size_t)std::min<uint64_t>(timestamp_diff, curr_buffer_free_samples);
+ 
+ 		// Increment sample count
+ 		curr_buffer_samples_stored += samples_to_fill;
+diff --git a/PlutoSDR_TXStreamerUSBGadget.cpp b/PlutoSDR_TXStreamerUSBGadget.cpp
+index 8c779b9..5d96cd0 100644
+--- a/PlutoSDR_TXStreamerUSBGadget.cpp
++++ b/PlutoSDR_TXStreamerUSBGadget.cpp
+@@ -134,7 +134,7 @@ int tx_streamer_usb_gadget::send(const void * const *buffs,
+ 
+ 		// Calculate how many samples to add to buffer
+ 		// No need to reset samples as buffer is zero initialized when created
+-		size_t samples_to_fill = std::min(timestamp_diff, curr_buffer_free_samples);
++		size_t samples_to_fill = (size_t)std::min<uint64_t>(timestamp_diff, curr_buffer_free_samples);
+ 
+ 		// Increment sample count
+ 		curr_buffer_samples_stored += samples_to_fill;

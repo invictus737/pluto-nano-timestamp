@@ -1,0 +1,13 @@
+#!/bin/sh
+# Wall clock from NTP (the Pluto has no RTC). BusyBox ntpd keeps retrying the servers, so it is
+# started at boot and syncs as soon as any interface (Wi-Fi, USB Ethernet, the USB link) has a
+# route and DNS. Servers: fw_setenv ntp_servers "a b c" (default pool.ntp.org).
+case "$1" in
+start)
+  S=$(fw_printenv -n ntp_servers 2>/dev/null || echo "0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org")
+  A=""; for s in $S; do A="$A -p $s"; done
+  start-stop-daemon -S -q -b -m -p /var/run/ntpd.pid -x /usr/sbin/ntpd -- -n $A && echo "ntpd: $S" ;;
+stop) start-stop-daemon -K -q -p /var/run/ntpd.pid ;;
+restart) $0 stop; sleep 1; $0 start ;;
+esac
+exit 0

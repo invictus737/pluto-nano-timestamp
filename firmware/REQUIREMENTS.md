@@ -63,3 +63,28 @@
    libad9361, libstdc++, `ca-certificates` (TLS with system roots), busybox `ntpd` at boot (no RTC),
    optional `CONFIG_TUN` + `nftables` + `ip_forward` for IP routing through the application. Persistent
    state stays in `/mnt/jffs2` (small TOML files only).
+
+## Implemented 2026-10-17 (second firmware)
+
+- **Runtime for the application on the Pluto** (9): `soapysdr` 0.8.1, `soapyplutosdr-ts` (pgreenland
+  2bbf771 + two patches: 32-bit `std::min`, plain IIO streams reset `timestamp_every`),
+  `sdr-ip-gadget` (pgreenland 9b3864d, `S55sdr_ip_gadget`: timestamps over `uri=ip:127.0.0.1`),
+  `ca-certificates`, kernel `CONFIG_TUN=y`.
+- **Application slot**: `firmware/fetch-app.sh` puts release `app` (`<name>-armv7.tar`, binary +
+  `app.conf`) under `/opt/<name>`; `S97app` starts it when `/mnt/jffs2/<name>/` holds its config,
+  restarts it after any exit, logs to `/var/log/<name>.log`; `fw_setenv app_autostart 0` disables.
+  The repository holds no application source; without the release the image has no application.
+- **Internet over Wi-Fi when the card is on the Pluto's USB** (4): `S96usbrole`, `usb_mode` =
+  `auto` (default) | `peripheral` | `host`. Auto: a computer that configures the port keeps the stock
+  peripheral behaviour; otherwise (powered hub with the Wi-Fi card) the port becomes host after
+  ~20-30 s, and returns to peripheral when nothing has enumerated for 30 s. Wi-Fi credentials are the
+  stock `config.txt` `[WLAN]` keys; DHCP gives address, route and DNS. VBUS back-powering is still
+  the open electrical check from item 4.
+- **AIC8800 mass-storage mode**: the mdev rules from `build-aic8800.sh` were overwritten by the stock
+  `board/pluto/post-build.sh` (it installs its own `mdev.conf` after the overlay). The nano
+  `post-build.sh` now runs after it and reinstalls them, so the driver CD is ejected and the card
+  comes up as `a69c:8d80` on the Pluto.
+- **NTP time** (no RTC): BusyBox `ntpd` (fragment `busybox.fragment`), `S49ntp`, servers from
+  `fw_setenv ntp_servers` (default pool.ntp.org), retries until a network is up.
+- **btop**: wrapper sets `LANG=C.UTF-8` (musl's built-in UTF-8 locale) and `/etc/profile.d/utf8.sh`
+  sets it for every login shell; no more `No UTF-8 locale detected`.

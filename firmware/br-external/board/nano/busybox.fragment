@@ -1,0 +1,3 @@
+# NTP client (no RTC on the Pluto: wall time comes from the network)
+CONFIG_NTPD=y
+CONFIG_FEATURE_NTPD_CONF=y

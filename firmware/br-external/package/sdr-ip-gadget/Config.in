@@ -1,0 +1,11 @@
+config BR2_PACKAGE_SDR_IP_GADGET
+	bool "sdr-ip-gadget"
+	select BR2_PACKAGE_LIBIIO
+	help
+	  pgreenland's IP streaming daemon: IIO buffers (with the
+	  FPGA sample timestamps) over UDP, control port 30432, data
+	  port 30433. SoapyPlutoSDR uri=ip:<addr>,direct=1 talks to
+	  it, including uri=ip:127.0.0.1 from an application on the
+	  Pluto itself.
+
+	  https://github.com/pgreenland/pluto-sdr-ip-gadget

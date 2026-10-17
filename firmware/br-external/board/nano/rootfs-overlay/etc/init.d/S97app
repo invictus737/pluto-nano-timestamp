@@ -1,0 +1,29 @@
+#!/bin/sh
+# Optional SDR application built into this firmware under /opt/<name> (fetch-app.sh), with its
+# configuration on the persistent partition: /mnt/jffs2/<name>/. It starts only when that
+# configuration exists, restarts after any exit (5 s), and logs to /var/log/<name>.log (RAM).
+# Disable without removing the configuration: fw_setenv app_autostart 0
+for A in /opt/*/app.conf; do
+  [ -f "$A" ] || continue
+  NAME= RUN= CONF=; . "$A"
+  [ -n "$NAME" ] && [ -n "$RUN" ] || continue
+  DIR=/mnt/jffs2/$NAME; PID=/var/run/$NAME.pid; LOG=/var/log/$NAME.log
+  case "$1" in
+  start)
+    [ "$(fw_printenv -n app_autostart 2>/dev/null)" = 0 ] && continue
+    [ -f "$DIR/$CONF" ] || { echo "$NAME: no $DIR/$CONF, not started"; continue; }
+    ( cd "$DIR" || exit 1
+      while :; do
+        [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 2000000 ] && mv "$LOG" "$LOG.1"
+        echo "--- $(date) start" >> "$LOG"
+        sh -c "$RUN" >> "$LOG" 2>&1 < /dev/null
+        echo "--- $(date) exit $?" >> "$LOG"; sleep 5
+      done ) > /dev/null 2>&1 &
+    echo $! > "$PID"; echo "$NAME started (log $LOG)" ;;
+  stop)
+    [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"
+    pids=$(pidof "$NAME") && kill $pids 2>/dev/null; sleep 3; pids=$(pidof "$NAME") && kill -9 $pids 2>/dev/null
+    echo "$NAME stopped" ;;
+  esac
+done
+exit 0
