@@ -10,7 +10,7 @@
 SLOT_SKIP=256   # 64 KiB blocks = 16 MiB
 slot_unpack() {
   ls /opt/*/app.conf > /dev/null 2>&1 && return 0
-  M=$(grep '"firmware"' /proc/mtd | cut -d: -f1); [ -n "$M" ] || return 0
+  M=$(grep -E '"(qspi-linux|firmware)"' /proc/mtd | cut -d: -f1); [ -n "$M" ] || return 0
   set -- $(dd if=/dev/mtdblock${M#mtd} bs=65536 skip=$SLOT_SKIP count=1 2>/dev/null | head -c 64)
   [ "$1" = NXAPP1 ] && [ -n "$2" ] || return 0
   dd if=/dev/mtdblock${M#mtd} bs=65536 skip=$SLOT_SKIP count=$(( ($2 + 64 + 65535) / 65536 )) 2>/dev/null | \
