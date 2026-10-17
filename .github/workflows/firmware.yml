@@ -120,7 +120,7 @@ jobs:
         with: { name: nano-system_top.xsa, path: xsa-cache/system_top.xsa, if-no-files-found: error }
       - uses: actions/upload-artifact@v4
         if: always() && steps.xsa-cache.outputs.cache-hit != 'true'
-        with: { name: vivado-logs, path: "/mnt/build/work/fw/hdl/projects/pluto/pluto.runs/**/*.log", if-no-files-found: ignore }
+        with: { name: vivado-logs, path: "/mnt/build/work/fw/hdl/projects/pluto/**/*.log", if-no-files-found: ignore }
   firmware:
     name: pluto.frm / pluto.dfu
     needs: hdl

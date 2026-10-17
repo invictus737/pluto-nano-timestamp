@@ -4,6 +4,7 @@
 # usage: vivado-image.sh fetch <mountpoint>   -> exit 0 and Vivado mounted, or exit 3 if no image yet
 #        vivado-image.sh publish <install-dir> -> pack, split, upload (needs GH_TOKEN with contents:write)
 set -euo pipefail
+export GH_REPO=${GH_REPO:-${GITHUB_REPOSITORY:-invictus737/pluto-nano-timestamp}}  # gh runs outside the checkout
 TAG=vivado-2022.2-zynq7-image
 CMD=${1:?fetch|publish}; DIR=${2:?dir}
 WORK=${WORK:-/mnt/build/work/vimg}; mkdir -p "$WORK"
