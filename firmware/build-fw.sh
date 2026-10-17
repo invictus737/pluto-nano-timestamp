@@ -16,7 +16,15 @@ BR2_DL_DIR="$HOME/br-dl"
 BR2_CCACHE=y
 BR2_CCACHE_DIR="$HOME/.buildroot-ccache"
 BR2_CCACHE_USE_BASEDIR=y
+BR2_PER_PACKAGE_DIRECTORIES=y
 BR
+# top-level parallel Buildroot (independent packages at the same time; needs per-package directories)
+python3 - "$FW/Makefile" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read(); old = "\tmake -C buildroot BUSYBOX_CONFIG_FILE="
+assert s.count(old) == 1, "plutosdr-fw Makefile: buildroot 'all' call not found"
+open(p, "w").write(s.replace(old, "\tmake -C buildroot -j$$(nproc) BUSYBOX_CONFIG_FILE="))
+PY
 # Kernel and U-Boot keep ADI's compiler (Linaro GCC 7.3 arm-linux-gnueabihf). plutosdr-fw used to take
 # it from Buildroot's external toolchain; the rootfs is musl now, so provide it separately on PATH.
 LINARO=gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf
@@ -26,6 +34,18 @@ if [ ! -x "$HERE/work-linaro/$LINARO/bin/arm-linux-gnueabihf-gcc" ]; then
 fi
 export PATH="$HERE/work-linaro/$LINARO/bin:$PATH"
 arm-linux-gnueabihf-gcc --version | head -1
+# zstd ramdisk: the plutosdr-fw Makefile and FIT source name rootfs.cpio.gz and mark it gzip
+sed -i 's#rootfs\.cpio\.gz#rootfs.cpio.zst#g' "$FW/Makefile"
+python3 - "$FW/scripts/pluto.its" <<'PY'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+s, n = re.subn(r'(ramdisk@1 \{[^}]*?)rootfs\.cpio\.gz("\);[^}]*?compression = )"gzip"', r'\1rootfs.cpio.zst\2"none"', s, flags=re.S)
+assert n == 1, "ramdisk@1 node not found in " + p
+open(p, 'w').write(s)
+PY
+grep -n -A6 'ramdisk@1 {' "$FW/scripts/pluto.its" | head -8
+# no LICENSE.html / legal-info in the image
+export SKIP_LEGAL=1
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/zImage 2>&1 | tail -5
 "$HERE/build-aic8800.sh" "$FW" "$HERE/br-external/board/nano/rootfs-overlay"
@@ -36,3 +56,5 @@ if ! make build/pluto.frm > "$HERE/../fw-build.log" 2>&1; then
 fi
 tail -5 "$HERE/../fw-build.log"
 ls -la build/pluto.frm; sha256sum build/pluto.frm
+# the application slot (S97app) starts 16 MiB into the firmware partition: the FIT must end before it
+[ "$(stat -c %s build/pluto.frm)" -lt $((16 * 1024 * 1024)) ] || { echo "pluto.frm reaches the application slot at 16 MiB"; exit 1; }
