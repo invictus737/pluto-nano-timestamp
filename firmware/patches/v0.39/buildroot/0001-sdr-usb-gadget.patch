@@ -1,0 +1,142 @@
+diff --git a/board/pluto/S23udc b/board/pluto/S23udc
+index 202347f001d..5b6d94fef11 100644
+--- a/board/pluto/S23udc
++++ b/board/pluto/S23udc
+@@ -5,8 +5,10 @@ source /etc/device_config
+ CONFIGFS=/sys/kernel/config/usb_gadget
+ GADGET=$CONFIGFS/composite_gadget
+ IIOD_OPTS="-D -n $ENDPOINTS -F /dev/iio_ffs"
++SDR_USB_GADGET_OPTS="/dev/sdr_gadget_ffs"
+ UDC_HANDLE_SUSPEND=`fw_printenv -n udc_handle_suspend 2> /dev/null || echo 0`
+ USB_ETH_MODE=`fw_printenv -n usb_ethernet_mode 2> /dev/null || echo rndis`
++SDR_USB_GADGET_DEBUG=`fw_printenv -n sdr_usb_gadget_debug 2> /dev/null || echo 0`
+ 
+ if [ "$USB_ETH_MODE" == "ncm" ]
+ then
+@@ -85,6 +87,7 @@ case "$1" in
+ 	echo $serial > $GADGET/strings/0x409/serialnumber
+ 
+ 	mkdir -p $GADGET/functions/ffs.iio_ffs
++	mkdir -p $GADGET/functions/ffs.sdr_gadget_ffs
+ 	mkdir -p $GADGET/functions/acm.usb0
+ 	mkdir -p $GADGET/functions/$USB_NET_FUNCTION
+ 	mkdir -p $GADGET/functions/mass_storage.0
+@@ -100,7 +103,7 @@ case "$1" in
+ 
+ 	mkdir -p $GADGET/configs/c.1
+ 	mkdir -p $GADGET/configs/c.1/strings/0x409
+-	echo "RNDIS/MSD/ACM/IIOUSBD" > $GADGET/configs/c.1/strings/0x409/configuration
++	echo "RNDIS/MSD/ACM/IIOUSBD/SDRGADGET" > $GADGET/configs/c.1/strings/0x409/configuration
+ 
+ 	# In case the M2k is powered via the Power USB, advertise low power on the DATA USB
+ 	if [ "$TARGET" == "m2k" ]; then
+@@ -114,11 +117,23 @@ case "$1" in
+ 	ln -s $GADGET/functions/mass_storage.0 $GADGET/configs/c.1
+ 	ln -s $GADGET/functions/acm.usb0 $GADGET/configs/c.1
+ 	ln -s $GADGET/functions/ffs.iio_ffs $GADGET/configs/c.1/ffs.iio_ffs
++	ln -s $GADGET/functions/ffs.sdr_gadget_ffs $GADGET/configs/c.1/ffs.sdr_gadget_ffs
+ 
+ 	mkdir -p /dev/iio_ffs
+ 	mount iio_ffs -t functionfs /dev/iio_ffs 2> /dev/null
+ 
++	mkdir -p /dev/sdr_gadget_ffs
++	mount sdr_gadget_ffs -t functionfs /dev/sdr_gadget_ffs 2> /dev/null
++
+ 	start-stop-daemon -S -b -q -m -p /var/run/iiod.pid -x  /usr/sbin/iiod  -- $IIOD_OPTS
++	if [ "$SDR_USB_GADGET_DEBUG" == "1" ]
++	then
++		# Launch SDR USB gadget, logging to file
++		start-stop-daemon -S -b -q -m -p /var/run/sdr_usb_gadget.pid --startas /bin/sh -- -c "exec /usr/sbin/sdr_usb_gadget -d $SDR_USB_GADGET_OPTS > /var/log/sdr_usb_gadget.log 2>&1"
++	else
++		# Launch SDR USB gadget, without logging
++		start-stop-daemon -S -b -q -m -p /var/run/sdr_usb_gadget.pid -x  /usr/sbin/sdr_usb_gadget -- $SDR_USB_GADGET_OPTS
++	fi
+ 	sleep 0.2
+ 
+ 	echo ci_hdrc.0 > $GADGET/UDC
+@@ -139,16 +154,19 @@ case "$1" in
+ 
+ 	echo "" > $GADGET/UDC
+ 	start-stop-daemon -K -q -p /var/run/iiod.pid 2>/dev/null
++	start-stop-daemon -K -q -p /var/run/sdr_usb_gadget.pid 2>/dev/null
+ 
+ 	rm $GADGET/configs/c.1/$USB_NET_FUNCTION
+ 	rm $GADGET/configs/c.1/mass_storage.0
+ 	rm $GADGET/configs/c.1/acm.usb0
+ 	rm $GADGET/configs/c.1/ffs.iio_ffs
++	rm $GADGET/configs/c.1/ffs.sdr_gadget_ffs
+ 
+ 	rmdir $GADGET/strings/0x409
+ 	rmdir $GADGET/configs/c.1/strings/0x409
+ 	rmdir $GADGET/configs/c.1
+ 
++	rmdir $GADGET/functions/ffs.sdr_gadget_ffs
+ 	rmdir $GADGET/functions/ffs.iio_ffs
+ 	#rmdir $GADGET/functions/acm.usb0
+ 	rmdir $GADGET/functions/$USB_NET_FUNCTION
+diff --git a/board/pluto/device_config b/board/pluto/device_config
+index 1159fc1a940..f3fa6eaab0b 100644
+--- a/board/pluto/device_config
++++ b/board/pluto/device_config
+@@ -1,5 +1,5 @@
+ #S23udc
+-PRODUCT="PlutoSDR (ADALM-PLUTO)"
++PRODUCT="PlutoSDR (ADALM-PLUTO) with timestamp support"
+ USBPID=0xb673
+ ENDPOINTS=3
+ 
+diff --git a/configs/zynq_pluto_defconfig b/configs/zynq_pluto_defconfig
+index 6203766e040..e5a3f094d6c 100644
+--- a/configs/zynq_pluto_defconfig
++++ b/configs/zynq_pluto_defconfig
+@@ -54,8 +54,9 @@ BR2_PACKAGE_IW=y
+ BR2_PACKAGE_WPA_SUPPLICANT=y
+ BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+ BR2_PACKAGE_WPA_SUPPLICANT_PASSPHRASE=y
+ BR2_PACKAGE_POLL_SYSFS=y
+ BR2_PACKAGE_AD936X_REF_CAL=y
++BR2_PACKAGE_SDR_USB_GADGET=y
+ BR2_TARGET_ROOTFS_CPIO=y
+ BR2_TARGET_ROOTFS_CPIO_GZIP=y
+ BR2_TARGET_ROOTFS_CPIO_UIMAGE=y
+diff --git a/package/Config.in b/package/Config.in
+index 1a57ab805f2..c3620f7d8de 100644
+--- a/package/Config.in
++++ b/package/Config.in
+@@ -2757,6 +2757,7 @@ endmenu
+ menu "Applications and Tools for PlutoSDR, M2k & SidekiqZ2"
+ 	source "package/poll_sysfs/Config.in"
+ 	source "package/ad936x_ref_cal/Config.in"
++	source "package/sdr_usb_gadget/Config.in"
+ endmenu
+ 
+ menu "Applications and Tools for the JESD204B Interface Framework"
+diff --git a/package/sdr_usb_gadget/Config.in b/package/sdr_usb_gadget/Config.in
+new file mode 100644
+index 00000000000..ef72ae422a8
+--- /dev/null
++++ b/package/sdr_usb_gadget/Config.in
+@@ -0,0 +1,8 @@
++config BR2_PACKAGE_SDR_USB_GADGET
++        bool "sdr_usb_gadget"
++        select BR2_PACKAGE_LIBIIO
++        select BR2_PACKAGE_LIBAIO
++        help
++          Low latency SDR streaming gadget. Transferring IIO buffer
++          objects via USB BULK transfers as fast as possible.
++
+diff --git a/package/sdr_usb_gadget/sdr_usb_gadget.mk b/package/sdr_usb_gadget/sdr_usb_gadget.mk
+new file mode 100644
+index 00000000000..c9ab20502dc
+--- /dev/null
++++ b/package/sdr_usb_gadget/sdr_usb_gadget.mk
+@@ -0,0 +1,9 @@
++SDR_USB_GADGET_VERSION = 1.0
++SDR_USB_GADGET_SITE = https://github.com/pgreenland/pluto-sdr-usb-gadget.git
++SDR_USB_GADGET_SITE_METHOD = git
++SDR_USB_GADGET_VERSION = 7339ab52678459da4c52a457f3259d52e7adf007
++SDR_USB_GADGET_DEPENDENCIES = libiio libaio
++SDR_USB_GADGET_CONF_OPTS = -DGIT_VERSION_OVERRIDE=7339ab52678459da4c52a457f3259d52e7adf007 -DGENERATE_STATS=OFF
++
++$(eval $(cmake-package))
++

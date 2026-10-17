@@ -1,6 +1,6 @@
 name: firmware software check (stand-in bitstream, NOT for flashing)
-# Builds kernel + musl rootfs + FIT exactly like firmware.yml, but with pgreenland's CLG225
-# system_top.xsa as a stand-in, so the software side can be validated without Vivado.
+# Builds kernel + musl rootfs + FIT exactly like firmware.yml, but with ADI's v0.39 CLG225
+# system_top.xsa (no timestamping) as a stand-in, so the software side can be validated without Vivado.
 # The output does not match the Nano's pinout and must never be flashed.
 on: { workflow_dispatch: {} }
 jobs:
@@ -13,10 +13,10 @@ jobs:
         with: { tool-cache: false, android: true, dotnet: true, haskell: true, large-packages: true }
       - name: Build dependencies
         run: sudo apt-get update -q && sudo apt-get install -y -q make gcc g++ zip unzip dfu-util fakeroot u-boot-tools device-tree-compiler mtools bison flex libncurses5-dev libssl-dev bc cpio rsync cmake xz-utils libgmp-dev libmpc-dev libclang-dev libgnutls28-dev curl python3 wget
-      - name: plutosdr-fw v0.38_timestamp (all submodules)
-        run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
-      - name: Stand-in xsa (pgreenland release, CLG225)
-        run: mkdir -p xsa && curl -sL -o xsa/system_top.xsa https://github.com/pgreenland/plutosdr-fw/releases/download/v0.38_with_timestamping/system_top.xsa && ls -la xsa
+      - name: ADI plutosdr-fw v0.39 + timestamping (all submodules)
+        run: firmware/fetch-fw.sh "$PWD/fw"
+      - name: Stand-in xsa (ADI v0.39 release, CLG225)
+        run: mkdir -p xsa && curl -sfL -o xsa/system_top.xsa https://github.com/analogdevicesinc/plutosdr-fw/releases/download/v0.39/system_top.xsa && ls -la xsa
       - uses: ./.github/actions/fw-caches
       - name: btop (static ARMv7 musl, into the rootfs overlay)
         run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay

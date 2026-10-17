@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id: { description: 'firmware.yml run that produced nano-system_top.xsa', required: true }
+      vivado: { description: 'Vivado version that run used', required: true, default: '2022.2' }
 permissions: { actions: read, contents: read }
 jobs:
   seed:
@@ -12,10 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: key
-        run: |
-          FW=$(git ls-remote https://github.com/pgreenland/plutosdr-fw.git refs/heads/v0.38_timestamp | cut -f1)
-          IN=$(cat board/nano/system_constr.xdc board/nano/ps7.tcl firmware/apply-nano.sh firmware/build-hdl.sh | sha256sum | cut -c1-16)
-          echo "key=nano-xsa-v1-${FW:0:12}-${IN}" >> "$GITHUB_OUTPUT"
+        run: echo "key=$(firmware/xsa-key.sh '${{ inputs.vivado }}')" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with: { name: nano-system_top.xsa, path: xsa-cache, run-id: '${{ inputs.run_id }}', github-token: '${{ github.token }}' }
       - run: ls -la xsa-cache/system_top.xsa && echo "key ${{ steps.key.outputs.key }}"

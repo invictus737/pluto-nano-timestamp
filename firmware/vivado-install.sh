@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Unattended Vivado 2022.2 ML Standard install with Zynq-7000 devices only, for a CI runner.
-# usage: vivado-install.sh <Xilinx_Unified_2022.2_*_Lin64.bin> <destination e.g. /opt/Xilinx>
+# Unattended Vivado ML Standard install (2022.2 or 2023.2 web installer) with Zynq-7000 devices only, for a CI runner.
+# usage: vivado-install.sh <Xilinx_Unified_2022.2_*_Lin64.bin | FPGAs_AdaptiveSoCs_Unified_2023.2_*_Lin64.bin> <destination e.g. /opt/Xilinx>
 # Needs AMD_USER / AMD_PASS in the environment (the free edition still requires an account for
 # the download). Prints the installed size; fails loudly on any step.
 set -euo pipefail

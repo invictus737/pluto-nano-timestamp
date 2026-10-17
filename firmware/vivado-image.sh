@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Installed Vivado as a zstd tar stream kept in the private release "vivado-2022.2-zynq7-image"
+# Installed Vivado as a zstd tar stream kept in the private release "vivado-<VIVADO_VERSION>-zynq7-image"
 # (split in <2 GB parts). Runs unpack it instead of reinstalling.
 # usage: vivado-image.sh fetch <mountpoint>   -> exit 0 and Vivado mounted, or exit 3 if no image yet
 #        vivado-image.sh publish <install-dir> -> pack, split, upload (needs GH_TOKEN with contents:write)
 set -euo pipefail
 export GH_REPO=${GH_REPO:-${GITHUB_REPOSITORY:-invictus737/pluto-nano-timestamp}}  # gh runs outside the checkout
-TAG=vivado-2022.2-zynq7-image
+VIVADO_VERSION=${VIVADO_VERSION:-2022.2}
+TAG=vivado-$VIVADO_VERSION-zynq7-image
 CMD=${1:?fetch|publish}; DIR=${2:?dir}
 WORK=${WORK:-/mnt/build/work/vimg}; mkdir -p "$WORK"
 case "$CMD" in
@@ -23,7 +24,7 @@ publish)
   # streamed: tar | zstd | split, each 1.9 GB part uploaded and deleted as soon as it is written,
   # so publishing needs about 2 GB free instead of the whole image
   sudo apt-get install -y -q zstd >/dev/null
-  gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Vivado 2022.2 (Zynq-7000 only), installed, tar.zst parts" --notes "Private CI asset: installed AMD Vivado ML Standard 2022.2, Zynq-7000 devices only, unpacked by the firmware workflow. Not redistributed."
+  gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Vivado $VIVADO_VERSION (Zynq-7000 only), installed, tar.zst parts" --notes "Private CI asset: installed AMD Vivado ML Standard $VIVADO_VERSION, Zynq-7000 devices only, unpacked by the firmware workflow. Not redistributed."
   cd "$WORK"
   export TAG
   tar -C "$DIR" -cf - . | zstd -T0 -10 | split -b 1900M -d -a 2 \

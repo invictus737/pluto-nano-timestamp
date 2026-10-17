@@ -1,22 +1,27 @@
 name: firmware (GitHub-hosted, Vivado installed in the job)
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      vivado:
+        description: 'Vivado version (ADI v0.39 is released for 2023.2; 2022.2 builds with the ADI version check off)'
+        default: '2022.2'
+        type: choice
+        options: ['2022.2', '2023.2']
+env:
+  VIVADO_VERSION: ${{ inputs.vivado || '2022.2' }}
 permissions: { contents: write, actions: read }
 jobs:
   hdl:
-    name: Nano bitstream (Vivado 2022.2 on the runner)
+    name: Nano bitstream (Vivado ${{ inputs.vivado || '2022.2' }} on the runner)
     runs-on: ubuntu-22.04
     timeout-minutes: 350
     outputs:
       cache-hit: ${{ steps.xsa-cache.outputs.cache-hit }}
     steps:
       - uses: actions/checkout@v4
-      - name: Bitstream cache key (Nano HDL inputs + pgreenland plutosdr-fw commit)
+      - name: Bitstream cache key (Nano HDL inputs, v0.39 patches, timestamp IP, Vivado version)
         id: key
-        run: |
-          FW=$(git ls-remote https://github.com/pgreenland/plutosdr-fw.git refs/heads/v0.38_timestamp | cut -f1)
-          IN=$(cat board/nano/system_constr.xdc board/nano/ps7.tcl firmware/apply-nano.sh firmware/build-hdl.sh | sha256sum | cut -c1-16)
-          echo "key=nano-xsa-v1-${FW:0:12}-${IN}" >> "$GITHUB_OUTPUT"
+        run: echo "key=$(firmware/xsa-key.sh "$VIVADO_VERSION")" >> "$GITHUB_OUTPUT"
       - name: Restore Nano bitstream
         id: xsa-cache
         uses: actions/cache/restore@v4
@@ -91,15 +96,15 @@ jobs:
               if [ "$R" -lt 8000 ] || [ "$M" -lt 8000 ]; then echo "[disk] LOW: root ${R}M /mnt ${M}M, stopping the installer"
                 sudo du -xh --max-depth=3 / 2>/dev/null | sort -rh | head -20; sudo du -h --max-depth=3 /mnt/build 2>/dev/null | sort -rh | head -15
                 pkill -f xsetup; pkill -f java; exit 0; fi; done ) &
-          gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
-      - name: plutosdr-fw v0.38_timestamp (hdl + quantulum IP only)
+          gh release download vivado-installer --pattern "*_Unified_${VIVADO_VERSION}_*_Lin64.bin" --dir /mnt/build/work \
+            || { echo "no ${VIVADO_VERSION} web installer in release vivado-installer (the repository owner uploads it)"; exit 1; }
+          cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls *_Unified_${VIVADO_VERSION}_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado *_Unified_${VIVADO_VERSION}_*_Lin64.bin && df -h /mnt/build
+      - name: ADI plutosdr-fw v0.39 + timestamping (hdl + vendored timestamp IP only)
         if: steps.xsa-cache.outputs.cache-hit != 'true'
-        run: |
-          git clone -q -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git /mnt/build/work/fw
-          git -C /mnt/build/work/fw submodule update --init --depth 1 hdl hdl-quantulum
+        run: firmware/fetch-fw.sh /mnt/build/work/fw --hdl-only
       - name: Synthesise and implement
         if: steps.xsa-cache.outputs.cache-hit != 'true'
-        env: { VIVADO_SETTINGS: /mnt/build/Xilinx/Vivado/2022.2/settings64.sh }
+        env: { VIVADO_SETTINGS: '/mnt/build/Xilinx/Vivado/${{ inputs.vivado || ''2022.2'' }}/settings64.sh' }
         run: firmware/build-hdl.sh /mnt/build/work/fw
       - name: Collect bitstream
         run: |
@@ -132,8 +137,8 @@ jobs:
         with: { tool-cache: false, android: true, dotnet: true, haskell: true, large-packages: true }
       - name: Build dependencies (as tezuka_fw uses on GitHub-hosted runners)
         run: sudo apt-get update -q && sudo apt-get install -y -q make gcc g++ zip unzip dfu-util fakeroot u-boot-tools device-tree-compiler mtools bison flex libncurses5-dev libssl-dev bc cpio rsync cmake xz-utils libgmp-dev libmpc-dev libclang-dev libgnutls28-dev curl python3 wget
-      - name: plutosdr-fw v0.38_timestamp (all submodules)
-        run: git clone -q --recursive --shallow-submodules -b v0.38_timestamp https://github.com/pgreenland/plutosdr-fw.git fw
+      - name: ADI plutosdr-fw v0.39 + timestamping (all submodules)
+        run: firmware/fetch-fw.sh "$PWD/fw"
       - uses: actions/download-artifact@v4
         with: { name: nano-system_top.xsa, path: xsa }
       - uses: ./.github/actions/fw-caches

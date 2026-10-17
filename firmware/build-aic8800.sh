@@ -5,7 +5,13 @@
 set -euo pipefail
 FW=$(cd "${1:?fw}" && pwd); OVL=$(mkdir -p "${2:?overlay}" && cd "$2" && pwd); HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$HERE/work-aic8800; mkdir -p "$WORK"
-[ -d "$WORK/aic8800d80" ] || git clone -q --depth 1 https://github.com/shenmintao/aic8800d80.git "$WORK/aic8800d80"
+# pinned: builds against kernel 6.1 (plutosdr-fw v0.39)
+AIC_REV=${AIC_REV:-43db8006cb9b5fcd2b3191ecb7e3ea5962d39aaa}
+if [ "$(git -C "$WORK/aic8800d80" rev-parse HEAD 2>/dev/null)" != "$AIC_REV" ]; then
+  rm -rf "$WORK/aic8800d80" && git init -q "$WORK/aic8800d80"
+  git -C "$WORK/aic8800d80" fetch -q --depth 1 https://github.com/shenmintao/aic8800d80.git "$AIC_REV"
+  git -C "$WORK/aic8800d80" checkout -q FETCH_HEAD
+fi
 # the Pluto flow builds only zImage; external modules need Module.symvers and scripts/module.lds
 make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules_prepare -j"$(nproc)" >/dev/null
 make -C "$FW/linux" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- modules -j"$(nproc)" >/dev/null
