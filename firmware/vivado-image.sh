@@ -28,7 +28,7 @@ publish)
   export TAG
   tar -C "$DIR" -cf - . | zstd -T0 -10 | split -b 1900M -d -a 2 \
     --filter='cat > "$FILE" && gh release upload "$TAG" "$FILE" --clobber && rm -f "$FILE"' - vivado.tar.zst.part
-  : > vivado.complete && gh release upload "$TAG" vivado.complete --clobber
+  echo "complete $(date -u +%FT%TZ)" > vivado.complete && gh release upload "$TAG" vivado.complete --clobber  # GitHub rejects empty assets
   gh release view "$TAG" --json assets -q '.assets[] | .name+" "+(.size|tostring)'
   ;;
 esac
