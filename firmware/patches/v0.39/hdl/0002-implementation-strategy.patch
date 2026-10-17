@@ -1,0 +1,16 @@
+Implementation strategy with post-route phys_opt (timing closure with the timestamp IP).
+
+diff --git a/projects/pluto/system_project.tcl b/projects/pluto/system_project.tcl
+index 3c5d49a..434804d 100644
+--- a/projects/pluto/system_project.tcl
++++ b/projects/pluto/system_project.tcl
+@@ -15,6 +15,9 @@ adi_project_files pluto [list \
+   "$ad_hdl_dir/library/common/ad_iobuf.v"]
+ 
+ set_property is_enabled false [get_files  *system_sys_ps7_0.xdc]
++# The timestamp FIFOs and the DAC DMA on sys_cpu_clk leave ~0.2 ns of negative slack with the
++# default implementation strategy: explore placement/routing and run post-route phys_opt.
++set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
+ adi_project_run pluto
+ source $ad_hdl_dir/library/axi_ad9361/axi_ad9361_delay.tcl
+ 
