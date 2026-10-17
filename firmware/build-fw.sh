@@ -29,5 +29,10 @@ arm-linux-gnueabihf-gcc --version | head -1
 cd "$FW" && export TARGET=pluto VIVADO_SETTINGS=/nonexistent
 make build/zImage 2>&1 | tail -5
 "$HERE/build-aic8800.sh" "$FW" "$HERE/br-external/board/nano/rootfs-overlay"
-make build/pluto.frm 2>&1 | tail -30
+if ! make build/pluto.frm > "$HERE/../fw-build.log" 2>&1; then
+  # the real compiler/linker errors, not just make's tail
+  grep -n -E "error:|undefined reference|No such file|cannot find|CMake Error" "$HERE/../fw-build.log" | head -40
+  tail -30 "$HERE/../fw-build.log"; exit 1
+fi
+tail -5 "$HERE/../fw-build.log"
 ls -la build/pluto.frm; sha256sum build/pluto.frm

@@ -146,3 +146,6 @@ jobs:
         run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
       - uses: actions/upload-artifact@v4
         with: { name: pluto-nano-timestamp-frm, path: "fw/build/pluto.frm\nfw/build/pluto.frm.md5", if-no-files-found: error }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: fw-build-log, path: fw-build.log, if-no-files-found: ignore }
