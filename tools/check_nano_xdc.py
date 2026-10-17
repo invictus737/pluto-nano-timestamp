@@ -6,8 +6,8 @@ import csv, re, sys, os
 root = os.path.join(os.path.dirname(__file__), '..')
 xdc = open(os.path.join(root, 'board/nano/system_constr.xdc')).read()
 p2port = {m.group(1): m.group(2) for m in re.finditer(r'PACKAGE_PIN\s+([A-Z]+[0-9]+).*?get_ports\s+\{?\s*([A-Za-z0-9_]+(?:\[[0-9]+\])?)', xdc)}
-inputs = ('rx_clk_in', 'rx_frame_in', 'rx_data_in', 'spi_miso', 'clk_out')
-outputs = ('tx_clk_out', 'tx_frame_out', 'tx_data_out', 'enable', 'txnrx', 'spi_csn', 'spi_clk', 'spi_mosi')
+inputs = ('rx_clk_in', 'rx_frame_in', 'rx_data_in', 'spi_miso', 'clk_out', 'pl_gpio1')
+outputs = ('tx_clk_out', 'tx_frame_out', 'tx_data_out', 'enable', 'txnrx', 'spi_csn', 'spi_clk', 'spi_mosi', 'pl_gpio0')
 bad = 0
 for r in csv.DictReader(open(os.path.join(root, 'data/vendor-nano-used-pins.csv'))):
     port = p2port.get(r['pin'])
@@ -16,8 +16,10 @@ for r in csv.DictReader(open(os.path.join(root, 'data/vendor-nano-used-pins.csv'
     base = re.sub(r'\[\d+\]', '', port)
     if base in inputs and r['direction'] != 'in' or base in outputs and r['direction'] != 'out':
         print('DIRECTION MISMATCH', r['pin'], port, 'vendor', r['direction']); bad += 1
-ports = {re.sub(r'\[\d+\]', '', p) for p in p2port.values()}
-for required in ('rx_clk_in', 'rx_frame_in', 'rx_data_in', 'tx_clk_out', 'tx_frame_out', 'tx_data_out', 'enable', 'txnrx', 'gpio_resetb', 'gpio_en_agc', 'gpio_ctl', 'gpio_status', 'spi_csn', 'spi_clk', 'spi_mosi', 'spi_miso', 'clk_out', 'pl_gpio'):
+ports = {re.sub(r'\[\d+\]', '', p) for p in p2port.values()} | set(p2port.values())
+for required in ('rx_clk_in', 'rx_frame_in', 'rx_data_in', 'tx_clk_out', 'tx_frame_out', 'tx_data_out', 'enable', 'txnrx', 'gpio_resetb', 'gpio_en_agc', 'gpio_ctl', 'gpio_status', 'spi_csn', 'spi_clk', 'spi_mosi', 'spi_miso', 'clk_out',
+                 # pgreenland/ADI system_top: five scalar ports, not a pl_gpio bus
+                 'pl_gpio0', 'pl_gpio1', 'pl_gpio2', 'pl_gpio3', 'pl_gpio4'):
     if required not in ports: print('MISSING port', required); bad += 1
 print(len(p2port), 'constrained pins;', 'OK' if not bad else f'{bad} problems')
 sys.exit(1 if bad else 0)
