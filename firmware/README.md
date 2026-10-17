@@ -1,10 +1,24 @@
-# Build recipe (target: Nano bitstream with timestamping)
+Base: ADI `analogdevicesinc/plutosdr-fw` tag `v0.39` (hdl 065c8f1, linux 6.1 f3da30d, buildroot
+2023.02.5 e783aad, u-boot-xlnx 90401ce), with pgreenland's RX/TX timestamping ported on top by
+`fetch-fw.sh` (until v0.38 the base was pgreenland's `v0.38_timestamp` superproject):
 
-Base: `pgreenland/plutosdr-fw` branch `v0.38_timestamp` (submodules: ADI `plutosdr-hdl` hdl_2018_r1,
-`plutosdr-hdl-quantulum` with `util_cpack2_timestamp`, `util_upack2_timestamp`, `util_wr_sync_mux`,
-`plutosdr-linux` 2018_R1, buildroot, u-boot-xlnx pluto).
+- `patches/v0.39/hdl`: pgreenland's `system_bd.tcl` integration (hdl 1283650) resolved against the
+  v0.39 block design. v0.39 gives both DMAs a plain `sync` port (SYNC_TRANSFER_START on both) and
+  dropped SYNC from the `fifo_wr` interface: `cpack/packed_sync` feeds the RX timestamp packer
+  explicitly, `util_wr_sync_mux` (timestamp block sync or TDD channel 1) drives `adc_dma/sync`, TDD
+  channel 2 reaches `dac_dma/sync` through a second synchroniser (the DMA stream side runs on
+  sys_cpu_clk here), and the TX timestamp unpacker is reset by `axi_ad9361/rst` only.
+- `hdl-quantulum/`: pgreenland's IP repository (d701022) vendored, copied to the superproject root.
+  Its private copy of the old `fifo_wr` interface (with SYNC) is removed and the SYNC port maps
+  dropped, so ADI's interface definition is the only one; `refresh.tcl` re-checksums the cores.
+- `patches/v0.39/linux`: `# CONFIG_GCC_PLUGINS is not set` (linux f763232).
+- `patches/v0.39/buildroot`: `sdr_usb_gadget` @7339ab5, S23udc FunctionFS wiring, device_config
+  product string (buildroot 79a8629, without htop).
 
-Changes for the Nano, applied by `build.sh` on a Vivado 2022.2 host:
+ADI releases v0.39 for Vivado 2023.2. With 2022.2 (the only installer uploaded so far)
+`build-hdl.sh` sets `ADI_IGNORE_VERSION_CHECK=1`; `firmware.yml` takes the version as an input.
+
+Changes for the Nano, applied by `apply-nano.sh` (from `build.sh`, `build-hdl.sh`, `build-fw.sh`):
 
 1. `hdl/projects/pluto/system_project.tcl`: part `xc7z010clg400-1` instead of `xc7z010clg225-1`.
 2. `hdl/projects/pluto/system_constr.xdc`: replaced by `../board/nano/system_constr.xdc` (Nano balls,
