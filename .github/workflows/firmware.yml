@@ -66,7 +66,7 @@ jobs:
       - name: Vivado prerequisites
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: sudo apt-get update -q && sudo apt-get install -y -q expect libtinfo5 libncurses5 libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 libfontconfig1 locales && sudo locale-gen en_US.UTF-8
-      - name: Vivado from the SquashFS image (fast path)
+      - name: Vivado from the saved image (fast path)
         id: vimg
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
@@ -91,10 +91,6 @@ jobs:
                 sudo du -xh --max-depth=3 / 2>/dev/null | sort -rh | head -20; sudo du -h --max-depth=3 /mnt/build 2>/dev/null | sort -rh | head -15
                 pkill -f xsetup; pkill -f java; exit 0; fi; done ) &
           gh release download vivado-installer --pattern 'Xilinx_Unified_2022.2_*_Lin64.bin' --dir /mnt/build/work && cd /mnt/build/work && "$GITHUB_WORKSPACE/firmware/vivado-install.sh" "$(ls Xilinx_Unified_2022.2_*_Lin64.bin)" /mnt/build/Xilinx && rm -rf work-vivado Xilinx_Unified_2022.2_*_Lin64.bin && df -h /mnt/build
-      - name: Publish the installed Vivado as a SquashFS image (once)
-        if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
-        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
-        run: firmware/vivado-image.sh publish /mnt/build/Xilinx
       - name: plutosdr-fw v0.38_timestamp (hdl + quantulum IP only)
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         run: |
@@ -113,6 +109,11 @@ jobs:
         if: steps.xsa-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with: { path: xsa-cache/system_top.xsa, key: '${{ steps.key.outputs.key }}' }
+      - name: Publish the installed Vivado image (once, after the bitstream; streamed parts)
+        if: steps.xsa-cache.outputs.cache-hit != 'true' && steps.vimg.outputs.mounted != 'true'
+        continue-on-error: true
+        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: rm -rf /mnt/build/work/fw/build; firmware/vivado-image.sh publish /mnt/build/Xilinx
       - uses: actions/upload-artifact@v4
         with: { name: nano-system_top.xsa, path: xsa-cache/system_top.xsa, if-no-files-found: error }
       - uses: actions/upload-artifact@v4

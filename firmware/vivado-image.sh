@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installed Vivado as a compressed, read-only SquashFS image kept in the private release
-# "vivado-2022.2-zynq7-image" (split in <2 GB parts). Runs mount it instead of reinstalling.
+# Installed Vivado as a zstd tar stream kept in the private release "vivado-2022.2-zynq7-image"
+# (split in <2 GB parts). Runs unpack it instead of reinstalling.
 # usage: vivado-image.sh fetch <mountpoint>   -> exit 0 and Vivado mounted, or exit 3 if no image yet
 #        vivado-image.sh publish <install-dir> -> pack, split, upload (needs GH_TOKEN with contents:write)
 set -euo pipefail
@@ -9,19 +9,25 @@ CMD=${1:?fetch|publish}; DIR=${2:?dir}
 WORK=${WORK:-/mnt/build/work/vimg}; mkdir -p "$WORK"
 case "$CMD" in
 fetch)
+  # streamed: each part is downloaded to stdout and unpacked on the fly, never stored whole
   gh release view "$TAG" >/dev/null 2>&1 || { echo "no Vivado image release yet"; exit 3; }
-  gh release download "$TAG" --pattern 'vivado.sqfs.part*' --dir "$WORK" --clobber
-  cat $(ls "$WORK"/vivado.sqfs.part* | sort) > "$WORK/vivado.sqfs" && rm -f "$WORK"/vivado.sqfs.part*
-  ( cd "$WORK" && gh release download "$TAG" --pattern 'vivado.sqfs.sha256' --clobber && sha256sum -c vivado.sqfs.sha256 )
-  sudo mkdir -p "$DIR" && sudo mount -t squashfs -o loop,ro "$WORK/vivado.sqfs" "$DIR"
-  ls "$DIR"; du -sh "$WORK/vivado.sqfs"
+  PARTS=$(gh release view "$TAG" --json assets -q '.assets[].name' | grep '^vivado.tar.zst.part' | sort)
+  [ -n "$PARTS" ] || { echo "Vivado image release has no parts"; exit 3; }
+  gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx 'vivado.complete' || { echo "Vivado image upload incomplete"; exit 3; }
+  mkdir -p "$DIR"
+  for p in $PARTS; do gh release download "$TAG" --pattern "$p" --output -; done | zstd -d -T0 | tar -C "$DIR" -xf -
+  ls "$DIR"; du -sh "$DIR"
   ;;
 publish)
-  sudo apt-get install -y -q squashfs-tools >/dev/null
-  mksquashfs "$DIR" "$WORK/vivado.sqfs" -comp zstd -Xcompression-level 15 -b 1M -no-progress -quiet -processors "$(nproc)"
-  du -sh "$DIR" "$WORK/vivado.sqfs"
-  ( cd "$WORK" && sha256sum vivado.sqfs > vivado.sqfs.sha256 && split -b 1900M -d -a 2 vivado.sqfs vivado.sqfs.part && rm vivado.sqfs )
-  gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Vivado 2022.2 (Zynq-7000 only), installed, SquashFS zstd" --notes "Private CI asset: installed AMD Vivado ML Standard 2022.2, Zynq-7000 devices only, mounted read-only by the firmware workflow. Not redistributed."
-  gh release upload "$TAG" "$WORK"/vivado.sqfs.part* "$WORK/vivado.sqfs.sha256" --clobber
+  # streamed: tar | zstd | split, each 1.9 GB part uploaded and deleted as soon as it is written,
+  # so publishing needs about 2 GB free instead of the whole image
+  sudo apt-get install -y -q zstd >/dev/null
+  gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Vivado 2022.2 (Zynq-7000 only), installed, tar.zst parts" --notes "Private CI asset: installed AMD Vivado ML Standard 2022.2, Zynq-7000 devices only, unpacked by the firmware workflow. Not redistributed."
+  cd "$WORK"
+  export TAG
+  tar -C "$DIR" -cf - . | zstd -T0 -10 | split -b 1900M -d -a 2 \
+    --filter='cat > "$FILE" && gh release upload "$TAG" "$FILE" --clobber && rm -f "$FILE"' - vivado.tar.zst.part
+  : > vivado.complete && gh release upload "$TAG" vivado.complete --clobber
+  gh release view "$TAG" --json assets -q '.assets[] | .name+" "+(.size|tostring)'
   ;;
 esac
