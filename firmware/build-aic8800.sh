@@ -43,13 +43,16 @@ wifi)
   [ "$ACTION" = add ] || exit 0
   lsmod | grep -q '^aic8800_fdrv' && exit 0
   logger -t aic8800 "AIC8800D80 Wi-Fi present, loading driver"
-  insmod /lib/modules/$(uname -r)/extra/aic_load_fw.ko 2>/dev/null
+  # the loader defaults to /vendor/etc/firmware; this image keeps the blobs under /lib/firmware
+  insmod /lib/modules/$(uname -r)/extra/aic_load_fw.ko aic_fw_path=/lib/firmware/aic8800D80 2>/dev/null
   insmod /lib/modules/$(uname -r)/extra/aic8800_fdrv.ko 2>/dev/null
   # The card enumerates only after S96usbrole made the port a host, long after S40network ran
   # ifup -a: bring wlan0 up (wpa_supplicant + DHCP) once it exists, if S40network configured it.
   ( i=0; while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
     if [ -e /sys/class/net/wlan0 ] && grep -q '^auto wlan0' /etc/network/interfaces; then
       ifup wlan0 > /dev/null 2>&1 && logger -t aic8800 "wlan0 up" || logger -t aic8800 "ifup wlan0 failed"
+      # ifup's udhcpc -n gives up when the association is not finished yet; keep asking in the background
+      ip -4 addr show wlan0 | grep -q inet || udhcpc -R -b -p /var/run/udhcpc.wlan0.pid -i wlan0
     fi ) < /dev/null > /dev/null 2>&1 & ;;
 clone)
   [ "$ACTION" = add ] && usb_modeswitch -v 0x1111 -p 0x1111 -c /etc/usb_modeswitch.d/1111:1111 ;;
@@ -60,7 +63,7 @@ chmod +x "$OVL/lib/mdev/aic8800.sh"
 # mdev.conf: the stock Pluto rules, with sd* routed through the AIC helper first (it chains to the automounter)
 cat > "$OVL/etc/mdev.conf" <<'M'
 $MODALIAS=usb:v1111p1111.*   root:root 660 @/lib/mdev/aic8800.sh clone
-$MODALIAS=usb:va69cp8d80.*   root:root 660 @/lib/mdev/aic8800.sh wifi
+$MODALIAS=usb:v[Aa]69[Cc]p8[Dd]80.*   root:root 660 @/lib/mdev/aic8800.sh wifi
 sd[a-z]           root:root 660 */lib/mdev/aic8800.sh disk
 sd[a-z][0-9]      root:root 660 */lib/mdev/automounter.sh
 wlan[0-9]         root:root 660 */lib/mdev/ifupdown.sh
