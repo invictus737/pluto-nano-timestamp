@@ -18,6 +18,10 @@ BR2_CCACHE_DIR="$HOME/.buildroot-ccache"
 BR2_CCACHE_USE_BASEDIR=y
 BR2_PER_PACKAGE_DIRECTORIES=y
 BR
+# firmware version (/opt/VERSIONS device-fw, login banner, msd page): the patched tree would describe
+# itself as v0.39-dirty
+sed -i 's/^VERSION=$(shell git describe .*/VERSION=v0.39-nexusBS/' "$FW/Makefile"
+grep -q '^VERSION=v0.39-nexusBS$' "$FW/Makefile" || { echo "plutosdr-fw Makefile: VERSION line not found"; exit 1; }
 # top-level parallel Buildroot (independent packages at the same time; needs per-package directories)
 python3 - "$FW/Makefile" <<'PY'
 import sys
