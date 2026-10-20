@@ -7,6 +7,11 @@ T=${1:?target dir}; HERE=$(cd "$(dirname "$0")" && pwd)
 [ -f "$HERE/rootfs-overlay/etc/mdev.conf" ] && install -m 0644 "$HERE/rootfs-overlay/etc/mdev.conf" "$T/etc/mdev.conf"
 # network hotplug for every USB adapter (DHCP retry while Wi-Fi associates), over the stock helper
 install -m 0755 "$HERE/ifupdown.sh" "$T/lib/mdev/ifupdown.sh"
+# NexusBS 2.0 login banner over the stock PlutoSDR one (S45msd fills in #BUILD#)
+install -m 0644 "$HERE/motd" "$T/etc/motd"
+# root's login shell is bash (SSH and serial console); init scripts keep busybox /bin/sh
+[ -x "$T/bin/bash" ] && sed -i 's#^root:\([^:]*\):0:0:\([^:]*\):\([^:]*\):.*#root:\1:0:0:\2:\3:/bin/bash#' "$T/etc/passwd"
+grep -qx /bin/bash "$T/etc/shells" 2>/dev/null || echo /bin/bash >> "$T/etc/shells"
 # mount point of the persistent data partition (S21data)
 mkdir -p "$T/mnt/data"
 # btop refuses to start without a UTF-8 locale; musl has C.UTF-8 built in, the shell just never sets it
