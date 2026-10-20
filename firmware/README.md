@@ -71,8 +71,16 @@ upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` bring
   directly; both SDR gadgets are stopped and the USB SDR function is left out of the composite.
   Switching rebuilds the USB composite, so a USB link drops for a few seconds.
 
-Note: SoapyPlutoSDR-ts delivers hardware timestamps only through the gadgets; a direct
-`uri=local:` stream is a plain IIO stream without timestamps (RX-derived clock in NexusBS).
+In the master role the application opens the radio with `driver=plutosdr,uri=local:,direct=1,
+timestamp_every=N` (soapyplutosdr-ts patch 0003, `PlutoSDR_LocalTS`): the FPGA's timestamped DMA
+blocks are used in place, no gadget, no extra thread or queue, waits are poll() on the DMA buffer
+(no CPU while idle). One block per N samples with its 64-bit tick header, exactly the gadget
+streams' semantics. TX keeps at most `local_buffers_tx` blocks queued (default 8 = the FPGA's
+admission window of 16 x N/2 bus words, so nothing is rejected as too early; a full queue is
+back-pressure, `writeStream` times out without losing data); RX keeps `local_buffers_rx`
+(default 16). Start/stop are idempotent; a busy device (gadget still running), DMA errors and
+timeline restarts are logged rate-limited and the DMA buffer is reopened. The stream mutex now
+blocks instead of spinning. Behaviour test against a libiio mmap model: `test/` in the patch.
 
 ## Tetra Amp Plus controller
 
