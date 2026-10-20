@@ -1,8 +1,11 @@
-Local timestamped streaming for an application on the Pluto itself: uri=local:, direct=1,
-timestamp_every=N uses the FPGA's timestamped DMA blocks in place, without the USB/UDP SDR gadgets,
-threads or queues (PlutoSDR_LocalTS). Same stream semantics as the gadget streamers. Also: the
-stream mutex blocks instead of spinning (a waiter burned a core while a stream waited for data),
-and the streams are released before the IIO context in the device destructor.
+Local timestamped streaming for an application on the Pluto itself: uri=local: with direct=1 or
+local_timestamp=1 (NexusBS) and timestamp_every=N uses the FPGA's timestamped DMA blocks in place,
+without the USB/UDP SDR gadgets, threads or queues (PlutoSDR_LocalTS); same stream semantics as the
+gadget streamers. For every timestamped stream (gadgets too) the tick unit is the requested sample
+rate, not the AD9361's rounded readback (599999 for 600000 drifted a sample per second against the
+plan). Also: timestamp_every must be even; TX setSampleRate used the RX decimation flag; the stream
+mutex blocks instead of spinning (a waiter burned a core while a stream waited for data); streams
+are released before the IIO context in the device destructor.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 8f75adb..a6a2aa6 100644
@@ -18,10 +21,10 @@ index 8f75adb..a6a2aa6 100644
  
 diff --git a/PlutoSDR_LocalTS.cpp b/PlutoSDR_LocalTS.cpp
 new file mode 100644
-index 0000000..93b0577
+index 0000000..fa439e2
 --- /dev/null
 +++ b/PlutoSDR_LocalTS.cpp
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,583 @@
 +#include "PlutoSDR_LocalTS.hpp"
 +
 +#include <algorithm>
@@ -196,21 +199,26 @@ index 0000000..93b0577
 +
 +int rx_streamer_local_ts::acquire(long timeoutUs)
 +{
-+	const long long deadline = now_ns() + (timeoutUs > 0 ? (long long)timeoutUs * 1000 : 0);
++	// the deadline is computed only when a wait is needed: clock_gettime is a syscall on the A9
++	long long deadline = -1;
++	auto left = [&]() {
++		if (deadline < 0) deadline = now_ns() + (timeoutUs > 0 ? (long long)timeoutUs * 1000 : 0);
++		return left_us(deadline);
++	};
 +	const ssize_t block_bytes = (ssize_t)((timestamp_every + timestamp_size_samples) * sample_size_bytes);
 +
 +	for (;;) {
 +		if (!buf && !open_buffer()) {
-+			sleep_us(left_us(deadline));
++			sleep_us(left());
 +			return SOAPY_SDR_TIMEOUT;
 +		}
 +
 +		// hands the block we hold back to the DMA (if any), then takes the next filled one
 +		ssize_t n = iio_buffer_refill(buf);
 +		if (n == -EAGAIN) {
-+			long left = left_us(deadline);
-+			if (left <= 0) return SOAPY_SDR_TIMEOUT;
-+			int rc = wait_fd(iio_buffer_get_poll_fd(buf), POLLIN, left);
++			long us = left();
++			if (us <= 0) return SOAPY_SDR_TIMEOUT;
++			int rc = wait_fd(iio_buffer_get_poll_fd(buf), POLLIN, us);
 +			if (rc == 0) return SOAPY_SDR_TIMEOUT;
 +			if (rc > 0) continue;
 +			n = -EIO;
@@ -219,9 +227,9 @@ index 0000000..93b0577
 +			log_error.hit(SOAPY_SDR_WARNING, "RX DMA refill failed, reopening",
 +						  n < 0 ? strerror((int)-n) : "short block");
 +			close_buffer();
-+			long left = left_us(deadline);
-+			sleep_us(std::min(left, 10000L));
-+			if (left <= 10000) return SOAPY_SDR_TIMEOUT;
++			long us = left();
++			sleep_us(std::min(us, 10000L));
++			if (us <= 10000) return SOAPY_SDR_TIMEOUT;
 +			continue;
 +		}
 +
@@ -349,16 +357,16 @@ index 0000000..93b0577
 +										   const std::vector<size_t> &channels, const SoapySDR::Kwargs &args,
 +										   uint32_t _timestamp_every):
 +	dev(_dev), format(_format), timestamp_every(_timestamp_every), sample_rate(0), buf(nullptr),
-+	running(false), have_block(false), filled(0), curr_ts(0)
++	running(false), have_block(false), filled(0), curr_ts(0), pushes(0), rejections(0), have_rejections(false)
 +{
 +	if (!dev) throw std::runtime_error("cf-ad9361-dds-core-lpc not found");
 +	if (timestamp_every == 0) throw std::runtime_error("local timestamped TX needs timestamp_every");
 +	channel_list = enable_channels(dev, channels);
 +	sample_size_bytes = channel_list.size() * sizeof(int16_t);
 +	timestamp_size_samples = HEADER_BYTES / sample_size_bytes;
-+	// 8 blocks: the FPGA admits headers up to 16 x timestamp_every/2 bus words (8 blocks) ahead, so
-+	// back-pressure at 8 queued blocks never produces a "too early" rejection
-+	kernel_buffers = arg_uint(args, "local_buffers_tx", 8, 2, 64);
++	// 16 blocks, as deployed with the gadget (RX16/TX16): the queue must hold the application's TX
++	// lead (6 ms = 12 blocks of 0.5 ms); a full queue is back-pressure, never a loss
++	kernel_buffers = arg_uint(args, "local_buffers_tx", 16, 2, 64);
 +	iio_channel_attr_read_longlong(iio_device_find_channel(dev, "voltage0", true), "sampling_frequency", &sample_rate);
 +	direct_copy = (channel_list.size() == 2) && same_endianness(channel_list[0]);
 +	if (format == PLUTO_SDR_CS12 && !direct_copy)
@@ -403,6 +411,8 @@ index 0000000..93b0577
 +	}
 +	have_block = true;
 +	filled = 0;
++	have_rejections = false;
++	check_rejections();	// baseline
 +	return true;
 +}
 +
@@ -416,10 +426,15 @@ index 0000000..93b0577
 +
 +bool tx_streamer_local_ts::acquire(long timeoutUs)
 +{
-+	const long long deadline = now_ns() + (timeoutUs > 0 ? (long long)timeoutUs * 1000 : 0);
++	if (buf && have_block) return true;	// fast path, no syscall
++	long long deadline = -1;
++	auto left = [&]() {
++		if (deadline < 0) deadline = now_ns() + (timeoutUs > 0 ? (long long)timeoutUs * 1000 : 0);
++		return left_us(deadline);
++	};
 +	for (;;) {
 +		if (!buf && !open_buffer()) {
-+			sleep_us(left_us(deadline));
++			sleep_us(left());
 +			return false;
 +		}
 +		if (have_block) return true;
@@ -431,18 +446,18 @@ index 0000000..93b0577
 +			return true;
 +		}
 +		if (r == -EAGAIN) {
-+			long left = left_us(deadline);
-+			if (left <= 0) return false;
-+			int rc = wait_fd(iio_buffer_get_poll_fd(buf), POLLIN | POLLOUT, left);
++			long us = left();
++			if (us <= 0) return false;
++			int rc = wait_fd(iio_buffer_get_poll_fd(buf), POLLIN | POLLOUT, us);
 +			if (rc == 0) return false;
 +			if (rc > 0) continue;
 +			r = -EIO;
 +		}
 +		log_error.hit(SOAPY_SDR_WARNING, "TX DMA dequeue failed, reopening", strerror((int)-r));
 +		close_buffer();
-+		long left = left_us(deadline);
-+		sleep_us(std::min(left, 10000L));
-+		if (left <= 10000) return false;
++		long us = left();
++		sleep_us(std::min(us, 10000L));
++		if (us <= 10000) return false;
 +	}
 +}
 +
@@ -454,6 +469,7 @@ index 0000000..93b0577
 +	filled = 0;
 +	// enqueue (the samples belong to the DMA from here on), then try to dequeue the next block
 +	ssize_t r = iio_buffer_push(buf);
++	if (++pushes % 1000 == 0) check_rejections();
 +	if (r >= 0) {
 +		have_block = true;
 +		return;
@@ -462,6 +478,23 @@ index 0000000..93b0577
 +	if (r == -EAGAIN) return;	// enqueued; the next block is taken by acquire()
 +	log_error.hit(SOAPY_SDR_WARNING, "TX DMA push failed, reopening", strerror((int)-r));
 +	close_buffer();
++}
++
++void tx_streamer_local_ts::check_rejections()
++{
++	// DAC timestamp gate: blocks whose header was late, or more than 8 blocks (16 x N/2 bus words)
++	// ahead of the DAC, are dropped by the FPGA and counted here
++	uint32_t v = 0;
++	if (iio_device_reg_read((iio_device *)dev, 0x800000B8, &v) < 0) return;
++	if (have_rejections && v != rejections) {
++		char detail[160];
++		std::snprintf(detail, sizeof(detail),
++					  "%u more blocks dropped by the FPGA gate: late, or stamped more than 8 blocks (%u samples) ahead",
++					  v - rejections, timestamp_every * 8);
++		log_rejected.hit(SOAPY_SDR_WARNING, "TX blocks rejected", detail);
++	}
++	rejections = v;
++	have_rejections = true;
 +}
 +
 +void tx_streamer_local_ts::convert(const void * const *buffs, size_t items)
@@ -577,10 +610,10 @@ index 0000000..93b0577
 +}
 diff --git a/PlutoSDR_LocalTS.hpp b/PlutoSDR_LocalTS.hpp
 new file mode 100644
-index 0000000..f5227e4
+index 0000000..220d110
 --- /dev/null
 +++ b/PlutoSDR_LocalTS.hpp
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,131 @@
 +#pragma once
 +
 +// Timestamped streaming for an application running on the Pluto itself (uri=local:, direct=1,
@@ -593,7 +626,10 @@ index 0000000..f5227e4
 +//     DMA block straight into the caller's buffer.
 +// TX: send() writes header and samples straight into the DMA block it holds and enqueues it when
 +//     full; the free-block wait is poll() with the caller's timeout (back-pressure, nothing is
-+//     dropped). With libiio's mmap interface a push enqueues first and dequeues the next block
++//     dropped). Queue (local_buffers_tx, 16) and FPGA admission window are different limits: the
++//     gate drops a header stamped more than 8 x timestamp_every samples ahead of the DAC whatever
++//     the queue depth, so the application's TX lead must stay under 8 blocks; the gate's drop
++//     counter is sampled every 1000 blocks and reported. With libiio's mmap interface a push enqueues first and dequeues the next block
 +//     second: a dequeue that returns EAGAIN leaves no block in hand, and only the dequeue is
 +//     retried, so a block is never enqueued twice or written while the DMA owns it.
 +// start()/stop() are idempotent; the DMA buffer exists only between them. Errors, a busy device
@@ -695,29 +731,35 @@ index 0000000..f5227e4
 +		bool have_block;			// a dequeued DMA block is ours to write
 +		size_t filled;				// samples in the held block
 +		uint64_t curr_ts;			// tick of the next sample written
++		uint64_t pushes;
++		uint32_t rejections;		// FPGA gate drop counter (0x800000B8) at the last check
++		bool have_rejections;
 +
-+		PlutoSDR_LocalTS::RateLog log_open, log_error, log_backwards;
++		PlutoSDR_LocalTS::RateLog log_open, log_error, log_backwards, log_rejected;
 +
 +		bool open_buffer();
 +		void close_buffer();
 +		bool acquire(long timeoutUs);
 +		void push_block();
++		void check_rejections();
 +		void convert(const void * const *buffs, size_t items);
 +		uint8_t *block_samples();
 +};
 diff --git a/PlutoSDR_Settings.cpp b/PlutoSDR_Settings.cpp
-index 5db2749..0642b9b 100644
+index 5db2749..510c4c5 100644
 --- a/PlutoSDR_Settings.cpp
 +++ b/PlutoSDR_Settings.cpp
-@@ -72,6 +72,7 @@ SoapyPlutoSDR::SoapyPlutoSDR( const SoapySDR::Kwargs &args ):
+@@ -72,6 +72,9 @@ SoapyPlutoSDR::SoapyPlutoSDR( const SoapySDR::Kwargs &args ):
  	#endif
  	ip_sdr_dev_control = -1;
  	ip_sdr_dev_data = -1;
 +	local_direct = false;
++	rx_rate_logical = 0;
++	tx_rate_logical = 0;
  
  	// Assume loopback unchanged
  	loopback = -1;
-@@ -89,6 +90,10 @@ SoapyPlutoSDR::SoapyPlutoSDR( const SoapySDR::Kwargs &args ):
+@@ -89,6 +92,10 @@ SoapyPlutoSDR::SoapyPlutoSDR( const SoapySDR::Kwargs &args ):
  
  SoapyPlutoSDR::~SoapyPlutoSDR(void){
  
@@ -728,7 +770,50 @@ index 5db2749..0642b9b 100644
  	long long samplerate=0;
  	if(decimation){
  		iio_channel_attr_read_longlong(iio_device_find_channel(dev, "voltage0", false),"sampling_frequency",&samplerate);
-@@ -864,6 +869,11 @@ void SoapyPlutoSDR::handle_direct_args(const SoapySDR::Kwargs & args)
+@@ -633,6 +640,8 @@ void SoapyPlutoSDR::setSampleRate( const int direction, const size_t channel, co
+ 
+ 		iio_channel_attr_write_longlong(iio_device_find_channel(rx_dev, "voltage0", false), "sampling_frequency", decimation?samplerate/8:samplerate);
+ 
++		// the requested rate is the timestamp unit (the readback is rounded)
++		rx_rate_logical = (long long)rate;
+ 		if(rx_stream)
+ 			rx_stream->set_buffer_size_by_samplerate(decimation ? samplerate / 8 : samplerate);
+ 	}
+@@ -656,8 +665,9 @@ void SoapyPlutoSDR::setSampleRate( const int direction, const size_t channel, co
+ 		iio_channel_attr_write_longlong(iio_device_find_channel(dev, "voltage0", true),"sampling_frequency", samplerate);
+ 		iio_channel_attr_write_longlong(iio_device_find_channel(tx_dev, "voltage0", true), "sampling_frequency", interpolation?samplerate / 8:samplerate);
+ 
++		tx_rate_logical = (long long)rate;
+ 		if(tx_stream)
+-			tx_stream->set_samplerate(decimation ? samplerate / 8 : samplerate);
++			tx_stream->set_samplerate(interpolation ? samplerate / 8 : samplerate);
+ 	}
+ 
+ #ifdef HAS_AD9361_IIO
+@@ -816,6 +826,22 @@ void SoapyPlutoSDR::handle_direct_args(const SoapySDR::Kwargs & args)
+ 	if (args.count("usb_direct") != 0) direct_val = args.at("usb_direct");
+ 	if (args.count("direct") != 0) direct_val = args.at("direct");
+ 
++	// local_timestamp=1: timestamped local DMA without saying direct=1 (NexusBS's spelling)
++	if (args.count("local_timestamp") != 0 && args.at("local_timestamp") != "0") {
++		if (args.at("local_timestamp") != "1" || 0 != strcmp(iio_context_get_name(ctx), "local")) {
++			SoapySDR_logf(SOAPY_SDR_ERROR, "local_timestamp=1 needs uri=local: (on the Pluto itself)");
++			throw std::runtime_error("local_timestamp=1 needs uri=local:");
++		}
++		direct_val = "1";
++	}
++	// explicit timestamp unit for an application attaching without setting the rate
++	if (args.count("local_timestamp_rate") != 0) {
++		long long r = 0;
++		try { r = std::stoll(args.at("local_timestamp_rate")); } catch (...) { r = 0; }
++		if (r < 1 || r > 61440000) throw std::runtime_error("invalid local_timestamp_rate");
++		rx_rate_logical = tx_rate_logical = r;
++	}
++
+ 	if (direct_val == "1") {
+ 		if (0 == strcmp(iio_context_get_name(ctx), "usb")) {
+ 			// Connected via usb, check if usb support is available to support direct mode
+@@ -864,6 +890,11 @@ void SoapyPlutoSDR::handle_direct_args(const SoapySDR::Kwargs & args)
  			}
  			this->udp_packet_size = udp_packet_size;
  		}
@@ -740,8 +825,32 @@ index 5db2749..0642b9b 100644
  	}
  	else if (direct_val == "0") {
  		// default value
+@@ -931,15 +962,21 @@ void SoapyPlutoSDR::handle_timestamp_every_arg(const SoapySDR::Kwargs & args, bo
+ 		// Check timestamp every is only asserted with usb_direct for now
+ 		if (new_timestamp_every > 0) {
+ 			#ifdef HAS_LIBUSB1
+-			if (!this->usb_sdr_dev && -1 == this->ip_sdr_dev_control) {
++			if (!this->local_direct && !this->usb_sdr_dev && -1 == this->ip_sdr_dev_control) {
+ 			#else
+-			if (-1 == this->ip_sdr_dev_control) {
++			if (!this->local_direct && -1 == this->ip_sdr_dev_control) {
+ 			#endif
+ 				SoapySDR_logf(SOAPY_SDR_ERROR, "timestamp_every only currently supported with direct mode");
+ 				throw std::runtime_error("timestamp_every only currently supported with direct mode");
+ 			}
+ 		}
+ 
++		// One I/Q channel carries two samples per 64-bit bus word: the FPGA counts N/2 words
++		if (new_timestamp_every % 2 != 0) {
++			SoapySDR_logf(SOAPY_SDR_ERROR, "timestamp_every must be even");
++			throw std::runtime_error("timestamp_every must be even");
++		}
++
+ 		// Set appropriate timestamp_every
+ 		if (tx) {
+ 			timestamp_every_tx = new_timestamp_every;
 diff --git a/PlutoSDR_Streaming.cpp b/PlutoSDR_Streaming.cpp
-index d181bbe..e450fc8 100644
+index d181bbe..8c352b7 100644
 --- a/PlutoSDR_Streaming.cpp
 +++ b/PlutoSDR_Streaming.cpp
 @@ -121,7 +121,12 @@ SoapySDR::Stream *SoapyPlutoSDR::setupStream(
@@ -758,7 +867,18 @@ index d181bbe..e450fc8 100644
  		{
  			// Use ip streaming gadget
  			this->rx_stream = std::unique_ptr<rx_streamer>(new rx_streamer_ip_gadget (rx_dev,
-@@ -154,7 +159,12 @@ SoapySDR::Stream *SoapyPlutoSDR::setupStream(
+@@ -144,6 +149,10 @@ SoapySDR::Stream *SoapyPlutoSDR::setupStream(
+ 			this->rx_stream = std::unique_ptr<rx_streamer>(new rx_streamer_iio (rx_dev, streamFormat, channels, args));
+ 		}
+ 
++		// timestamped streams count ticks in the requested rate, not the rounded readback
++		if (timestamp_every_rx > 0 && rx_rate_logical > 0)
++			this->rx_stream->set_buffer_size_by_samplerate((size_t)rx_rate_logical);
++
+         return reinterpret_cast<SoapySDR::Stream*>(this->rx_stream.get());
+ 	}
+ 
+@@ -154,7 +163,12 @@ SoapySDR::Stream *SoapyPlutoSDR::setupStream(
  		iio_channel_attr_write_bool(
  			iio_device_find_channel(dev, "altvoltage1", true), "powerdown", false); // Turn ON TX LO
  
@@ -772,8 +892,18 @@ index d181bbe..e450fc8 100644
  		{
  			// Use ip streaming gadget
  			this->tx_stream = std::unique_ptr<tx_streamer>(new tx_streamer_ip_gadget (tx_dev,
+@@ -177,6 +191,9 @@ SoapySDR::Stream *SoapyPlutoSDR::setupStream(
+ 			this->tx_stream = std::unique_ptr<tx_streamer>(new tx_streamer_iio (tx_dev, streamFormat, channels, args));
+ 		}
+ 
++		if (timestamp_every_tx > 0 && tx_rate_logical > 0)
++			this->tx_stream->set_samplerate((size_t)tx_rate_logical);
++
+         return reinterpret_cast<SoapySDR::Stream*>(this->tx_stream.get());
+ 	}
+ 
 diff --git a/SoapyPlutoSDR.hpp b/SoapyPlutoSDR.hpp
-index 57f8176..65d98fa 100644
+index 57f8176..cc4f99a 100644
 --- a/SoapyPlutoSDR.hpp
 +++ b/SoapyPlutoSDR.hpp
 @@ -21,6 +21,7 @@
@@ -806,12 +936,17 @@ index 57f8176..65d98fa 100644
  };
  
  
-@@ -366,6 +370,8 @@ class SoapyPlutoSDR : public SoapySDR::Device{
+@@ -366,6 +370,13 @@ class SoapyPlutoSDR : public SoapySDR::Device{
  
  		/* "Direct" IP ethernet gadget */
  		int ip_sdr_dev_control;
-+		// uri=local: with direct=1: timestamped DMA in place (PlutoSDR_LocalTS), no gadget
++		// uri=local: with direct=1 or local_timestamp=1: timestamped DMA in place (PlutoSDR_LocalTS)
 +		bool local_direct;
++		// Requested (logical) sample rates: the unit of the FPGA sample counter for every timestamped
++		// stream. The AD9361 readback is rounded (599999 for a 600000 plan) and would make the
++		// tick/time conversion drift by a sample per second against the application's plan.
++		long long rx_rate_logical;
++		long long tx_rate_logical;
  		int ip_sdr_dev_data;
  		size_t udp_packet_size;
  		void open_sdr_ip_gadget(void);
@@ -827,10 +962,10 @@ index 0000000..aa3e7ae
 +    c++ -std=c++14 -fsanitize=address,undefined -I<headers> -I.. localts_mock_test.cpp ../PlutoSDR_LocalTS.cpp
 diff --git a/test/localts_mock_test.cpp b/test/localts_mock_test.cpp
 new file mode 100644
-index 0000000..87b2800
+index 0000000..f9375f1
 --- /dev/null
 +++ b/test/localts_mock_test.cpp
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,270 @@
 +// Behaviour test of PlutoSDR_LocalTS against a model of libiio 0.26's mmap ("high speed") local
 +// buffers: get_buffer enqueues the block handed out last, then dequeues the next one; in
 +// non-blocking mode the dequeue may return -EAGAIN after the enqueue already happened.
@@ -870,7 +1005,7 @@ index 0000000..87b2800
 +struct iio_channel { int idx; bool enabled; };
 +struct Block { std::vector<uint8_t> data; enum { KERNEL, USER } owner = KERNEL; std::vector<uint8_t> snapshot; };
 +struct iio_device {
-+	bool tx; iio_channel ch[4]; unsigned kbuf = 4; uint32_t reg_bc = 0;
++	bool tx; iio_channel ch[4]; unsigned kbuf = 4; uint32_t reg_bc = 0; uint32_t reg_rejects = 0;
 +	bool open = false; int fail_create_errno = 0; int fail_next_io = 0;
 +	std::vector<Block> blocks; size_t block_bytes = 0;
 +	std::deque<int> incoming, outgoing;	// RX: incoming=kernel to fill, outgoing=filled; TX: incoming=queued for DAC, outgoing=free
@@ -892,7 +1027,7 @@ index 0000000..87b2800
 +int iio_channel_attr_read_longlong(const iio_channel *, const char *, long long *v) { *v = 200000; return 0; }
 +void iio_channel_convert(const iio_channel *, void *dst, const void *src) { std::memcpy(dst, src, 2); }
 +void iio_channel_convert_inverse(const iio_channel *, void *dst, const void *src) { std::memcpy(dst, src, 2); }
-+int iio_device_reg_read(iio_device *d, uint32_t, uint32_t *v) { *v = d->reg_bc; return 0; }
++int iio_device_reg_read(iio_device *d, uint32_t a, uint32_t *v) { *v = a == 0x800000B8 ? d->reg_rejects : d->reg_bc; return 0; }
 +int iio_device_reg_write(iio_device *d, uint32_t, uint32_t v) { d->reg_bc = v; return 0; }
 +int iio_device_set_kernel_buffers_count(const iio_device *d, unsigned int n) { ((iio_device *)d)->kbuf = n; return 0; }
 +
@@ -1030,16 +1165,16 @@ index 0000000..87b2800
 +		int16_t s[2 * 250]; for (int i = 0; i < 250; i++) { s[2 * i] = (int16_t)(i + 1); s[2 * i + 1] = (int16_t)-(i + 1); }
 +		const void *sp[1] = {s}; int flags = SOAPY_SDR_HAS_TIME;
 +		CHECK(tx.send(sp, 250, flags, 0, 1000) == SOAPY_SDR_STREAM_ERROR);	// not activated
-+		CHECK(g_tx.kbuf == 8 || true);
++		
 +		tx.start(0, 0, 0); tx.start(0, 0, 0);
-+		CHECK(g_tx.kbuf == 8);
++		CHECK(g_tx.kbuf == 16);
 +		long long t0 = SoapySDR::ticksToTimeNs(10000, 200000);
 +		size_t done = 0;
 +		while (done < 250) {
 +			const void *p[1] = {s + 2 * done}; int f = (done == 0 ? SOAPY_SDR_HAS_TIME : 0) | SOAPY_SDR_END_BURST;
 +			int r = tx.send(p, 250 - done, f, t0, 1000); CHECK(r > 0); if (r <= 0) break; done += r;
 +		}
-+		tx_consume(8);
++		tx_consume(16);
 +		CHECK(g_tx.transmitted.size() == 3);
 +		if (g_tx.transmitted.size() == 3) {
 +			CHECK(hdr(g_tx.transmitted[0]) == 10000); CHECK(hdr(g_tx.transmitted[1]) == 10100); CHECK(hdr(g_tx.transmitted[2]) == 10200);
@@ -1053,7 +1188,7 @@ index 0000000..87b2800
 +		CHECK(tx.send(p1, 40, f, SoapySDR::ticksToTimeNs(20000, 200000), 1000) == 40);
 +		f = SOAPY_SDR_HAS_TIME | SOAPY_SDR_END_BURST;
 +		CHECK(tx.send(p1, 60, f, SoapySDR::ticksToTimeNs(20050, 200000), 1000) == 50);	// 10 padded, 50 fit
-+		tx_consume(8);
++		tx_consume(16);
 +		CHECK(g_tx.transmitted.size() == 1);
 +		if (!g_tx.transmitted.empty()) {
 +			CHECK(hdr(g_tx.transmitted[0]) == 20000); CHECK(smp(g_tx.transmitted[0], 39, 0) == 40);
@@ -1064,20 +1199,30 @@ index 0000000..87b2800
 +		g_tx.transmitted.clear();
 +		int enq0 = g_tx.enqueues; long long t = SoapySDR::ticksToTimeNs(30000, 200000);
 +		int sent_blocks = 0; int r = 0;
-+		for (int k = 0; k < 20; k++) {
++		for (int k = 0; k < 40; k++) {
 +			const void *p[1] = {s}; int fl = (k == 0 ? SOAPY_SDR_HAS_TIME : 0);
 +			r = tx.send(p, N, fl, t, 2000);
 +			if (r == SOAPY_SDR_TIMEOUT) break;
 +			CHECK(r == (int)N); sent_blocks++;
 +		}
-+		CHECK(r == SOAPY_SDR_TIMEOUT); CHECK(sent_blocks == 8);	// 8 DMA blocks, the 8th push found no free block
-+		CHECK(g_tx.enqueues - enq0 == 8);
++		CHECK(r == SOAPY_SDR_TIMEOUT); CHECK(sent_blocks == 16);	// 16 DMA blocks, the 16th push found no free block
++		CHECK(g_tx.enqueues - enq0 == 16);
 +		tx_consume(2);
 +		const void *p[1] = {s}; int fl = 0;
 +		CHECK(tx.send(p, N, fl, 0, 2000) == (int)N);	// resumes after the DAC freed blocks
-+		tx_consume(8);
-+		CHECK(g_tx.transmitted.size() == 9);
++		tx_consume(16);
++		CHECK(g_tx.transmitted.size() == 17);
 +		for (size_t k = 0; k < g_tx.transmitted.size(); k++) CHECK(hdr(g_tx.transmitted[k]) == 30000 + 100 * k);
++
++		std::printf("TX: FPGA gate rejections are reported (sampled every 1000 blocks)\n");
++		{
++			int w = warnings; g_tx.reg_rejects += 7;
++			for (int k = 0; k < 1000; k++) { const void *q[1] = {s}; int fl2 = 0; int rr = tx.send(q, N, fl2, 0, 2000); CHECK(rr == (int)N); tx_consume(16); }
++			CHECK(warnings == w + 1);
++			w = warnings;
++			for (int k = 0; k < 1000; k++) { const void *q[1] = {s}; int fl2 = 0; tx.send(q, N, fl2, 0, 2000); tx_consume(16); }
++			CHECK(warnings == w);	// no new rejections, no new log
++		}
 +
 +		std::printf("TX: push error -> reopen, stream continues\n");
 +		g_tx.fail_next_io = EIO;

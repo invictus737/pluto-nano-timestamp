@@ -71,16 +71,25 @@ upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` bring
   directly; both SDR gadgets are stopped and the USB SDR function is left out of the composite.
   Switching rebuilds the USB composite, so a USB link drops for a few seconds.
 
-In the master role the application opens the radio with `driver=plutosdr,uri=local:,direct=1,
-timestamp_every=N` (soapyplutosdr-ts patch 0003, `PlutoSDR_LocalTS`): the FPGA's timestamped DMA
-blocks are used in place, no gadget, no extra thread or queue, waits are poll() on the DMA buffer
-(no CPU while idle). One block per N samples with its 64-bit tick header, exactly the gadget
-streams' semantics. TX keeps at most `local_buffers_tx` blocks queued (default 8 = the FPGA's
-admission window of 16 x N/2 bus words, so nothing is rejected as too early; a full queue is
-back-pressure, `writeStream` times out without losing data); RX keeps `local_buffers_rx`
-(default 16). Start/stop are idempotent; a busy device (gadget still running), DMA errors and
-timeline restarts are logged rate-limited and the DMA buffer is reopened. The stream mutex now
-blocks instead of spinning. Behaviour test against a libiio mmap model: `test/` in the patch.
+In the master role the application opens the radio with `driver=plutosdr,uri=local:` plus
+`local_timestamp=1` (NexusBS) or `direct=1`, and `timestamp_every=N` (soapyplutosdr-ts patch 0003,
+`PlutoSDR_LocalTS`): the FPGA's timestamped DMA blocks are used in place, no gadget, no extra thread
+or queue, waits are poll() on the DMA buffer (no CPU while idle, no clock syscall on the fast path).
+One block per N samples with its 64-bit tick header, the gadget streams' semantics. Start/stop are
+idempotent; a busy device (gadget still running), DMA errors and timeline restarts are logged
+rate-limited and the DMA buffer is reopened. The stream mutex now blocks instead of spinning.
+
+Buffers, two different limits:
+- **DMA queue** `local_buffers_rx`/`local_buffers_tx`, default **16/16** (as deployed with the
+  gadget; RX4 lost samples). A full TX queue is back-pressure: `writeStream` times out, no loss.
+- **FPGA admission window: 8 blocks.** The DAC gate drops a header stamped more than
+  16 x N/2 bus words = **8 x N samples** ahead of the DAC (and any late one), whatever the queue
+  depth. The application's TX lead must stay under 8 blocks (4 ms at N = rate/2000, 8 ms at
+  N = rate/1000), on every timestamped path: local, USB and IP gadget. The local TX streamer
+  samples the gate's drop counter (0x800000B8) every 1000 blocks and logs any increase.
+
+The tick unit of every timestamped stream is the requested sample rate (the AD9361 readback is
+rounded, 599999 for 600000). Behaviour test against a libiio mmap model: `test/` in the patch.
 
 ## Tetra Amp Plus controller
 
