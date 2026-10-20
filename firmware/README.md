@@ -58,6 +58,15 @@ r8188eu/rtl8xxxu/rtl8192cu (in kernel, `rtlwifi` firmware); `wpa_supplicant` has
 upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` brings any hot-plugged
 `wlan*`/`eth*` up from `/etc/network/interfaces` (config.txt) and keeps DHCP retrying.
 
+## Station role: slave (default) or master
+
+`nexus-role` (U-Boot environment `nexus_role`). **slave**, the default: the Pluto is the SDR of a
+NexusBS running elsewhere, e.g. a Raspberry Pi with the Pluto on USB (`uri=usb:` / RNDIS
+`ip:192.168.2.1`) or on the network (`uri=ip:<pluto>,direct=1,timestamp_every=...`, UDP gadget
+30432/30433); nothing else is started. **master**: `nexus-role master` starts the applications on
+`/mnt/data/<name>/app.conf` now and at every boot (NexusBS on the Pluto, radio via `ip:127.0.0.1`);
+`nexus-role slave` stops them. The role is shown at login.
+
 ## Tetra Amp Plus controller
 
 The amplifier's RP2040 (pico-sdk USB CDC, VID 2e8a) appears as `/dev/tetra-amp` (mdev, other

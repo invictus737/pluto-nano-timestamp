@@ -1,0 +1,19 @@
+#!/bin/sh
+# Station role of this Pluto (U-Boot environment nexus_role, default slave):
+#   slave   SDR for NexusBS running elsewhere (a Raspberry Pi over USB or the network): iiod and
+#           the timestamp UDP gadget serve the radio, no application is started on the Pluto.
+#   master  NexusBS runs on the Pluto itself (S97app starts /mnt/data/<name>/app.conf), using
+#           the radio through uri=ip:127.0.0.1. Do not point an external NexusBS at it meanwhile.
+# usage: nexus-role [slave|master|status]   (the change is applied now and kept across reboots)
+R=$(fw_printenv -n nexus_role 2>/dev/null || echo slave)
+case "${1:-status}" in
+slave|master)
+	[ "$1" = "$R" ] || fw_setenv nexus_role "$1" || exit 1
+	if [ "$1" = master ]; then /etc/init.d/S97app start; else /etc/init.d/S97app stop; fi
+	logger -t nexus-role "role $1"; echo "role: $1" ;;
+status)
+	echo "role: $R"
+	for p in /var/run/*.pid; do n=$(basename $p .pid); [ -f /mnt/data/$n/app.conf ] || [ -f /opt/$n/app.conf ] || continue
+		kill -0 "$(cat $p)" 2>/dev/null && echo "running: $n (log /var/log/$n.log)"; done ;;
+*) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

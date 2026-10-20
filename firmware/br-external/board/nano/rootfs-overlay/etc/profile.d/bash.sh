@@ -4,3 +4,5 @@ if [ -n "$BASH_VERSION" ]; then
   HISTFILE=/root/.bash_history HISTSIZE=1000 HISTCONTROL=ignoredups
   alias ll='ls -la'
 fi
+# station role at login
+case "$-" in *i*) echo "Role: $(fw_printenv -n nexus_role 2>/dev/null || echo slave)  (nexus-role slave|master)"; echo ;; esac
