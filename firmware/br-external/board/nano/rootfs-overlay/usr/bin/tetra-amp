@@ -1,0 +1,43 @@
+#!/bin/sh
+# Tetra Amp Plus controller (RP2040 on USB) from the Pluto.
+#   tetra-amp <command...>      one console command, prints the reply (help, status, tx on, tx off,
+#                               kill, reset, bias ..., lim ..., cal ..., save, ...: see 'tetra-amp help')
+#   tetra-amp watch             status 4 times per second (stream 1) until Ctrl-C
+#   tetra-amp flash <file.uf2>  firmware update: BOOTSEL by 1200-baud touch, copy to RPI-RP2
+# Port: /dev/tetra-amp (mdev, VID 2e8a), or TETRA_AMP=/dev/ttyACMx.
+DEV=${TETRA_AMP:-/dev/tetra-amp}
+die() { echo "tetra-amp: $*" >&2; exit 1; }
+port() { [ -c "$DEV" ] || die "no controller ($DEV): amplifier USB not connected?"; stty -F "$DEV" 115200 raw -echo -echoe -echok -icrnl -onlcr; }
+case "$1" in
+""|-h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+watch)
+	port; exec 3<>"$DEV"; trap 'printf "stream 0\n" >&3; exit 0' INT TERM
+	printf 'stream 1\n' >&3; tr -d '\r' <&3 ;;
+flash)
+	[ -f "$2" ] || die "usage: tetra-amp flash <file.uf2>"
+	if [ -c "$DEV" ]; then
+		printf 'tx off\n' > "$DEV" 2>/dev/null; sleep 1
+		stty -F "$DEV" 1200; sleep 1   # pico-sdk stdio_usb: 1200 baud = reboot into BOOTSEL
+	fi
+	n=0; while :; do
+		m=$(grep -l -s RPI-RP2 /media/*/INFO_UF2.TXT | head -1)
+		[ -n "$m" ] && break; n=$((n+1)); [ $n -lt 20 ] || die "no RPI-RP2 drive (hold BOOT while plugging the module)"; sleep 1
+	done
+	d=${m%/INFO_UF2.TXT}; echo "copying $2 to $d"; cp "$2" "$d/" && sync
+	n=0; while [ ! -c "$DEV" ] && [ $n -lt 20 ]; do sleep 1; n=$((n+1)); done
+	[ -c "$DEV" ] && echo "controller back on $DEV" || die "controller did not come back" ;;
+*)
+	port; exec 3<>"$DEV"
+	# drop anything queued (stream lines, events), then one command
+	while IFS= read -r -t 0.1 l <&3; do :; done
+	printf '%s\n' "$*" >&3
+	# reply ends with an OK/ERR line or the status JSON; multi-line listings end when the port is quiet
+	rc=0; got=0
+	while IFS= read -r -t 1 l <&3; do
+		l=$(printf '%s' "$l" | tr -d '\r'); [ "$l" = "$*" ] && continue
+		echo "$l"; got=1
+		case "$l" in OK*) break ;; ERR*) rc=1; break ;; \{*) [ "$1" = status ] && break ;; esac
+	done
+	[ $got = 1 ] || { echo "tetra-amp: no reply" >&2; rc=2; }
+	exit $rc ;;
+esac

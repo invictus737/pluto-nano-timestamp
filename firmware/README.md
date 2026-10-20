@@ -58,6 +58,22 @@ r8188eu/rtl8xxxu/rtl8192cu (in kernel, `rtlwifi` firmware); `wpa_supplicant` has
 upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` brings any hot-plugged
 `wlan*`/`eth*` up from `/etc/network/interfaces` (config.txt) and keeps DHCP retrying.
 
+## Tetra Amp Plus controller
+
+The amplifier's RP2040 (pico-sdk USB CDC, VID 2e8a) appears as `/dev/tetra-amp` (mdev, other
+CDC-ACM devices keep their ttyACM name). `tetra-amp <command>` sends one console command and prints
+the reply (`tetra-amp status`, `tetra-amp tx on`, `tetra-amp help`), `tetra-amp watch` streams the
+status, `tetra-amp flash <file.uf2>` puts the RP2040 into BOOTSEL (1200-baud touch) and copies the
+file to its RPI-RP2 drive (automounted under /media).
+
+## WireGuard
+
+Kernel WireGuard + `wg`. Put a wg-quick style file in `/mnt/data/wireguard/wg0.conf` (or
+`/mnt/jffs2/wireguard/`); S50wireguard brings it up with `wg-up` once NTP has set the clock (the
+peer refuses handshakes stamped 1970 as replays) and a default route exists. IPv4 Address/MTU and
+AllowedIPs routes are handled (0.0.0.0/0 as two /1 routes, endpoint kept on the old gateway);
+DNS/PostUp and the like are ignored. `fw_setenv wireguard 0` disables it.
+
 Output: `build/pluto.frm` and `build/pluto.dfu`. Flash with `dfu-util -a firmware.dfu -D build/pluto.dfu`
 after the vendor backup. Host driver: `pgreenland/SoapyPlutoSDR` branch `sdr_gadget_timestamping`,
 probe with `SoapySDRUtil --probe="driver=plutosdr,uri=ip:192.168.2.1,direct=1,timestamp_every=1500"`.

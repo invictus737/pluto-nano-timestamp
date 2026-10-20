@@ -94,6 +94,7 @@ sd[a-z][0-9]      root:root 660 */lib/mdev/automounter.sh
 wlan[0-9]         root:root 660 */lib/mdev/ifupdown.sh
 usb[0-9]          root:root 660 */lib/mdev/ifupdown.sh
 eth[0-9]          root:root 660 */lib/mdev/ifupdown.sh
+ttyACM[0-9]+      root:root 660 */lib/mdev/tetra-amp.sh
 M
 # adapter already plugged at boot: replay its uevents once mdev is running
 mkdir -p "$OVL/etc/init.d"

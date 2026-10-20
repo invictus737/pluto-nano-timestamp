@@ -1,0 +1,38 @@
+#!/bin/sh
+# Bring up one WireGuard tunnel from a wg-quick style file (no bash on this image, so no wg-quick).
+#   wg-up <file.conf>   interface name = file name without .conf (wg0.conf -> wg0)
+#   wg-up -d <file.conf> tears it down
+# [Interface] Address (IPv4, comma separated), MTU; everything else is passed to 'wg setconf'.
+# DNS, Table, Pre/PostUp/Down and SaveConfig are ignored. Each peer's AllowedIPs get a route
+# through the tunnel; 0.0.0.0/0 becomes 0.0.0.0/1 + 128.0.0.0/1 with the endpoint kept on the
+# current default gateway.
+set -e
+down=0; [ "$1" = -d ] && { down=1; shift; }
+C=${1:?wg-up [-d] <file.conf>}; IF=$(basename "$C" .conf)
+key() { awk -F' *= *' -v k="$1" 'tolower($1)==tolower(k) {sub(/^[^=]*= */,""); print}' "$C" | tr ',' ' '; }
+if [ $down = 1 ]; then
+	for e in $(cat /var/run/wg-$IF.endpoints 2>/dev/null); do ip route del $e 2>/dev/null || :; done
+	ip link del "$IF" 2>/dev/null || :; rm -f /var/run/wg-$IF.endpoints; exit 0
+fi
+ip link show "$IF" > /dev/null 2>&1 || ip link add "$IF" type wireguard
+T=/var/run/wg-$IF.setconf; umask 077
+grep -v -i -E '^[[:space:]]*(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown|SaveConfig)[[:space:]]*=' "$C" > "$T"
+wg setconf "$IF" "$T"; rm -f "$T"
+ip -4 addr flush dev "$IF"
+for a in $(key Address); do case "$a" in *:*) ;; *) ip -4 addr add "$a" dev "$IF" ;; esac; done
+M=$(key MTU); ip link set "$IF" mtu ${M:-1420} up
+GW=$(ip -4 route show default | awk '{for(i=1;i<NF;i++) if($i=="via") {print $(i+1); exit}}')
+DEV=$(ip -4 route show default | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
+: > /var/run/wg-$IF.endpoints
+for n in $(key AllowedIPs); do
+	case "$n" in
+	*:*) ;;
+	0.0.0.0/0)
+		for e in $(wg show "$IF" endpoints | awk '{split($2,a,":"); if (a[1] != "(none)") print a[1]}'); do
+			[ -n "$GW" ] && ip route replace $e/32 via "$GW" dev "$DEV" && echo $e/32 >> /var/run/wg-$IF.endpoints
+		done
+		ip route replace 0.0.0.0/1 dev "$IF"; ip route replace 128.0.0.0/1 dev "$IF" ;;
+	*) ip route replace "$n" dev "$IF" ;;
+	esac
+done
+logger -t wireguard "$IF up ($(key Address))"

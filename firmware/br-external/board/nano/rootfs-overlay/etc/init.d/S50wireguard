@@ -1,0 +1,24 @@
+#!/bin/sh
+# WireGuard tunnels: every /mnt/data/wireguard/<if>.conf (else /mnt/jffs2/wireguard/<if>.conf), in
+# wg-quick format, is brought up by wg-up. The Pluto has no RTC: a handshake stamped 1970 after a
+# reboot is refused by the peer as a replay, so each tunnel waits for NTP time and a default route,
+# then retries until 'wg setconf' succeeds (endpoint names need DNS). PersistentKeepalive in the
+# peer section keeps NAT open. Disable: fw_setenv wireguard 0
+confs() { ls /mnt/data/wireguard/*.conf 2>/dev/null || ls /mnt/jffs2/wireguard/*.conf 2>/dev/null; }
+case "$1" in
+start)
+	[ "$(fw_printenv -n wireguard 2>/dev/null)" = 0 ] && exit 0
+	for c in $(confs); do
+		( n=0
+		  until [ "$(date +%Y)" -ge 2025 ] && ip -4 route show default | grep -q .; do
+			[ $n = 30 ] && logger -t wireguard "$(basename $c .conf): waiting for NTP time and a network"
+			sleep 2; n=$((n+1))
+		  done
+		  until wg-up "$c" > /dev/null 2>&1; do sleep 10; done
+		) < /dev/null > /dev/null 2>&1 &
+		echo "wireguard: $(basename $c .conf) (from $c)"
+	done ;;
+stop) for c in $(confs); do wg-up -d "$c"; done ;;
+restart) $0 stop; $0 start ;;
+esac
+exit 0
