@@ -1,0 +1,61 @@
+Winbond W25Q256 extended address register (Linux sees all 32 MiB) and the Nano QSPI layout: FIT
+partition in the lower bank, read-only boot copy at 16 MiB, 15 MiB data partition.
+
+--- a/drivers/mtd/spi-nor/core.c	2026-10-20 11:02:13
++++ b/drivers/mtd/spi-nor/core.c	2026-10-20 11:02:13
+@@ -584,6 +584,13 @@
+ 	return ret;
+ }
+ 
++/*
++ * Winbond W25Q256 (JEDEC 0xEF) has an Extended Address Register too: read 0xC8, write 0xC5
++ * after Write Enable. Without it the Zynq QSPI path cannot leave the bank U-Boot left selected
++ * and every access above 16 MiB wraps onto the lower half.
++ */
++#define SNOR_MFR_WINBOND_EAR	0xef
++
+ /**
+  * spi_nor_write_ear() - Write Extended Address Register.
+  * @nor:	pointer to 'struct spi_nor'.
+@@ -623,7 +630,8 @@
+ 		code = SPINOR_OP_BRWR;
+ 	if (nor->info->id[0] == CFI_MFR_ST ||
+ 	    nor->info->id[0] == CFI_MFR_MACRONIX ||
+-	    nor->info->id[0] == CFI_MFR_PMC) {
++	    nor->info->id[0] == CFI_MFR_PMC ||
++	    nor->info->id[0] == SNOR_MFR_WINBOND_EAR) {
+ 		spi_nor_write_enable(nor);
+ 		code = SPINOR_OP_WREAR;
+ 	}
+@@ -669,7 +677,8 @@
+ 	/* This is actually Micron */
+ 	else if (nor->info->id[0] == CFI_MFR_ST ||
+ 		 nor->info->id[0] == CFI_MFR_MACRONIX ||
+-		 nor->info->id[0] == CFI_MFR_PMC)
++		 nor->info->id[0] == CFI_MFR_PMC ||
++		 nor->info->id[0] == SNOR_MFR_WINBOND_EAR)
+ 		code = SPINOR_OP_RDEAR;
+ 	else
+ 		return -EINVAL;
+--- a/arch/arm/boot/dts/zynq-pluto-sdr.dtsi	2026-10-20 11:02:13
++++ b/arch/arm/boot/dts/zynq-pluto-sdr.dtsi	2026-10-20 11:02:13
+@@ -75,8 +75,18 @@
+ 		};
+ 		partition@qspi-linux {
+ 			label = "qspi-linux";
+-			reg = <0x200000 0x1E00000>; /* 30M */
++			reg = <0x200000 0xE00000>; /* 14M: the FIT stays in the lower 16 MiB bank */
++		};
++		partition@qspi-bootcopy {
++			/* copy of qspi-fsbl-uboot: the BootROM starts here after a reset with EAR=1 */
++			label = "qspi-bootcopy";
++			reg = <0x1000000 0x100000>; /* 1M */
++			read-only;
+ 		};
++		partition@qspi-data {
++			label = "qspi-data";
++			reg = <0x1100000 0xF00000>; /* 15M, UBIFS at /mnt/data */
++		};
+ 	};
+ };
+ 

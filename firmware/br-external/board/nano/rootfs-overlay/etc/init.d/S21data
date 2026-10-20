@@ -1,0 +1,31 @@
+#!/bin/sh
+# Persistent data partition at /mnt/data: UBIFS (power-cut safe, wear levelled) on qspi-data, the
+# upper 16 MiB bank of the W25Q256 (0x1100000, 15 MiB), for application binaries and their data.
+# An empty or foreign partition is formatted, but only when Linux demonstrably addresses the upper
+# bank (Winbond extended address register readable, data partition not aliased onto the lower
+# bank). Otherwise nothing is written and /mnt/data stays an empty directory on the RAM disk.
+MNT=/mnt/data
+mtd() { grep "\"$1\"" /proc/mtd | cut -d: -f1 | tr -dc 0-9; }
+first64k() { dd if=/dev/mtd$1 bs=65536 count=1 2>/dev/null | md5sum | cut -d' ' -f1; }
+say() { echo "data: $*"; logger -t data "$*"; }
+start() {
+	mkdir -p $MNT; grep -q " $MNT " /proc/mounts && return 0
+	D=$(mtd qspi-data); E=$(mtd qspi-uboot-env); B=$(mtd qspi-bootcopy); F=$(mtd qspi-fsbl-uboot)
+	[ -n "$D" ] && [ -n "$E" ] || { say "no qspi-data partition"; return 0; }
+	if dmesg | grep -q "failed to read ear reg"; then say "flash bank register unreadable, upper bank not used"; return 0; fi
+	if [ "$(first64k $D)" = "$(first64k $E)" ]; then say "qspi-data reads the lower bank (aliased), not used"; return 0; fi
+	[ -n "$B" ] && [ -n "$F" ] && [ "$(first64k $B)" != "$(first64k $F)" ] && \
+		say "WARNING: qspi-bootcopy differs from qspi-fsbl-uboot (a reset with EAR=1 would not boot)"
+	if ! ubiattach -m "$D" -d 0 > /dev/null 2>&1; then
+		say "formatting qspi-data (mtd$D) as UBI"
+		ubiformat /dev/mtd$D -y -q && ubiattach -m "$D" -d 0 > /dev/null || { say "UBI attach failed"; return 1; }
+	fi
+	n=0; while [ ! -e /dev/ubi0 ] && [ $n -lt 5 ]; do sleep 1; n=$((n+1)); done
+	ubinfo -d 0 -N data > /dev/null 2>&1 || ubimkvol /dev/ubi0 -N data -m > /dev/null || { say "ubimkvol failed"; return 1; }
+	mount -t ubifs -o noatime ubi0:data $MNT && say "mounted ($(df -h $MNT | awk 'NR==2 {print $4}') free)"
+}
+case "$1" in
+start) start ;;
+stop) umount $MNT 2>/dev/null; ubidetach -d 0 2>/dev/null; true ;;
+esac
+exit 0

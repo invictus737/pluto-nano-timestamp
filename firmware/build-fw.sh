@@ -63,5 +63,6 @@ if ! make build/pluto.frm > "$HERE/../fw-build.log" 2>&1; then
 fi
 tail -5 "$HERE/../fw-build.log"
 ls -la build/pluto.frm; sha256sum build/pluto.frm
-# the application slot (S97app) starts 16 MiB into the firmware partition: the FIT must end before it
-[ "$(stat -c %s build/pluto.frm)" -lt $((16 * 1024 * 1024)) ] || { echo "pluto.frm reaches the application slot at 16 MiB"; exit 1; }
+# qspi-linux is 14 MiB (0x200000..0x1000000, the lower bank of the W25Q256): the FIT must fit, else
+# U-Boot's read crosses into the upper bank (boot copy + data partition)
+[ "$(stat -c %s build/pluto.frm)" -le $((14 * 1024 * 1024)) ] || { echo "pluto.frm is larger than the 14 MiB qspi-linux partition"; exit 1; }

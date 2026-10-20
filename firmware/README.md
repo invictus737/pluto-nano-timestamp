@@ -11,7 +11,8 @@ Base: ADI `analogdevicesinc/plutosdr-fw` tag `v0.39` (hdl 065c8f1, linux 6.1 f3d
 - `hdl-quantulum/`: pgreenland's IP repository (d701022) vendored, copied to the superproject root.
   Its private copy of the old `fifo_wr` interface (with SYNC) is removed and the SYNC port maps
   dropped, so ADI's interface definition is the only one; `refresh.tcl` re-checksums the cores.
-- `patches/v0.39/linux`: `# CONFIG_GCC_PLUGINS is not set` (linux f763232).
+- `patches/v0.39/linux`: `# CONFIG_GCC_PLUGINS is not set` (linux f763232); Winbond extended
+  address register (0002, below).
 - `patches/v0.39/buildroot`: `sdr_usb_gadget` @7339ab5, S23udc FunctionFS wiring, device_config
   product string (buildroot 79a8629, without htop).
 
@@ -26,6 +27,36 @@ Changes for the Nano, applied by `apply-nano.sh` (from `build.sh`, `build-hdl.sh
 3. `linux/arch/arm/boot/dts/zynq-pluto-sdr*.dts`: Nano differences from `../board/nano/dts/nano.dtsi`
    (USB PHY reset GPIO 46, no ADM1177, LED on gpio0 15, model string).
 4. FIT (`scripts/pluto.its`): unchanged layout, one bitstream shared by the Rev.A/B/C configurations.
+
+## Flash layout (W25Q256, 32 MiB)
+
+The Xilinx spi-nor path on the Zynq QSPI keeps 3-byte addresses above 16 MiB and switches banks
+with the flash's extended address register (EAR). It only knew Spansion/Micron/Macronix/PMC: on the
+Winbond the EAR read failed (`failed to read ear reg`) and its write went out without Write Enable,
+so every access above 16 MiB wrapped onto the lower half. Patch 0002 adds Winbond (0xEF: RDEAR 0xC8,
+WREN + WREAR 0xC5); `spi_nor_shutdown` returns the EAR to 0 before a reboot.
+
+| offset | size | partition | |
+|---|---|---|---|
+| 0x0000000 | 1 MiB | qspi-fsbl-uboot | vendor FSBL + U-Boot |
+| 0x0100000 | 128 KiB | qspi-uboot-env | |
+| 0x0120000 | 896 KiB | qspi-nvmfs | JFFS2 `/mnt/jffs2` (stock) |
+| 0x0200000 | 14 MiB | qspi-linux | `pluto.frm` (FIT), must stay below 16 MiB (`build-fw.sh` checks) |
+| 0x1000000 | 1 MiB | qspi-bootcopy | read-only copy of qspi-fsbl-uboot: the BootROM starts here after a reset with EAR=1 |
+| 0x1100000 | 15 MiB | qspi-data | UBIFS `/mnt/data` (S21data), applications (S97app) and their data |
+
+S21data formats an empty or foreign qspi-data only when the EAR is readable and the partition does
+not read back the lower bank; it warns when qspi-bootcopy differs from qspi-fsbl-uboot.
+
+## USB adapters (OTG host)
+
+Wi-Fi: AIC8800D80/D81 (out-of-tree driver, branch `legacy-mcu1`, `build-aic8800.sh`), Realtek
+r8188eu/rtl8xxxu/rtl8192cu (in kernel, `rtlwifi` firmware); `wpa_supplicant` has nl80211 and wext
+(r8188eu is wext only) and the ifup hook tries both. Ethernet: r8152 (RTL8153, RTL8156/8156B 2.5G,
+`rtl_nic` firmware), ASIX, SMSC, CDC ECM/NCM, RNDIS. Bluetooth: kernel btusb + bluez
+(bluetoothd, bluetoothctl); AIC combo adapters hand the HCI interface to btusb after the firmware
+upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` brings any hot-plugged
+`wlan*`/`eth*` up from `/etc/network/interfaces` (config.txt) and keeps DHCP retrying.
 
 Output: `build/pluto.frm` and `build/pluto.dfu`. Flash with `dfu-util -a firmware.dfu -D build/pluto.dfu`
 after the vendor backup. Host driver: `pgreenland/SoapyPlutoSDR` branch `sdr_gadget_timestamping`,

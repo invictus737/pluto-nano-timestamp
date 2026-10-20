@@ -5,6 +5,10 @@ set -e
 T=${1:?target dir}; HERE=$(cd "$(dirname "$0")" && pwd)
 # mdev rules with the AIC8800 Wi-Fi mode switch (written into the overlay by build-aic8800.sh)
 [ -f "$HERE/rootfs-overlay/etc/mdev.conf" ] && install -m 0644 "$HERE/rootfs-overlay/etc/mdev.conf" "$T/etc/mdev.conf"
+# network hotplug for every USB adapter (DHCP retry while Wi-Fi associates), over the stock helper
+install -m 0755 "$HERE/ifupdown.sh" "$T/lib/mdev/ifupdown.sh"
+# mount point of the persistent data partition (S21data)
+mkdir -p "$T/mnt/data"
 # btop refuses to start without a UTF-8 locale; musl has C.UTF-8 built in, the shell just never sets it
 if [ -f "$T/usr/bin/btop" ] && ! head -c 2 "$T/usr/bin/btop" | grep -q '#!'; then
   mkdir -p "$T/usr/libexec" && mv "$T/usr/bin/btop" "$T/usr/libexec/btop"
