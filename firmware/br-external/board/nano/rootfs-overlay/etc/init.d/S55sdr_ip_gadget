@@ -1,10 +1,11 @@
 #!/bin/sh
 # pgreenland UDP IIO gadget (control 30432, data 30433): timestamped streams for uri=ip:<pluto>
-# from the network and uri=ip:127.0.0.1 for an application on the Pluto itself.
+# from the network (slave role only; in the master role NexusBS on the Pluto uses the radio directly).
 D=/usr/sbin/sdr_ip_gadget
 [ -x $D ] || exit 0
 case "$1" in
-start) start-stop-daemon -S -q -b -m -p /var/run/sdr_ip_gadget.pid -x $D && echo "sdr_ip_gadget started" ;;
+start) [ "$(fw_printenv -n operating_mode 2>/dev/null)" = master ] && { echo "operating_mode master: sdr_ip_gadget not started"; exit 0; }
+       start-stop-daemon -S -q -b -m -p /var/run/sdr_ip_gadget.pid -x $D && echo "sdr_ip_gadget started" ;;
 stop) start-stop-daemon -K -q -p /var/run/sdr_ip_gadget.pid ;;
 restart) $0 stop; sleep 1; $0 start ;;
 esac

@@ -6,7 +6,7 @@
 # Each starts only when its configuration exists, restarts after any exit (5 s), and logs to
 # /var/log/<name>.log (RAM). Only in the master role (nexus-role master); in the default slave role
 # the Pluto is an SDR for NexusBS on another computer and starts nothing.
-[ "$1" = start ] && [ "$(fw_printenv -n nexus_role 2>/dev/null || echo slave)" != master ] && \
+[ "$1" = start ] && [ "$(fw_printenv -n operating_mode 2>/dev/null || echo slave)" != master ] && \
   { echo "role slave: SDR for an external NexusBS host (nexus-role master to run it here)"; exit 0; }
 for A in /mnt/data/*/app.conf /opt/*/app.conf; do
   [ -f "$A" ] || continue

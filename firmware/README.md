@@ -60,12 +60,19 @@ upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` bring
 
 ## Station role: slave (default) or master
 
-`nexus-role` (U-Boot environment `nexus_role`). **slave**, the default: the Pluto is the SDR of a
-NexusBS running elsewhere, e.g. a Raspberry Pi with the Pluto on USB (`uri=usb:` / RNDIS
-`ip:192.168.2.1`) or on the network (`uri=ip:<pluto>,direct=1,timestamp_every=...`, UDP gadget
-30432/30433); nothing else is started. **master**: `nexus-role master` starts the applications on
-`/mnt/data/<name>/app.conf` now and at every boot (NexusBS on the Pluto, radio via `ip:127.0.0.1`);
-`nexus-role slave` stops them. The role is shown at login.
+`config.txt` [SYSTEM] `operating_mode = slave|master` (U-Boot environment `operating_mode`), or
+`nexus-role slave|master` on the device; applied at once and at every boot, shown at login.
+
+- **slave** (default): the Pluto is the SDR of a NexusBS running elsewhere, e.g. a Raspberry Pi.
+  Both timestamp SDR gadgets run: USB FunctionFS (`sdr_usb_gadget`, `uri=usb:...,direct=1`) and
+  UDP (`sdr_ip_gadget` 30432/30433, `uri=ip:<pluto>,direct=1,timestamp_every=...`), plus iiod.
+  No application is started.
+- **master**: NexusBS runs on the Pluto (S97app, `/mnt/data/<name>/app.conf`) and uses the radio
+  directly; both SDR gadgets are stopped and the USB SDR function is left out of the composite.
+  Switching rebuilds the USB composite, so a USB link drops for a few seconds.
+
+Note: SoapyPlutoSDR-ts delivers hardware timestamps only through the gadgets; a direct
+`uri=local:` stream is a plain IIO stream without timestamps (RX-derived clock in NexusBS).
 
 ## Tetra Amp Plus controller
 

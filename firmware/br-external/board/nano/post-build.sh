@@ -12,6 +12,54 @@ install -m 0644 "$HERE/motd" "$T/etc/motd"
 # root's login shell is bash (SSH and serial console); init scripts keep busybox /bin/sh
 [ -x "$T/bin/bash" ] && sed -i 's#^root:\([^:]*\):0:0:\([^:]*\):\([^:]*\):.*#root:\1:0:0:\2:\3:/bin/bash#' "$T/etc/passwd"
 grep -qx /bin/bash "$T/etc/shells" 2>/dev/null || echo /bin/bash >> "$T/etc/shells"
+# config.txt [SYSTEM] operating_mode = slave|master (station role, nexus-role): written by S40network,
+# read back by update.sh like the stock keys and applied at once
+python3 - "$T/etc/init.d/S40network" "$T/sbin/update.sh" <<'PY'
+import sys
+net, upd = sys.argv[1], sys.argv[2]
+s = open(net).read()
+a = "\tUSB_ETH_MODE=`fw_printenv -n usb_ethernet_mode 2> /dev/null || echo rndis`\n"
+assert s.count(a) == 1, "S40network: usb_ethernet_mode read not found"
+s = s.replace(a, a + "\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n")
+b = "\techo \"usb_ethernet_mode = $USB_ETH_MODE\"$'\\r' >> $CONF\n"
+assert s.count(b) == 1, "S40network: usb_ethernet_mode line not found"
+s = s.replace(b, b + "\techo \"# NexusBS station role [slave|master]: slave = SDR for NexusBS on another computer,\"$'\\r' >> $CONF\n"
+                     "\techo \"# master = NexusBS runs on this Pluto\"$'\\r' >> $CONF\n"
+                     "\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n")
+open(net, "w").write(s)
+u = open(upd).read()
+c = "\t\techo \"netmask_eth $netmask_eth\" >> /opt/fw_set.tmp\n"
+assert u.count(c) == 1, "update.sh: netmask_eth line not found"
+u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master) ;; *) operating_mode=slave ;; esac\n"
+                     "\t\techo \"operating_mode $operating_mode\" >> /opt/fw_set.tmp\n")
+d = "\t\ttouch /mnt/msd/SUCCESS_ENV_UPDATE\n"
+assert u.count(d) == 1, "update.sh: SUCCESS_ENV_UPDATE not found"
+u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n")
+open(upd, "w").write(u)
+PY
+# master role: no SDR gadgets (NexusBS on the Pluto uses the radio directly). The USB SDR function must
+# not even be in the composite then: a FunctionFS function without its daemon blocks the UDC bind.
+python3 - "$T/etc/init.d/S23udc" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+def rep(old, new):
+    global s
+    assert s.count(old) == 1, "S23udc: " + old
+    s = s.replace(old, new)
+rep("SDR_USB_GADGET_DEBUG=`fw_printenv -n sdr_usb_gadget_debug 2> /dev/null || echo 0`\n",
+    "SDR_USB_GADGET_DEBUG=`fw_printenv -n sdr_usb_gadget_debug 2> /dev/null || echo 0`\n"
+    "# station role (config.txt operating_mode): the SDR USB gadget only as a slave\n"
+    "SDRG=1; [ \"`fw_printenv -n operating_mode 2> /dev/null`\" = master ] && SDRG=0\n")
+rep("\tmkdir -p $GADGET/functions/ffs.sdr_gadget_ffs\n", "\t[ $SDRG = 1 ] && mkdir -p $GADGET/functions/ffs.sdr_gadget_ffs\n")
+rep("\tln -s $GADGET/functions/ffs.sdr_gadget_ffs $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n",
+    "\t[ $SDRG = 1 ] && ln -s $GADGET/functions/ffs.sdr_gadget_ffs $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n")
+rep("\tmkdir -p /dev/sdr_gadget_ffs\n\tmount sdr_gadget_ffs -t functionfs /dev/sdr_gadget_ffs 2> /dev/null\n",
+    "\t[ $SDRG = 1 ] && mkdir -p /dev/sdr_gadget_ffs && mount sdr_gadget_ffs -t functionfs /dev/sdr_gadget_ffs 2> /dev/null\n")
+rep("\tif [ \"$SDR_USB_GADGET_DEBUG\" == \"1\" ]\n", "\tif [ $SDRG = 0 ]\n\tthen\n\t\t:\n\telif [ \"$SDR_USB_GADGET_DEBUG\" == \"1\" ]\n")
+rep("\trm $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n", "\trm -f $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n")
+rep("\trmdir $GADGET/functions/ffs.sdr_gadget_ffs\n", "\trmdir $GADGET/functions/ffs.sdr_gadget_ffs 2> /dev/null\n")
+open(p, "w").write(s)
+PY
 # mount point of the persistent data partition (S21data)
 mkdir -p "$T/mnt/data"
 # btop refuses to start without a UTF-8 locale; musl has C.UTF-8 built in, the shell just never sets it

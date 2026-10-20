@@ -1,14 +1,20 @@
 #!/bin/sh
-# Station role of this Pluto (U-Boot environment nexus_role, default slave):
-#   slave   SDR for NexusBS running elsewhere (a Raspberry Pi over USB or the network): iiod and
-#           the timestamp UDP gadget serve the radio, no application is started on the Pluto.
-#   master  NexusBS runs on the Pluto itself (S97app starts /mnt/data/<name>/app.conf), using
-#           the radio through uri=ip:127.0.0.1. Do not point an external NexusBS at it meanwhile.
+# Station role of this Pluto (config.txt [SYSTEM] operating_mode, U-Boot environment, default slave):
+#   slave   SDR for NexusBS running elsewhere (a Raspberry Pi over USB or the network): iiod and the
+#           timestamp SDR gadgets (USB FunctionFS, UDP 30432/30433) serve the radio, nothing else runs.
+#   master  NexusBS runs on the Pluto itself (S97app starts /mnt/data/<name>/app.conf) and uses the
+#           radio directly (uri=local:); both SDR gadgets are stopped.
 # usage: nexus-role [slave|master|status]   (the change is applied now and kept across reboots)
-R=$(fw_printenv -n nexus_role 2>/dev/null || echo slave)
+R=$(fw_printenv -n operating_mode 2>/dev/null || echo slave)
 case "${1:-status}" in
 slave|master)
-	[ "$1" = "$R" ] || fw_setenv nexus_role "$1" || exit 1
+	[ "$1" = "$R" ] || fw_setenv operating_mode "$1" || exit 1
+	if [ "$1" != "$R" ]; then
+		# the USB composite is rebuilt without/with the SDR function: a USB link drops for a few seconds
+		[ "$1" = master ] && /etc/init.d/S55sdr_ip_gadget stop
+		/etc/init.d/S23udc stop > /dev/null 2>&1; /etc/init.d/S23udc start > /dev/null 2>&1
+		[ "$1" = slave ] && /etc/init.d/S55sdr_ip_gadget start
+	fi
 	if [ "$1" = master ]; then /etc/init.d/S97app start; else /etc/init.d/S97app stop; fi
 	logger -t nexus-role "role $1"; echo "role: $1" ;;
 status)
