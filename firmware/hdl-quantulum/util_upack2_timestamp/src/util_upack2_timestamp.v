@@ -127,7 +127,7 @@ module util_upack2_timestamp #(
     reg timestamp_valid = 'b0;
 
     // Combine write data
-    assign fifo_wr_data = {transfer_start_dma, timestamp_valid, last_timestamp, s_axis_data};
+    assign fifo_wr_data = {transfer_start_dma, ((timestamp_every != 0) && timestamp_valid), last_timestamp, s_axis_data};
 
     // Split read data
     wire transfer_start_dac;
@@ -258,7 +258,7 @@ module util_upack2_timestamp #(
     // This value and its flag get carried across in the fifo to the DAC clock domain, allowing it to hold the first sample in a block
     // before the transmission timestamp is reached
     always @(posedge dma_clk) begin
-        if (!s_axis_xfer_req) begin
+        if (!timestamp_en || !s_axis_xfer_req) begin
             // Reset timestamp and valid flag
             last_timestamp <= 'h0;
             timestamp_valid <= 'b0;
@@ -269,8 +269,10 @@ module util_upack2_timestamp #(
                 // Capture timestamp and set valid flag
                 last_timestamp <= s_axis_data_timestamp;
                 timestamp_valid <= 'b1;
-            end else begin
-                // Data invalid, not ready for more data or no timestamp required yet, reset register and clear flag
+            end else if (fifo_wr_en) begin
+                // Clear only after the first payload word actually consumes
+                // this tag. AXI VALID bubbles/backpressure after a header must
+                // preserve its scheduled release time, not bypass the gate.
                 last_timestamp <= 'h0;
                 timestamp_valid <= 'b0;
             end

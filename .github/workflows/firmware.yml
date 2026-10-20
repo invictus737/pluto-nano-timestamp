@@ -19,6 +19,8 @@ jobs:
       cache-hit: ${{ steps.xsa-cache.outputs.cache-hit }}
     steps:
       - uses: actions/checkout@v4
+      - name: TX timestamp gate regression (Icarus, before any Vivado time is spent)
+        run: sudo apt-get install -y -q iverilog >/dev/null && firmware/hdl-quantulum/tests/run.sh
       - name: Bitstream cache key (Nano HDL inputs, v0.39 patches, timestamp IP, Vivado version)
         id: key
         run: echo "key=$(firmware/xsa-key.sh "$VIVADO_VERSION")" >> "$GITHUB_OUTPUT"
