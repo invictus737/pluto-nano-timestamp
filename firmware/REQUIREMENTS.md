@@ -88,3 +88,21 @@
   `fw_setenv ntp_servers` (default pool.ntp.org), retries until a network is up.
 - **btop**: wrapper sets `LANG=C.UTF-8` (musl's built-in UTF-8 locale) and `/etc/profile.d/utf8.sh`
   sets it for every login shell; no more `No UTF-8 locale detected`.
+
+## Implemented 2026-10-22 (standard Linux image, branch v0.39-std)
+
+- AIC8800D80/D81 handled only by standard mechanisms: driver built in the kernel tree as modules
+  (legacy-mcu1 a9683a4 + `patches/aic8800`), modules_install/depmod, mdev `$MODALIAS` -> modprobe,
+  firmware through request_firmware from `/lib/firmware`, Bluetooth through btusb (ZLP quirk now a btusb
+  table entry, linux patch 0003), driver CD switched by usb_modeswitch with its standard config files
+  while usb-storage ignores it (linux patch 0004). No insmod helper, no uevent kicking, no kprobes.
+- Wi-Fi TX power capped at 15 dBm (driver userconfig), standard regulatory (wireless-regdb,
+  `country_wlan`, default RO), quiet driver log, USB reset recovery when the firmware stops answering.
+- Network: busybox ifupdown + wpa_supplicant hook + udhcpc `-b` with the host name; busybox
+  simple.script for DNS; default host name `plutosdr` (avahi `plutosdr.local`).
+- Bluetooth audio in the OS (bluetoothd audio plugins, bluez-alsa, S41bluealsa); pairings on
+  `/mnt/data/bt/lib`. SFTP server (gesftpserver) for dropbear. Generic `config.txt` and NexusBS
+  examples in `/etc`. Soft-lockup detector, printk timestamps.
+- FIT 13.60 MB (was 14.41 MB): unused AIC firmware images, HCI test tools, alsa-lib, Jim Tcl, test
+  tools, unreferenced libraries, Ralink/r8712u drivers without firmware removed; build fails above
+  13.5 MiB.
