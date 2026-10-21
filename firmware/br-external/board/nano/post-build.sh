@@ -145,7 +145,16 @@ fi
 # usb_modeswitch is called directly by mdev with its configuration file; the udev dispatcher and its
 # Jim Tcl interpreter are not used
 rm -f "$T/usr/sbin/usb_modeswitch_dispatcher" "$T/lib/udev/usb_modeswitch"; rmdir "$T/lib/udev" 2>/dev/null || true
-for lib in libgfortran libgomp libjim; do
+# development and test tools pulled in by libraries (Jim Tcl shell, PCRE/libxml2/GLib/D-Bus test and
+# schema tools); not used on the device
+rm -f "$T"/usr/bin/jimsh "$T"/usr/bin/tclsh "$T"/usr/bin/pcretest "$T"/usr/bin/pcregrep "$T"/usr/bin/xmllint \
+      "$T"/usr/bin/xmlcatalog "$T"/usr/bin/gio "$T"/usr/bin/gio-querymodules "$T"/usr/bin/gapplication \
+      "$T"/usr/bin/gresource "$T"/usr/bin/gsettings "$T"/usr/bin/dbus-test-tool "$T"/usr/bin/a2dpconf \
+      "$T"/usr/lib/libstdc++.so.*-gdb.py
+rm -rf "$T/usr/share/gdb"
+# libraries nothing links against any more
+for lib in libgfortran libgomp libjim libform libmenu libpanel libnl-xfrm-3 libnl-idiag-3 libnl-nf-3 \
+           libavahi-gobject libgpiodcxx libpcrecpp libpcreposix; do
   if ! grep -rlsq --exclude="$lib.so*" "$lib.so" "$T/usr" "$T/lib" "$T/bin" "$T/sbin"; then rm -f "$T"/usr/lib/$lib.so* "$T"/lib/$lib.so*; fi
 done
 chmod 0755 "$T"/etc/init.d/S*
