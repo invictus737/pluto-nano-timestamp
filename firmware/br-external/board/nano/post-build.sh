@@ -15,7 +15,7 @@ a = "\techo /sbin/mdev >/proc/sys/kernel/hotplug\n\t/sbin/mdev -s\n"
 assert s.count(a) == 1, "S10mdev: hotplug lines not found"
 s = s.replace(a, "\techo > /dev/mdev.seq\n" + a +
     "\t# coldplug: replay the add events of devices that appeared before mdev was the hotplug helper\n"
-    "\tfor u in /sys/bus/usb/devices/*/uevent; do [ -e \"$u\" ] && echo add > \"$u\"; done\n")
+    "\tfor u in /sys/bus/usb/devices/*/uevent; do [ -e \"$u\" ] && echo add > \"$u\"; done; true\n")
 open(p, "w").write(s)
 PY2
 # NexusBS 2.0 login banner over the stock PlutoSDR one (S45msd fills in #BUILD#)
