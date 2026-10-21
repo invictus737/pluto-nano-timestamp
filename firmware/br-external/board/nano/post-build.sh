@@ -134,10 +134,13 @@ find "$T" -name '._*' -delete
 # libraries nothing links against (pulled in by the toolchain's OpenMP/Fortran runtime and fftw's
 # threaded variants; ad936x_ref_cal only needs libfftw3), and the fftw wisdom tools
 rm -f "$T"/usr/bin/fftw*-wisdom* "$T"/usr/lib/libfftw3*_omp.so* "$T"/usr/lib/libfftw3*_threads.so*
-# alsa-lib comes with the bluez-alsa package for its ALSA plugins; bluealsa, bluealsa-cli and the
-# applications talk D-Bus/PCM pipes and do not use ALSA here: drop it when nothing links against it
-if ! grep -rlsq --exclude='libasound.so*' --exclude-dir=alsa-lib 'libasound.so' "$T/usr/bin" "$T/usr/sbin" "$T/usr/lib" "$T/usr/libexec" "$T/lib"; then
-  rm -rf "$T"/usr/lib/libasound.so* "$T/usr/lib/alsa-lib" "$T/usr/share/alsa" "$T/etc/alsa"
+# alsa-lib only comes with the bluez-alsa package (its ALSA PCM/CTL plugins); bluealsa, bluealsa-cli
+# and the applications use D-Bus and PCM pipes, not ALSA. Drop alsa-lib, its tools and the plugins
+# unless some other program links against it.
+if ! grep -rlsq --exclude='libasound.so*' --exclude='libatopology.so*' --exclude=aserver --exclude-dir=alsa-lib \
+     'libasound.so' "$T/usr/bin" "$T/usr/sbin" "$T/usr/lib" "$T/usr/libexec" "$T/lib" "$T/bin" "$T/sbin"; then
+  rm -rf "$T"/usr/lib/libasound.so* "$T"/usr/lib/libatopology.so* "$T/usr/bin/aserver" "$T/usr/lib/alsa-lib" \
+         "$T/usr/share/alsa" "$T/etc/alsa"
 fi
 # usb_modeswitch is called directly by mdev with its configuration file; the udev dispatcher and its
 # Jim Tcl interpreter are not used

@@ -85,10 +85,11 @@ ls -la build/pluto.frm; sha256sum build/pluto.frm
 # qspi-linux is 14 MiB (0x200000..0x1000000, the lower bank of the W25Q256): the FIT must fit, else
 # U-Boot's read crosses into the upper bank (boot copy + data partition)
 [ "$(stat -c %s build/pluto.frm)" -le $((14 * 1024 * 1024)) ] || { echo "pluto.frm is larger than the 14 MiB qspi-linux partition"; exit 1; }
-# size report: FIT images, ramdisk content
-{ echo "== FIT"; dumpimage -l build/pluto.itb 2>/dev/null || dumpimage -l build/pluto.frm
-  ls -la build/zImage build/rootfs.cpio.zst build/pluto.frm build/pluto.dfu 2>/dev/null
-  echo "== rootfs (uncompressed, KiB)"; du -sk buildroot/output/target
-  du -k -a buildroot/output/target | sort -rn | awk '$1 >= 100' | head -60; } | tee "$HERE/../fw-size-report.txt"
+# size report: FIT images, ramdisk content (informational, never fails the build)
+{ echo "== FIT"; mkimage -l build/pluto.itb || true
+  ls -la build/zImage build/rootfs.cpio.zst build/pluto.itb build/pluto.frm || true
+  echo "== rootfs (uncompressed, KiB)"; du -sk buildroot/output/target || true
+  du -k -a buildroot/output/target | sort -rn | awk '$1 >= 100' | head -60 || true; } > "$HERE/../fw-size-report.txt" 2>&1 || true
+cat "$HERE/../fw-size-report.txt"
 # and a safety margin under U-Boot's 14 MiB fit_size window (a 19.66 MB image bricked a board)
 [ "$(stat -c %s build/pluto.frm)" -le $((27 * 512 * 1024)) ] || { echo "pluto.frm is larger than the 13.5 MiB target"; exit 1; }
