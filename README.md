@@ -61,6 +61,9 @@ tree also matches the vendor's: USB PHY reset on GPIO 46 (ADI uses 52), no ADM11
 
 ## Recovering the firmware
 
+Step-by-step flashing (RAM boot, DFU flash, serial console): [docs/FLASHING.md](docs/FLASHING.md).
+
+
 Back up before flashing: `device_reboot sf` (or `dfu = 1` in `config.txt`), then
 `dfu-util -a firmware.dfu -U vendor-firmware.dfu`, `-a boot.dfu -U ...`, `-a uboot-env.dfu -U ...`.
 Restore with `dfu-util -a firmware.dfu -D vendor-firmware.dfu`. The vendor image is proprietary and is

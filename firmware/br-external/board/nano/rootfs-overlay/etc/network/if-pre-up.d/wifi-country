@@ -1,0 +1,9 @@
+#!/bin/sh
+# ifupdown pre-up: the Wi-Fi regulatory country (config.txt [WLAN] country_wlan, default RO) once the
+# adapter's wiphy exists. At boot S40network sets it before any driver is loaded; a driver that
+# registers its wiphy later may bring its own country hint, so it is applied again here.
+case "$IFACE" in wlan*) ;; *) exit 0 ;; esac
+C=$(fw_printenv -n country_wlan 2>/dev/null)
+echo "$C" | grep -qx '[A-Z][A-Z]' || C=RO
+iw reg set "$C" && logger -t network "$IFACE: regulatory country $C"
+exit 0

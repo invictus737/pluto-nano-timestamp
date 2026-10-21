@@ -39,6 +39,9 @@ UC=$OVL/lib/firmware/aic_userconfig_8800d80.txt
 awk -v max="$AIC_TXPWR_MAX" -F= 'BEGIN { OFS = "=" }
   /^lvl_/ && $2 + 0 > max { $2 = max } { print }' "$UC" > "$UC.new" && mv "$UC.new" "$UC"
 sed -i "1a # Pluto Nano: every lvl_* TX power entry capped at $AIC_TXPWR_MAX dBm (firmware/aic8800-intree.sh)" "$UC"
+# the D80 legacy (SDK V3) parser has no txpwr_loss keys: it logs "invalid cmd: loss_enable/loss_value"
+sed -i -e '/^loss_enable=/d' -e '/^loss_value=/d' -e '/^# txpwr_loss/d' "$UC"
+! grep -q '^loss_' "$UC" || { echo "aic8800: loss keys left in the userconfig"; exit 1; }
 grep -E '^lvl_' "$UC" | awk -F= -v max="$AIC_TXPWR_MAX" '$2 + 0 > max { bad = 1 } END { exit bad }' || { echo "aic8800: TX power cap failed"; exit 1; }
 grep -E '^(enable|lvl_11b_11ag_1m_2g4|lvl_11a_6m_5g)=' "$UC"
 ls -la "$OVL/lib/firmware" | grep 8800d80
