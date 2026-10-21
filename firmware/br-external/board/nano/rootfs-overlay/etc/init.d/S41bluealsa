@@ -1,0 +1,21 @@
+#!/bin/sh
+# BlueALSA (bluez-alsa): Bluetooth audio for ALSA-free clients on the system D-Bus, next to bluetoothd
+# (S40bluetoothd). A2DP source with SBC: the Pluto streams to headphones/speakers
+# (bluealsa-cli open /org/bluealsa/hci0/dev_XX_XX_XX_XX_XX_XX/a2dpsrc/sink < pcm).
+# Options in /etc/default/bluealsa (BLUEALSA_ARGS).
+DAEMON=/usr/bin/bluealsa
+PIDFILE=/var/run/bluealsa.pid
+BLUEALSA_ARGS="-p a2dp-source"
+[ -r /etc/default/bluealsa ] && . /etc/default/bluealsa
+case "$1" in
+start)
+	printf 'Starting bluealsa: '
+	start-stop-daemon -S -q -m -b -p "$PIDFILE" -x "$DAEMON" -- $BLUEALSA_ARGS && echo OK || echo FAIL ;;
+stop)
+	printf 'Stopping bluealsa: '
+	start-stop-daemon -K -q -p "$PIDFILE" && echo OK || echo FAIL; rm -f "$PIDFILE" ;;
+restart)
+	"$0" stop; sleep 1; "$0" start ;;
+*)
+	echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

@@ -1,0 +1,154 @@
+# =============================================================================
+#  NexusBS on the Pluto (firmware v0.39-nexusBS): this file is the generic,
+#  commented example shipped in the image (/etc/nexus2/nexus2.example.toml).
+#  The live configuration and the application binary live on the persistent
+#  data partition, which survives firmware updates:
+#      /mnt/data/nexus2/nexus2.toml      (mode 0600: it holds passwords)
+#      /mnt/data/nexus2/app.conf         (S97app: what to run, see S97app)
+#  Copy this file there, adapt every N0CALL / CHANGE_ME / example value, and
+#  ignore the /opt/nexus-bs2 path below, which is the Raspberry Pi layout.
+# =============================================================================
+# =============================================================================
+#  Nexus-BS 2.0 -- example station configuration (nexus2.example.toml)
+# =============================================================================
+#  One short file says what the station does: who it is, which carriers it
+#  puts on the air and where they link to. Everything the board needs to do
+#  that cleanly (gains, DC/image nulls, the clean ceiling) is measured by the
+#  tools and kept next to it in nexus2.calibration.toml; you never edit that.
+#
+#  Frequencies are in MHz, exactly as a radio displays them. The station
+#  derives the local oscillators, the carrier offsets, the sample rate and
+#  every modem constant; `nexus2 plan` prints what it derived.
+#
+#  Getting started
+#    1. Copy this file to /opt/nexus-bs2/nexus2.toml (mode 0600: it holds
+#       passwords) and replace every N0CALL / CHANGE_ME / example value.
+#    2. Check the frequencies against your licence and band plan.
+#    3. `nexus2 doctor` -- it checks the file exactly the way the service does.
+#    4. `nexus2 tx-calibrate --allow-rf-tx --write` with the carriers you will
+#       run enabled, on a dummy load, to write the board calibration.
+#    5. Set transmit = true, start the service, read the dashboard.
+#
+#  Keys left out take the defaults in Docs/Manual_conf.md. Any unknown key is
+#  an error, so a typo cannot silently do nothing.
+#
+#  The example cell: TX 438.025 / RX 433.025 MHz (5 MHz split), MCC 901,
+#  MNC 9999 (the amateur test network), with DMR, P25 and FM carriers on the
+#  same board. DO NOT RUN without adapting it to your licence.
+# =============================================================================
+
+[station]
+callsign = "N0CALL"                 # every network link and the CW ID use it
+name = "Nexus-BS 2.0"               # shown on TETRA terminals, sent to DMR masters
+
+[radio]
+transmit = false                    # shipped safe; true once the plan matches your licence
+duplex_split_mhz = 5.0              # RX = TX - this, on every carrier (7.6 for the ham 70 cm split)
+rx_gain_db = 30.0                   # overall receive gain
+
+
+# --- TETRA -------------------------------------------------------------------
+[[carrier]]
+mode = "tetra"
+tx_mhz = 438.025                    # downlink (the base station transmits here)
+
+[carrier.tetra]
+mcc = 901                           # mobile country code (0-1023)
+mnc = 9999                          # mobile network code (0-16383)
+colour_code = 1                     # 0-63
+location_area = 2                   # rotated at each start so terminals re-register
+hangtime_secs = 5                   # the group keeps the channel this long after the last over
+packet_data = "10.44.0.0/24"        # IP over TETRA; the gateway is the pool's first host
+# A split that is not a standard TETRA spacing (10, 7, 0, 8, 5, 9.5 MHz in
+# the 400 MHz band) needs the entry of the terminals' custom duplex table:
+# custom_duplex_index = 7
+
+[carrier.tetra.core]                # Brew / TetraPack core link (leave out for a stand-alone cell)
+host = "core.tetrapack.online"
+username = "CHANGE_ME"
+password = "CHANGE_ME"
+drop_deregistered = true            # a radio the core moved elsewhere is detached here
+
+# A second carrier of the same cell carrying packet data only (off until you
+# have data terminals). It takes its identity from the primary carrier.
+[[carrier]]
+mode = "tetra-data"
+tx_mhz = 437.900
+enabled = false
+
+
+# --- DMR ---------------------------------------------------------------------
+[[carrier]]
+mode = "dmr"
+tx_mhz = 437.975
+level_db = -3.0                     # 3 dB below the loudest carrier
+
+[carrier.dmr]
+id = 1234567                        # your DMR ID (radioid.net), the 24-bit repeater ID on RF
+colour_code = 1
+
+[carrier.dmr.network]
+profile = "brandmeister"            # brandmeister | dmrplus | tgif | freedmr | custom
+master = "CHANGE-ME.master.brandmeister.network:62031"
+id = 123456701                      # network ID = DMR ID + 2-digit suffix (> 1000)
+password = "CHANGE_ME"              # hotspot password
+port = 62002                        # local UDP port (0 = any)
+location = "Somewhere"
+latitude = 44.43
+longitude = 26.10
+
+
+# --- P25 ---------------------------------------------------------------------
+[[carrier]]
+mode = "p25"
+tx_mhz = 438.075
+level_db = -3.0
+
+[carrier.p25]
+nac = 0x293                         # Network Access Code as programmed in radios (hex)
+
+[carrier.p25.reflector]
+host = "p25-reflector.example.net:41000"
+talkgroup = 10200
+port = 62005
+auto_select = false                 # true: follow the talkgroup dialled on RF
+
+
+# --- Analog FM ---------------------------------------------------------------
+[[carrier]]
+mode = "fm"
+tx_mhz = 438.125
+level_db = -9.5                     # one third of the loudest carrier's amplitude
+
+[carrier.fm]
+repeater = "duplex"                 # duplex | simplex | link
+ctcss_hz = 103.5                    # standard tone, exactly as programmed in the radios; leave out for carrier squelch
+squelch = { open = 105, close = 111 }   # modem metric units; measure the idle floor on your board (115 on the reference HAT)
+timeout_secs = 180
+hang_ms = 300
+cw_id = { every_secs = 600, wpm = 20, tone_hz = 1000 }   # the callsign in Morse every 10 minutes
+
+[carrier.fm.svxlink]                # bridge to svxlink (RoLink, EchoLink, ...)
+addon = "/opt/nexus-bs2/addons/svxlink"   # its svxlink.conf, PTYs and talker files live under here
+audio = "studio"                    # studio: de-emphasis, gate, leveler, limiter; flat: plain gain
+from_network_gain = 9.0             # svxlink sends flat, quiet audio
+jitter_ms = 300                     # prebuffer; internet reflectors arrive in bursts of up to ~300 ms
+
+[carrier.fm.svxlink.mdc1200]        # announce the network talker's MDC1200 ID on the air
+database = "/opt/nexus-bs2/callsigns.csv"   # built with `nexus2 callsigns --out ...`
+unknown = "ROLINK"                  # label for a talker missing from the database
+source = "https://rolink.network/api/reflector/nodes/filter/"
+
+
+# --- Dashboard and touch panel -----------------------------------------------
+[dashboard]
+listen = "0.0.0.0:8080"             # off loopback it needs username and password
+username = "CHANGE_ME"
+password = "CHANGE_ME"
+# p25_list_token = "..."            # RefCheck.Radio token for the P25 reflector list (Settings page)
+
+[touch]                             # the native panel; read by the panel process within 5 s
+backlight = 100                     # % while in use
+screen_timeout_secs = 300           # idle seconds before the screensaver; 0 = always on
+screensaver = "splash"              # splash (dimmed logo) | blank
+wake_on_traffic = true              # a new call wakes the screen

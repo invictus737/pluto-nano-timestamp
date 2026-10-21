@@ -1,4 +1,3 @@
-source "$BR2_EXTERNAL_PLUTO_NANO_PATH/package/aic8800d80/Config.in"
 source "$BR2_EXTERNAL_PLUTO_NANO_PATH/package/soapysdr/Config.in"
 source "$BR2_EXTERNAL_PLUTO_NANO_PATH/package/soapyplutosdr-ts/Config.in"
 source "$BR2_EXTERNAL_PLUTO_NANO_PATH/package/sdr-ip-gadget/Config.in"

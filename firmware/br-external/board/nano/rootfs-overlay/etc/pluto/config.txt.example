@@ -1,0 +1,45 @@
+# PlutoSDR (Pluto Nano, NexusBS firmware v0.39-nexusBS) device configuration: generic example.
+# The live file is config.txt on the Pluto's USB drive (written at every boot from the U-Boot
+# environment). Edit it there, save, eject the drive: the values go into the U-Boot environment
+# (the same keys work with `fw_setenv <key> <value>` over SSH). Never share a file with real
+# passwords in it.
+
+[NETWORK]
+# host name: DHCP requests carry it (the router lists the Pluto under it) and mDNS answers
+# <hostname>.local
+hostname = plutosdr
+# USB network (gadget): the Pluto's address, the computer's address, netmask
+ipaddr = 192.168.2.1
+ipaddr_host = 192.168.2.10
+netmask = 255.255.255.0
+
+[WLAN]
+# USB Wi-Fi adapter (AIC8800D80/D81, Realtek): network name and WPA2 passphrase. The adapter is
+# brought up at boot and whenever one is plugged in (wpa_supplicant + DHCP + DNS).
+ssid_wlan = MyNetwork
+pwd_wlan = CHANGE_ME
+# empty = DHCP, or a fixed address
+ipaddr_wlan =
+# regulatory country (ISO 3166 alpha-2) for channels and transmit power, default RO
+country_wlan = RO
+
+[USB_ETHERNET]
+# USB Ethernet adapter: empty = DHCP, or a fixed address and netmask
+ipaddr_eth =
+netmask_eth = 255.255.255.0
+
+[SYSTEM]
+# reference oscillator correction in Hz (40 MHz nominal), measured per board
+xo_correction =
+udc_handle_suspend = 0
+# USB Communication Device Class Compatibility Mode [rndis|ncm|ecm]
+usb_ethernet_mode = rndis
+# NexusBS station role [slave|master]: slave = SDR for NexusBS on another computer,
+# master = NexusBS runs on this Pluto (/mnt/data/nexus2, example /etc/nexus2/nexus2.example.toml)
+operating_mode = slave
+
+[ACTIONS]
+diagnostic_report = 0
+dfu = 0
+reset = 0
+calibrate = 0

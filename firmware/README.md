@@ -50,13 +50,46 @@ not read back the lower bank; it warns when qspi-bootcopy differs from qspi-fsbl
 
 ## USB adapters (OTG host)
 
-Wi-Fi: AIC8800D80/D81 (out-of-tree driver, branch `legacy-mcu1`, `build-aic8800.sh`), Realtek
-r8188eu/rtl8xxxu/rtl8192cu (in kernel, `rtlwifi` firmware); `wpa_supplicant` has nl80211 and wext
-(r8188eu is wext only) and the ifup hook tries both. Ethernet: r8152 (RTL8153, RTL8156/8156B 2.5G,
-`rtl_nic` firmware), ASIX, SMSC, CDC ECM/NCM, RNDIS. Bluetooth: kernel btusb + bluez
-(bluetoothd, bluetoothctl); AIC combo adapters hand the HCI interface to btusb after the firmware
-upload, 368b:8d81 with the `aic_zlp_quirk` module. `/lib/mdev/ifupdown.sh` brings any hot-plugged
-`wlan*`/`eth*` up from `/etc/network/interfaces` (config.txt) and keeps DHCP retrying.
+Standard Linux mechanisms only; nothing is loaded by board scripts.
+
+- **Modules by alias.** Kernel modules are installed with `modules_install` (`build-modules.sh`), depmod
+  writes `modules.dep`/`modules.alias`, and mdev's `$MODALIAS` rule runs `modprobe -b "$MODALIAS"` for
+  every device (S10mdev replays the USB add events once at boot, like `udevadm trigger`).
+- **AIC8800D80/D81 Wi-Fi** (`a69c:8d80` loader, `a69c:8d81`/`368b:8d81` running): the community driver
+  `shenmintao/aic8800d80` branch `legacy-mcu1` (a9683a4, 2026-10-21), the maintained profile for
+  `chip_mcu_id=1` units (SDK V3 firmware that fits the MCU1 upload window; the newer SDK V5 firmware on
+  `main`/Radxa does not). `aic8800-intree.sh` copies it into `drivers/net/wireless/aic8800` and it is
+  built **in tree** as `aic_load_fw.ko` + `aic8800_fdrv.ko` (no out-of-tree taint). `patches/aic8800`:
+  firmware through `request_firmware()` from `/lib/firmware` (incl. `aic_userconfig_8800d80.txt`, whose
+  TX power entries are capped at 15 dBm by the build), `aic_load_fw` binds only the vendor interface of
+  the running device (no failed probe of the Bluetooth interfaces), errors at KERN_ERR and the
+  chatter at debug level (`aicwf_dbg_level`, default errors only), standard cfg80211 regulatory by
+  default (`custregd=0`: wireless-regdb, `iw reg set <country>`), `get_tx_power` reports the limit in
+  force and `set_tx_power` never exceeds the userconfig table, the upstream rwnx_close fix for a dead
+  bus (PR 99), and a firmware that stops answering commands resets the USB device through the USB core
+  (`usb_queue_reset_device`) instead of leaving a crashed command queue. Options:
+  `/etc/modprobe.d/aic8800.conf` (`ps_on=0`).
+- **Driver CD mode** (`a69c:5721..572f`, Pandora `1111:1111`): `usb-storage` ignores these IDs (linux
+  patch 0004, `US_FL_IGNORE_DEVICE`, so nothing is mounted), mdev calls `usb_modeswitch` with the
+  standard configuration file `/etc/usb_modeswitch.d/<vid>:<pid>` (StandardEject), the adapter
+  re-enumerates in Wi-Fi/Bluetooth mode.
+- **Bluetooth**: kernel `btusb`; the AIC `368b:8d81` controller needs a zero-length packet after ACL
+  bulk OUT transfers, now a `btusb` quirk-table entry (linux patch 0003, `BTUSB_ACL_TX_ZLP`) instead of
+  the former kprobe module. BlueZ `bluetoothd` with the audio plugins (A2DP/AVRCP) and bluez-alsa
+  (`S41bluealsa`, A2DP source, SBC, `bluealsa-cli`) on the system D-Bus; pairings in
+  `/mnt/data/bt/lib` (`/var/lib/bluetooth`).
+- Other Wi-Fi: Realtek r8188eu/rtl8xxxu/rtl8192cu (in kernel, `rtlwifi` firmware). Ethernet: r8152
+  (`rtl_nic` firmware), ASIX, SMSC, CDC ECM/NCM, RNDIS.
+- **Network**: `config.txt [WLAN] ssid_wlan/pwd_wlan/country_wlan` (U-Boot environment) give
+  `/etc/wpa.conf` and the `wlan0` stanza of `/etc/network/interfaces` (S40network). Busybox ifupdown has
+  no `allow-hotplug` keyword, so the stanzas are `auto` (boot) and mdev runs the stock
+  `/lib/mdev/ifupdown.sh` (`ifup`/`ifdown`) when an adapter appears or goes; wpa_supplicant is started
+  and stopped by its ifupdown hook, `udhcpc` sends the host name (`hostname`) and stays in the
+  background until it gets a lease (`udhcpc_opts -b`). DNS: busybox's upstream `simple.script` as
+  `/usr/share/udhcpc/default.script` (plain `nameserver` lines). mDNS: avahi, `<hostname>.local`
+  (default host name `plutosdr`).
+- Lockups: soft-lockup detector (reports after 8 s, `kernel.watchdog_thresh=4`) and hung-task
+  detector (20 s) log a stack trace; the hardware watchdog resets after 10 s.
 
 ## Station role: slave (default) or master
 
@@ -106,6 +139,18 @@ Kernel WireGuard + `wg`. Put a wg-quick style file in `/mnt/data/wireguard/wg0.c
 peer refuses handshakes stamped 1970 as replays) and a default route exists. IPv4 Address/MTU and
 AllowedIPs routes are handled (0.0.0.0/0 as two /1 routes, endpoint kept on the old gateway);
 DNS/PostUp and the like are ignored. `fw_setenv wireguard 0` disables it.
+
+## SSH, SCP, SFTP
+
+Dropbear (`dropbearmulti`: server, client, `scp`) and the Green End SFTP server as
+`/usr/libexec/sftp-server`: `scp`, `sftp` and `rsync`-free copies from any OpenSSH client work as usual
+(OpenSSH 9+ `scp` uses the SFTP protocol; `scp -O` uses dropbear's scp).
+
+## Configuration files shipped in the image
+
+Generic and commented, without secrets: `/etc/pluto/config.txt.example` (the `config.txt` keys) and
+`/etc/nexus2/nexus2.example.toml` (NexusBS station example). Applications, their live configuration
+and the Bluetooth pairings stay on `/mnt/data` (UBIFS), which survives firmware updates.
 
 Output: `build/pluto.frm` and `build/pluto.dfu`. Flash with `dfu-util -a firmware.dfu -D build/pluto.dfu`
 after the vendor backup. Host driver: `pgreenland/SoapyPlutoSDR` branch `sdr_gadget_timestamping`,

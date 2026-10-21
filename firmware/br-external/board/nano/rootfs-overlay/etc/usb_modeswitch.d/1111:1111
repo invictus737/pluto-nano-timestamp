@@ -1,0 +1,10 @@
+# AIC8800D80 "Pandora" clone adapter (1111:1111): two vendor-specific SCSI CDBs (F3, then F2)
+# switch it from storage to Wi-Fi/Bluetooth mode. From github.com/shenmintao/aic8800d80
+# usb_modeswitch/1111_1111.
+DefaultVendor=0x1111
+DefaultProduct=0x1111
+TargetVendor=0xa69c
+TargetProduct=0x8d80
+MessageContent="555342438765432100000000000010fd0000000000000000000000000000f3"
+MessageContent2="555342438765432100000000000010fd0000000000000000000000000000f2"
+NeedResponse=1

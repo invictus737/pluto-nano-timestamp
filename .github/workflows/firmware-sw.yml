@@ -18,8 +18,8 @@ jobs:
       - name: Stand-in xsa (ADI v0.39 release, CLG225)
         run: mkdir -p xsa && curl -sfL -o xsa/system_top.xsa https://github.com/analogdevicesinc/plutosdr-fw/releases/download/v0.39/system_top.xsa && ls -la xsa
       - uses: ./.github/actions/fw-caches
-      - name: btop (static ARMv7 musl, into the rootfs overlay)
-        run: firmware/build-btop.sh firmware/br-external/board/nano/rootfs-overlay
+      - name: btop (static ARMv7 musl, into the generated rootfs overlay)
+        run: firmware/build-btop.sh firmware/work-overlay
       - name: Assemble firmware
         run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
       - name: Image report
@@ -27,8 +27,9 @@ jobs:
         run: |
           ls -la fw/build/ || true
           du -sh fw/buildroot/output/target 2>/dev/null || true
-          ls -la fw/buildroot/output/target/usr/bin/btop fw/buildroot/output/target/lib/firmware/aic8800D80 2>/dev/null | head || true
           find fw/buildroot/output/target -name '*.ko' 2>/dev/null | head -20 || true
+          mkdir -p review && cp fw-size-report.txt fw/linux/.config fw/build/rootfs.cpio.zst review/ 2>/dev/null || true
+          (cd fw/buildroot/output/target && find . | sort) > review/rootfs-files.txt 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: software-check-DO-NOT-FLASH, path: "fw/build/pluto.frm\nfw/build/pluto.dfu\nfw/buildroot/output/build/*/build.log", if-no-files-found: ignore }
+        with: { name: software-check-DO-NOT-FLASH, path: "fw/build/pluto.frm\nfw/build/pluto.dfu\nreview\nfw-build.log", if-no-files-found: ignore }

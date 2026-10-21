@@ -25,7 +25,9 @@ start() {
 	mount -t ubifs -o noatime ubi0:data $MNT && say "mounted ($(df -h $MNT | awk 'NR==2 {print $4}') free)"
 }
 case "$1" in
-start) start ;;
+start) start
+	# Bluetooth pairing store (/var/lib/bluetooth links here): persistent when the partition is mounted
+	mkdir -p -m 0700 $MNT/bt/lib ;;
 stop) umount $MNT 2>/dev/null; ubidetach -d 0 2>/dev/null; true ;;
 esac
 exit 0

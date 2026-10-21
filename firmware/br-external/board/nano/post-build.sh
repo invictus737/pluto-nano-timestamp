@@ -3,10 +3,21 @@
 # rootfs overlay's copy). $1 = target dir.
 set -e
 T=${1:?target dir}; HERE=$(cd "$(dirname "$0")" && pwd)
-# mdev rules with the AIC8800 Wi-Fi mode switch (written into the overlay by build-aic8800.sh)
-[ -f "$HERE/rootfs-overlay/etc/mdev.conf" ] && install -m 0644 "$HERE/rootfs-overlay/etc/mdev.conf" "$T/etc/mdev.conf"
-# network hotplug for every USB adapter (DHCP retry while Wi-Fi associates), over the stock helper
-install -m 0755 "$HERE/ifupdown.sh" "$T/lib/mdev/ifupdown.sh"
+# mdev rules (modalias module loading, usb_modeswitch, network hotplug): the overlay's copy, over the
+# stock one board/pluto/post-build.sh installs after the overlay
+install -m 0644 "$HERE/rootfs-overlay/etc/mdev.conf" "$T/etc/mdev.conf"
+# mdev: events handled in kernel order (/dev/mdev.seq), and devices present before the hotplug
+# helper was registered replayed once (coldplug: modules by alias, mode switches), like udevadm trigger
+python3 - "$T/etc/init.d/S10mdev" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = "\techo /sbin/mdev >/proc/sys/kernel/hotplug\n\t/sbin/mdev -s\n"
+assert s.count(a) == 1, "S10mdev: hotplug lines not found"
+s = s.replace(a, "\techo > /dev/mdev.seq\n" + a +
+    "\t# coldplug: replay the add events of devices that appeared before mdev was the hotplug helper\n"
+    "\tfor u in /sys/bus/usb/devices/*/uevent; do echo add > \"$u\"; done\n")
+open(p, "w").write(s)
+PY2
 # NexusBS 2.0 login banner over the stock PlutoSDR one (S45msd fills in #BUILD#)
 install -m 0644 "$HERE/motd" "$T/etc/motd"
 # root's login shell is bash (SSH and serial console); init scripts keep busybox /bin/sh
@@ -18,6 +29,33 @@ python3 - "$T/etc/init.d/S40network" "$T/sbin/update.sh" <<'PY'
 import sys
 net, upd = sys.argv[1], sys.argv[2]
 s = open(net).read()
+def rep(old, new):
+    global s
+    assert s.count(old) == 1, "S40network: " + old
+    s = s.replace(old, new)
+# Wi-Fi regulatory country (config.txt [WLAN] country_wlan, default RO): cfg80211 + wireless-regdb
+rep("\tWLAN_IPADDR=`fw_printenv -n ipaddr_wlan 2> /dev/null`\n",
+    "\tWLAN_IPADDR=`fw_printenv -n ipaddr_wlan 2> /dev/null`\n"
+    "\tWLAN_COUNTRY=`fw_printenv -n country_wlan 2> /dev/null`\n"
+    "\techo \"$WLAN_COUNTRY\" | grep -qx '[A-Z][A-Z]' || WLAN_COUNTRY=RO\n")
+rep("\techo \"ipaddr_wlan = $WLAN_IPADDR\"$'\\r' >> $CONF\n",
+    "\techo \"ipaddr_wlan = $WLAN_IPADDR\"$'\\r' >> $CONF\n"
+    "\techo \"# regulatory country (ISO 3166 alpha-2), default RO\"$'\\r' >> $CONF\n"
+    "\techo \"country_wlan = $WLAN_COUNTRY\"$'\\r' >> $CONF\n")
+# USB Ethernet and Wi-Fi adapters come and go: busybox ifupdown has no "allow-hotplug" keyword (it
+# would be taken as an option of the previous stanza), so the stanzas stay "auto" (ifup -a at boot)
+# and mdev's net rule runs ifup/ifdown when an adapter appears or goes. DHCP sends the host name (the
+# router lists the Pluto under it) and udhcpc stays in the background until a lease arrives (-b takes
+# priority over ifup's default -n)
+rep('\t\techo -e "iface eth0 inet dhcp\\n" >> $IFAC\n',
+    '\t\techo -e "iface eth0 inet dhcp\\n\\thostname $HOSTNAME\\n\\tudhcpc_opts -b\\n" >> $IFAC\n')
+rep('\t\t\techo -e "iface wlan0 inet dhcp" >> $IFAC\n',
+    '\t\t\techo -e "iface wlan0 inet dhcp\\n\\thostname $HOSTNAME\\n\\tudhcpc_opts -b" >> $IFAC\n')
+# country before any interface comes up; resolv.conf (a link into /tmp) exists for avahi/udhcpc
+rep("\t/bin/hostname -F /etc/hostname\n",
+    "\t/bin/hostname -F /etc/hostname\n"
+    "\tiw reg set \"$WLAN_COUNTRY\" 2>&1 | logger -t network\n"
+    "\tR=`readlink -f /etc/resolv.conf`; [ -e \"$R\" ] || : > \"$R\"\n")
 a = "\tUSB_ETH_MODE=`fw_printenv -n usb_ethernet_mode 2> /dev/null || echo rndis`\n"
 assert s.count(a) == 1, "S40network: usb_ethernet_mode read not found"
 s = s.replace(a, a + "\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n")
@@ -28,6 +66,9 @@ s = s.replace(b, b + "\techo \"# NexusBS station role [slave|master]: slave = SD
                      "\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n")
 open(net, "w").write(s)
 u = open(upd).read()
+w = "\t\techo \"pwd_wlan $pwd_wlan\" >> /opt/fw_set.tmp\n"
+assert u.count(w) == 1, "update.sh: pwd_wlan line not found"
+u = u.replace(w, w + "\t\techo \"country_wlan $country_wlan\" >> /opt/fw_set.tmp\n")
 c = "\t\techo \"netmask_eth $netmask_eth\" >> /opt/fw_set.tmp\n"
 assert u.count(c) == 1, "update.sh: netmask_eth line not found"
 u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master) ;; *) operating_mode=slave ;; esac\n"
@@ -62,6 +103,8 @@ open(p, "w").write(s)
 PY
 # mount point of the persistent data partition (S21data)
 mkdir -p "$T/mnt/data"
+# Bluetooth pairings (bluetoothd) persist on the data partition, as with the former BT add-on
+rm -rf "$T/var/lib/bluetooth" && ln -s /mnt/data/bt/lib "$T/var/lib/bluetooth"
 # btop refuses to start without a UTF-8 locale; musl has C.UTF-8 built in, the shell just never sets it
 if [ -f "$T/usr/bin/btop" ] && ! head -c 2 "$T/usr/bin/btop" | grep -q '#!'; then
   mkdir -p "$T/usr/libexec" && mv "$T/usr/bin/btop" "$T/usr/libexec/btop"
@@ -91,7 +134,15 @@ find "$T" -name '._*' -delete
 # libraries nothing links against (pulled in by the toolchain's OpenMP/Fortran runtime and fftw's
 # threaded variants; ad936x_ref_cal only needs libfftw3), and the fftw wisdom tools
 rm -f "$T"/usr/bin/fftw*-wisdom* "$T"/usr/lib/libfftw3*_omp.so* "$T"/usr/lib/libfftw3*_threads.so*
-for lib in libgfortran libgomp; do
+# alsa-lib comes with the bluez-alsa package for its ALSA plugins; bluealsa, bluealsa-cli and the
+# applications talk D-Bus/PCM pipes and do not use ALSA here: drop it when nothing links against it
+if ! grep -rlsq --exclude='libasound.so*' --exclude-dir=alsa-lib 'libasound.so' "$T/usr/bin" "$T/usr/sbin" "$T/usr/lib" "$T/usr/libexec" "$T/lib"; then
+  rm -rf "$T"/usr/lib/libasound.so* "$T/usr/lib/alsa-lib" "$T/usr/share/alsa" "$T/etc/alsa"
+fi
+# usb_modeswitch is called directly by mdev with its configuration file; the udev dispatcher and its
+# Jim Tcl interpreter are not used
+rm -f "$T/usr/sbin/usb_modeswitch_dispatcher" "$T/lib/udev/usb_modeswitch"; rmdir "$T/lib/udev" 2>/dev/null || true
+for lib in libgfortran libgomp libjim; do
   if ! grep -rlsq --exclude="$lib.so*" "$lib.so" "$T/usr" "$T/lib" "$T/bin" "$T/sbin"; then rm -f "$T"/usr/lib/$lib.so* "$T"/lib/$lib.so*; fi
 done
 chmod 0755 "$T"/etc/init.d/S*

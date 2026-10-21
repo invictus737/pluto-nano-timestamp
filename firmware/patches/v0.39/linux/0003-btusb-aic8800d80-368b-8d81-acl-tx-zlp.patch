@@ -1,0 +1,52 @@
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index f05018988..cc03dbddf 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -63,6 +63,7 @@ static struct usb_driver btusb_driver;
+ #define BTUSB_INTEL_BROKEN_SHUTDOWN_LED	BIT(24)
+ #define BTUSB_INTEL_BROKEN_INITIAL_NCMD BIT(25)
+ #define BTUSB_INTEL_NO_WBS_SUPPORT	BIT(26)
++#define BTUSB_ACL_TX_ZLP		BIT(27)
+ 
+ static const struct usb_device_id btusb_table[] = {
+ 	/* Generic Bluetooth USB device */
+@@ -582,6 +583,11 @@ static const struct usb_device_id blacklist_table[] = {
+ 	/* Silicon Wave based devices */
+ 	{ USB_DEVICE(0x0c10, 0x0000), .driver_info = BTUSB_SWAVE },
+ 
++	/* AICSemi AIC8800D80 Wi-Fi/Bluetooth combo: the controller needs a zero-length
++	 * packet after an ACL bulk OUT transfer that is a multiple of the packet size */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x368b, 0x8d81, 0xe0, 0x01, 0x01),
++	  .driver_info = BTUSB_ACL_TX_ZLP },
++
+ 	{ }	/* Terminating entry */
+ };
+ 
+@@ -644,6 +650,7 @@ struct btusb_data {
+ 	unsigned long flags;
+ 
+ 	bool poll_sync;
++	bool acl_tx_zlp;
+ 	int intr_interval;
+ 	struct work_struct  work;
+ 	struct work_struct  waker;
+@@ -1689,6 +1696,9 @@ static struct urb *alloc_bulk_urb(struct hci_dev *hdev, struct sk_buff *skb)
+ 	usb_fill_bulk_urb(urb, data->udev, pipe,
+ 			  skb->data, skb->len, btusb_tx_complete, skb);
+ 
++	if (data->acl_tx_zlp)
++		urb->transfer_flags |= URB_ZERO_PACKET;
++
+ 	skb->dev = (void *)hdev;
+ 
+ 	return urb;
+@@ -3942,6 +3952,9 @@ static int btusb_probe(struct usb_interface *intf,
+ 	if (id->driver_info & BTUSB_WIDEBAND_SPEECH)
+ 		set_bit(HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED, &hdev->quirks);
+ 
++	if (id->driver_info & BTUSB_ACL_TX_ZLP)
++		data->acl_tx_zlp = true;
++
+ 	if (id->driver_info & BTUSB_VALID_LE_STATES)
+ 		set_bit(HCI_QUIRK_VALID_LE_STATES, &hdev->quirks);
+ 
