@@ -35,6 +35,9 @@ role() { r=$(env_get operating_mode); [ "$r" = master ] || r=slave; echo $r; }
 ppm() { awk -v x="$1" 'BEGIN { printf "%+.3f", (x - 40000000) / 40 }'; }
 bytes() { printf '%s' "$1" | wc -c | tr -d ' '; }
 lock9() { n=0; while ! flock -n 9; do n=$((n + 1)); [ $n -ge 30 ] && return 1; sleep 1; done; }   # busybox flock has no -w
+# init scripts and helpers that start daemons: without the lock (fd 9) and the menu's terminal/result
+# descriptors (3, 4), else a daemon or S97app's supervisor would hold the lock for good
+svc() { "$@" 3>&- 4>&- 9>&-; }
 
 # ---------------------------------------------------------------- system
 do_hostname() {
@@ -46,12 +49,12 @@ do_hostname() {
 	for f in "$NJ" "$NJ.applied"; do
 		[ -f "$f" ] && jq -e 'has("hostname")' "$f" > /dev/null 2>&1 && jq 'del(.hostname)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 	done
-	$INITD/S50avahi-daemon stop > /dev/null 2>&1; $INITD/S50avahi-daemon start > /dev/null 2>&1
+	svc $INITD/S50avahi-daemon stop > /dev/null 2>&1; svc $INITD/S50avahi-daemon start > /dev/null 2>&1
 	log "hostname $h"; say "host name: $h (mDNS $h.local; DHCP leases carry it from their next renewal)"
 }
 do_role() {
 	case "${1:-}" in master|slave) ;; *) err "role: master or slave"; return 2 ;; esac
-	$SBIN/nexus-role "$1" || return 1
+	svc $SBIN/nexus-role "$1" || return 1
 	[ "$1" = master ] && say "NexusBS runs on this Pluto; the SDR gadgets are stopped" || say "SDR for NexusBS on another computer; NexusBS here is stopped"
 }
 do_usb_mode() {
@@ -61,13 +64,22 @@ do_usb_mode() {
 	[ "$1" = host ] && say "WARNING: in host mode a computer on the USB-C port no longer sees the Pluto (no USB network, no drive); reach it over Wi-Fi/Ethernet or the serial console"
 	return 0
 }
+# [radio] ppm of the station's nexus2.toml when it is not 0 (it would correct the LO a second time)
+station_ppm() { awk '/^[[:space:]]*\[/ { s = ($0 ~ /^[[:space:]]*\[radio\][[:space:]]*(#.*)?$/) } s && /^[[:space:]]*ppm[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, ""); if ($0 + 0 != 0) print; exit }' "$STATION/nexus2.toml" 2>/dev/null; }
+xo_notes() {
+	say "(ppm = (xo - 40000000) / 40000000 x 1e6; a slow crystal tunes the radio low and has xo below 40000000;"
+	say " 1 ppm = 438 Hz at 438 MHz. Keep [radio] ppm = 0 in nexus2.toml on a Pluto: guide Docs/PLUTO-CRYSTAL-CORRECTION.md)"
+	p=$(station_ppm); [ -z "$p" ] || say "WARNING: $STATION/nexus2.toml has [radio] ppm = $p: set it to 0, the crystal correction already covers the LO and the sample clock"
+}
 do_xo_correction() {
 	v=${1:-}; now=${2:-}
 	if [ "$v" = default ]; then env_set xo_correction "" || return 1; log "xo_correction unset"; say "crystal correction removed (40000000 Hz nominal, at the next boot)"; return 0; fi
 	printf '%s' "$v" | grep -Eq '^[0-9]{8}$' && [ "$v" -ge 39990000 ] && [ "$v" -le 40010000 ] || \
-		{ err "crystal correction: the measured reference in Hz, 8 digits within 250 ppm of 40000000 (39990000-40010000)"; return 1; }
+		{ err "crystal correction: the measured reference in Hz, 8 digits within +/-250 ppm of 40000000 (39990000-40010000)"; return 1; }
+	# idempotent: the same value again changes nothing (provision.sh and the menu may both hand it in)
+	if [ "$v" = "$(env_get xo_correction)" ] && [ "$now" != --now ]; then say "crystal: $v Hz = $(ppm $v) ppm (unchanged)"; xo_notes; return 0; fi
 	env_set xo_correction "$v" || return 1
-	log "xo_correction $v"; say "crystal: $v Hz = $(ppm $v) ppm"
+	log "xo_correction $v"; say "crystal: $v Hz = $(ppm $v) ppm"; xo_notes
 	if [ "$now" = --now ]; then
 		d=; for n in $P/sys/bus/iio/devices/*/name; do [ "$(cat "$n" 2>/dev/null)" = ad9361-phy ] && d=$(dirname "$n"); done
 		if [ -n "$d" ] && echo "$v" > "$d/xo_correction" 2>/dev/null; then say "applied to the AD9361 now (restart NexusBS if it runs)"
@@ -234,16 +246,18 @@ do_wifi_country() {
 }
 do_net_apply() { net_apply; }
 do_net_confirm() { $SBIN/nexus-net confirm; }
-do_net_rollback() { $SBIN/nexus-net revert && say "previous network settings restored"; }
+do_net_rollback() { svc $SBIN/nexus-net revert > /dev/null && say "previous network settings restored"; }
 
 # ---------------------------------------------------------------- Bluetooth
 # bluetoothctl waits forever for a bluetoothd that does not run: only with the daemon, and bounded
 bt_running() { [ -f $P/var/run/bluetoothd.pid ] && kill -0 "$(cat $P/var/run/bluetoothd.pid)" 2>/dev/null; }
 btctl() { bt_running && bluetoothctl --timeout 5 "$@" 2>/dev/null; }
 player_bt_off() {   # keep the NexusBS Player's switch (player.json bt_off) in step
-	f=$STATION/player.json; [ -d "$STATION" ] || return 0
+	f=$STATION/player.json
+	# off before the station exists (first boot, slave role): the Player must start off all the same
+	if [ ! -d "$STATION" ]; then [ "$1" = true ] && [ -d "$DATA" ] && mkdir -p "$STATION" && chmod 700 "$STATION" || return 0; fi
 	if [ -s "$f" ] && jq -e 'type == "object"' "$f" > /dev/null 2>&1; then jq ".bt_off = $1" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-	elif [ "$1" = true ]; then echo '{"bt_off": true}' > "$f"; fi
+	elif [ "$1" = true ]; then echo '{"bt_off": true}' > "$f.tmp" && mv "$f.tmp" "$f"; fi
 	chmod 600 "$f" 2>/dev/null; return 0
 }
 do_bluetooth() {
@@ -304,7 +318,7 @@ do_station_setup() {   # KEY=value lines on stdin (the nexus-setup.txt format)
 }
 do_station_restart() {
 	[ "$(role)" = master ] || { err "role slave: NexusBS does not run on this Pluto (nexus-config nonint do_role master)"; return 1; }
-	$INITD/S97app restart
+	svc $INITD/S97app restart
 }
 station_status() {
 	echo "role: $(role)"
@@ -333,14 +347,16 @@ versions() {
 	else echo "application slot: none"; fi
 	Z=$(mtdnum qspi-fsbl-uboot 2>/dev/null)
 	[ -n "$Z" ] && echo "U-Boot: $(dd if=$(mtddev $Z) bs=65536 count=16 2>/dev/null | tr -c ' -~' '\n' | grep -m1 '^U-Boot 20')"
-	echo "FSBL (CPU/DDR clock): $($SBIN/nexus-clock status 2>/dev/null | jq -r '"\(.installed) installed, \(.effective) configured, CPU \(.cpu_mhz) MHz / DDR \(.ddr_mts) MT/s"' 2>/dev/null)"
+	echo "FSBL (CPU/DDR clock): $($SBIN/nexus-clock status 2>/dev/null | jq -r '"\(.installed) installed, \(.effective) configured, CPU \(.cpu_mhz) MHz / DDR \(.ddr_mts) MT/s\(if .apply_failed then " (LAST WRITE FAILED, see the log)" else "" end)"' 2>/dev/null)"
 	echo "kernel: $(uname -r)"
 }
 update_help() { cat <<'EOF'
 Firmware updates go through the Pluto's USB drive (USB-C to a computer, usb_mode peripheral or auto):
   pluto.frm   the firmware (kernel + root file system), with boot.frm on a first install from stock
-  boot.frm    FSBL + U-Boot + U-Boot environment (no fallback: never cut power while it is written)
-  apps.frm    the NexusBS application slot (apps-stock-clock.frm also resets the CPU clock to standard)
+  boot.frm    FSBL + U-Boot + U-Boot environment (no fallback: never cut power while it is written;
+              it resets every config.txt key to the image defaults)
+  apps.frm    the NexusBS application slot (apps-stock-clock.frm also writes the standard-clock FSBL
+              and sets cpu_clock = standard: the way back from an overclock)
   nexus-setup.txt  station identity, applied once (or: nexus-config, NexusBS station)
 Copy the files (at most one boot*.frm and one apps*.frm), eject the drive, wait: the LED blinks fast
 while flashing and the Pluto reboots. /mnt/data (settings, NexusBS data, pairings, SSH keys) is kept.
@@ -352,20 +368,25 @@ do_backup() {
 	grep -q " /mnt/data " $P/proc/mounts 2>/dev/null || { err "/mnt/data is not mounted, nothing to back up"; return 1; }
 	if [ "$d" = - ]; then [ -t 1 ] && { err "the archive goes to stdout: redirect it (ssh root@pluto nexus-config nonint do_backup - > backup.tar.gz)"; return 1; }
 		tar -c -C "$DATA" . | gzip; return $?; fi
-	case "$d" in /mnt/data|/mnt/data/*) err "the backup cannot be written inside /mnt/data"; return 1 ;; esac
+	case "$d" in /*) ;; *) err "the backup path must be absolute (e.g. /media/sda1 or /tmp)"; return 1 ;; esac
 	[ -d "$P$d" ] && d=$d/nexus-data-$(date +%Y%m%d-%H%M%S).tar.gz
+	# the directory it lands in, links resolved: never inside /mnt/data (it would archive itself)
+	r=$(cd "$(dirname "$P$d")" 2>/dev/null && pwd -P) || { err "no directory $(dirname "$d")"; return 1; }
+	dr=$(cd "$DATA" 2>/dev/null && pwd -P) || dr=$DATA
+	case "$r" in "$dr"|"$dr"/*) err "the backup cannot be written inside /mnt/data"; return 1 ;; esac
 	tar -c -C "$DATA" . | gzip > "$P$d" && chmod 600 "$P$d" || { rm -f "$P$d"; err "backup failed"; return 1; }
 	log "backup written to $d"; say "backup: $d ($(wc -c < "$P$d") bytes, 0600; it contains passwords and keys; restore: gunzip -c FILE | tar -x -C /mnt/data)"
 }
 do_factory_reset() {
 	[ "${1:-}" = ERASE-ALL-DATA ] || { err "do_factory_reset ERASE-ALL-DATA: erases /mnt/data (network, NexusBS station, pairings, SSH host keys)"; return 2; }
 	grep -q " /mnt/data ubifs " $P/proc/mounts 2>/dev/null || { err "/mnt/data is not the persistent partition here, nothing done"; return 1; }
-	$INITD/S97app stop > /dev/null 2>&1
+	svc $INITD/S97app stop > /dev/null 2>&1
 	rm -rf "$DATA"/* "$DATA"/.[!.]* 2>/dev/null
 	mkdir -p "$DATA/bt/lib" "$DATA/dropbear" "$DATA/network" && chmod 700 "$DATA/bt" "$DATA/bt/lib" "$DATA/dropbear" "$DATA/network"
 	sync; log "factory reset of /mnt/data"
 	say "/mnt/data erased. Reboot now: the station gets its defaults again, new SSH host keys (clients warn once)."
-	say "The U-Boot environment (config.txt keys) is unchanged."
+	say "The U-Boot environment (config.txt keys) is unchanged: after the reboot Wi-Fi/Ethernet use the config.txt"
+	say "settings again (ssid_wlan, pwd_wlan, ipaddr_*); networks added with nexus-config are gone."
 }
 
 # ---------------------------------------------------------------- get
@@ -410,7 +431,7 @@ net_status_text() {
 		"settings from: \(.source)\(if .rollback_pending then " (change waiting for confirmation)" else "" end)"' 2>/dev/null || echo "network status unavailable"
 }
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; cat <<'EOF'
 
 nonint functions:
   do_hostname NAME                     do_role master|slave            do_usb_mode peripheral|auto|host
@@ -466,7 +487,7 @@ menu_system() {
 				slave "SDR for an external NexusBS" master "NexusBS on this Pluto") && act "Station role" do_role "$v" ;;
 		3) v=$(dlg --title "USB mode" --default-item "$(get usb_mode)" --menu "USB-C port role, applied at the next boot.\nperipheral: a computer is the USB host (USB network, drive, SDR over USB).\nauto: peripheral; host when no computer configures the port within 20 s.\nhost: always host (hub with Wi-Fi/Ethernet adapters); a computer no longer sees the Pluto." 16 76 3 \
 				peripheral "a computer is the host (default)" auto "host when no computer is found" host "always host") && act "USB mode" do_usb_mode "$v" ;;
-		4) v=$(ask "Crystal correction" "The AD9361 reference: the measured frequency of this board's 40 MHz crystal in Hz,\ne.g. 39999331. ppm = (xo - 40000000) / 40000000 x 1e6, so 39999331 = -16.725 ppm\n(the crystal runs 16.725 ppm low). Type 'default' to remove it. Active at the next boot." "$x") || continue
+		4) v=$(dlg --title "Crystal correction" --inputbox "Measured frequency of this board's 40 MHz crystal in Hz (+/-250 ppm),\ne.g. 39999331. ppm = (xo - 40000000) / 40000000 x 1e6 (39999331 = -16.725).\nA slow crystal tunes the radio low: xo below 40000000. 1 ppm = 438 Hz\nat 438 MHz. Keep [radio] ppm = 0 in nexus2.toml. 'default' removes it.\nActive at the next boot. Guide: Docs/PLUTO-CRYSTAL-CORRECTION.md" 14 78 "$x") || continue
 		   [ "$v" = default ] && { act "Crystal correction" do_xo_correction default; continue; }
 		   now=; dlg --title "Crystal correction" --defaultno --yesno "Apply $v Hz ($(ppm "$v" 2>/dev/null) ppm) to the AD9361 now as well?\nThe radio retunes; a running NexusBS should be restarted afterwards." 9 76 && now=--now
 		   act "Crystal correction" do_xo_correction "$v" $now ;;
@@ -477,7 +498,7 @@ menu_system() {
 	done
 }
 menu_clock() {
-	st=$($SBIN/nexus-clock status 2>/dev/null | jq -r '"configured \(.configured), installed \(.installed), running CPU \(.cpu_mhz) MHz / DDR \(.ddr_mts) MT/s"' 2>/dev/null)
+	st=$($SBIN/nexus-clock status 2>/dev/null | jq -r '"configured \(.configured), installed \(.installed), running CPU \(.cpu_mhz) MHz / DDR \(.ddr_mts) MT/s\(if .apply_failed then "\\nTHE LAST FSBL WRITE FAILED (not retried until the setting changes)" else "" end)"' 2>/dev/null)
 	v=$(dlg --title "CPU/DDR clock" --default-item "$(get cpu_clock)" --menu "$st\n\nThe boot block is rewritten at the next restart; a power cut during that < 1 s write needs DFU/JTAG recovery." 17 76 4 \
 		standard "Tezuka default clocks (recommended)" \
 		495_396 "CPU 495/DDR 396: Tezuka file, not tested on the reference board" \

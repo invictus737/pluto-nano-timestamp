@@ -22,7 +22,7 @@ if [ "${1:-}" = --docker ]; then
 		python3 "$S/patch.py" "$S/fw/pb/S40network" "$S/fw/pb/update.sh" "$S/fw/pb/S45msd" || exit 1
 		PBE="-e PB_DIR=/fw/pb"
 	fi
-	COPYFILE_DISABLE=1 tar -C "$S" -cf - fw | docker run --rm -i $PBE alpine:3.20 sh -c 'tar -x -C / &&
+	COPYFILE_DISABLE=1 tar -C "$S" -cf - fw | docker run --rm -i $PBE -e NEXUS_TEST_CONTAINER=1 alpine:3.20 sh -c 'tar -x -C / &&
 		{ apk add -q jq > /dev/null 2>&1 || { echo "jq could not be installed in the container"; exit 1; }; } && exec busybox sh /fw/tests/nexus-config-test.sh'
 	r=$?; rm -rf "${S:?}"; exit $r
 fi
@@ -110,7 +110,9 @@ head -c 65536 /dev/zero | tr '\000' '\377' > $R/ff64k
 # ---- mtd sandbox: Tezuka-like boot image (block 0 per clock variant + common rest), env, slot
 printf 'dev:    size   erasesize  name\nmtd0: 00100000 00010000 "qspi-fsbl-uboot"\nmtd1: 00020000 00010000 "qspi-uboot-env"\nmtd2: 00040000 00010000 "qspi-nvmfs"\nmtd3: 00100000 00010000 "qspi-linux"\nmtd4: 00100000 00010000 "qspi-bootcopy"\nmtd5: 00080000 00010000 "qspi-apps"\nmtd6: 00080000 00010000 "qspi-data"\n' > $R/proc/mtd
 C=$R/usr/share/nexus-clock
-for v in standard 495_396 950_600 1100_750; do head -c 65536 /dev/urandom > $C/$v.blk0; done
+# every variant carries the Zynq boot header (width word + XNLX at 0x20), as apps-frm-install checks
+for v in standard 495_396 950_600 1100_750; do head -c 65536 /dev/urandom > $C/$v.blk0
+	printf '\146\125\231\252\130\116\114\130' | dd of=$C/$v.blk0 bs=1 seek=32 conv=notrunc 2>/dev/null; done
 head -c 204800 /dev/urandom > $C/boot-rest.bin; echo "boot_len=$((65536 + 204800))" > $C/layout
 (cd $C && sha256sum *.blk0 boot-rest.bin > SHA256SUMS)
 ffs() { n=0; while [ $n -lt $2 ]; do cat $R/ff64k; n=$((n + 1)); done > "$1"; }
@@ -148,6 +150,19 @@ rc 0 "xo 39999331" $NC nonint do_xo_correction 39999331
 check "xo in env" [ "$(envv xo_correction)" = 39999331 ]
 check "xo ppm -16.725" [ "$($NC get xo_ppm)" = "-16.725" ]
 check "xo output shows both values" grep -q '39999331 Hz = -16.725 ppm' $T/out
+check "xo output: formula, sign convention, 438 Hz per ppm, keep [radio] ppm = 0" sh -c "grep -q 'ppm = (xo - 40000000) / 40000000 x 1e6' $T/out && grep -q 'slow crystal tunes the radio low' $T/out && grep -q '1 ppm = 438 Hz at 438 MHz' $T/out && grep -q 'Keep \[radio\] ppm = 0' $T/out"
+: > $R/argv.log
+rc 0 "xo the same value again: idempotent" $NC nonint do_xo_correction 39999331
+check "xo unchanged: no env write" sh -c "grep -q unchanged $T/out && ! grep -q '^fw_setenv' $R/argv.log"
+rc 1 "xo refused: +250.025 ppm (40010001)" $NC nonint do_xo_correction 40010001
+rc 0 "xo accepted: -250 ppm (39990000)" $NC nonint do_xo_correction 39990000
+printf '[station]\ncallsign = "X"\n[radio]\ntransmit = false\nppm = -16.73   # LO only\n' > $R/mnt/data/nexus2/nexus2.toml
+rc 0 "xo with a station still on [radio] ppm" $NC nonint do_xo_correction 39999331
+check "xo warns about [radio] ppm = -16.73" grep -q 'WARNING: .*\[radio\] ppm = -16.73' $T/out
+printf '[radio]\nppm = 0.0\n[x]\nppm = 5\n' > $R/mnt/data/nexus2/nexus2.toml
+rc 0 "xo with [radio] ppm = 0" $NC nonint do_xo_correction 39999400
+check "no warning for ppm = 0 (another table's ppm ignored)" sh -c "! grep -q WARNING $T/out"
+rm -f $R/mnt/data/nexus2/nexus2.toml
 rc 0 "xo --now" $NC nonint do_xo_correction 39999400 --now
 check "xo applied to the AD9361 sysfs" [ "$(cat $R/sys/bus/iio/devices/iio:device0/xo_correction)" = 39999400 ]
 rc 0 "xo default (unset)" $NC nonint do_xo_correction default
@@ -190,6 +205,46 @@ rc 1 "foreign boot image (not Tezuka): clock refused" $R/usr/sbin/nexus-clock ap
 check "foreign boot image untouched" [ "$(h $R/dev/mtd0)" = "$before" ]
 mkboot standard $R/dev/mtd0; cp $R/dev/mtd0 $R/dev/mtd4
 check "upper_bank_ok on a healthy sandbox" sh -c ". $R/usr/sbin/apps-flash-lib.sh; upper_bank_ok"
+# ---- a block 0 write that does not verify: the old block back, and not tried again at the next boot
+sed -i 's/^cpu_clock=.*/cpu_clock=950_600/' $R/env; before=$(h $R/dev/mtd0)
+# dd fake: the new 950_600 block lands corrupted on mtd0 (the write back of the old block works)
+cat > $B/dd <<F
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "if=$C/950_600.blk0" ] && exec busybox dd if=/dev/urandom of=$R/dev/mtd0 bs=65536 count=1 conv=notrunc 2>/dev/null; done
+exec busybox dd "\$@"
+F
+chmod 755 $B/dd; : > $R/argv.log
+rc 1 "nexus-clock apply: block 0 does not verify" $R/usr/sbin/nexus-clock apply
+rm -f $B/dd
+check "failed write: the previous block 0 written back, bootcopy restored" [ "$(h $R/dev/mtd0)" = "$before" -a "$(h $R/dev/mtd4)" = "$before" ]
+check "failed write: no reboot, CRITICAL logged" sh -c "! grep -q '^reboot' $R/argv.log && grep -q 'previous one was written back' $R/syslog"
+check "failure marker written" [ -f $R/mnt/data/nexus-clock.failed ]
+check "status: apply_failed" sh -c "$R/usr/sbin/nexus-clock status | jq -e '.apply_failed == true' > /dev/null"
+: > $R/argv.log
+rc 1 "next boot: the failed write is not tried again" $R/usr/sbin/nexus-clock apply
+check "not tried again: no erase, no write" sh -c "! grep -q '^flash_erase' $R/argv.log && ! grep -q '^flashcp' $R/argv.log"
+check "not tried again: boot flash unchanged" [ "$(h $R/dev/mtd0)" = "$before" ]
+rc 0 "nexus-config sets the clock again: the marker goes" $NC nonint do_cpu_clock 950_600
+check "marker removed by set" [ ! -f $R/mnt/data/nexus-clock.failed ]
+rc 0 "apply after the new setting" $R/usr/sbin/nexus-clock apply
+check "950_600 installed" [ "$(blk0 $R/dev/mtd0)" = "$(h $C/950_600.blk0)" ]
+# ---- apps-stock-clock.frm: the standard FSBL goes in and cpu_clock follows it (no overclock written back)
+printf 'cpu_clock=1100_750\ncpu_clock_cooling_confirmed=yes\n' >> $R/env; sed -i '/^cpu_clock=950_600$/d' $R/env
+mkboot 1100_750 $R/dev/mtd0; cp $R/dev/mtd0 $R/dev/mtd4; cp $R/dev/mtd5 $T/apps.save
+head -c 5000 /dev/urandom > $T/pl; cat $C/standard.blk0 $C/boot-rest.bin > $T/bb
+md() { md5sum < "$1" | cut -c1-32; }
+printf 'NEXUSBS-APPS-FRM 1\npayload_size=%s\npayload_md5=%s\nbootbin_size=%s\nbootbin_md5=%s\nbootbin_desc=test standard\nversion=apps-test-2\ncreated=x\n' \
+	$(wc -c < $T/pl) $(md $T/pl) $(wc -c < $T/bb) $(md $T/bb) > $T/hdr
+head -c $((4096 - $(wc -c < $T/hdr))) /dev/zero >> $T/hdr; cat $T/hdr $T/pl $T/bb > $T/body
+{ cat $T/body; printf '%s\n' "$(md $T/body)"; } > $T/apps-stock-clock.frm; mkdir -p $T/msd
+rc 0 "apps-frm-install apps-stock-clock.frm over a 1100_750 board" env MSD=$T/msd $R/usr/sbin/apps-frm-install $T/apps-stock-clock.frm
+check "apps-stock-clock: standard block 0, bootcopy equal" [ "$(blk0 $R/dev/mtd0)" = "$(h $C/standard.blk0)" -a "$(h $R/dev/mtd4)" = "$(h $R/dev/mtd0)" ]
+check "apps-stock-clock: slot written, markers" [ "$(head -c 18 $R/dev/mtd5)" = 'NEXUSBS-APPS-FRM 1' -a -f $T/msd/APPS_SUCCESS -a -f $T/msd/BOOT_UPDATE_SUCCESS ]
+check "apps-stock-clock: cpu_clock = standard in the env" [ "$(envv cpu_clock)" = standard ]
+: > $R/argv.log
+rc 0 "next boot: S22clock leaves the standard FSBL alone" $R/usr/sbin/nexus-clock apply
+check "no clock write after apps-stock-clock" sh -c "! grep -q '^flash_erase' $R/argv.log && ! grep -q '^reboot' $R/argv.log"
+cp $T/apps.save $R/dev/mtd5; mkboot standard $R/dev/mtd0; cp $R/dev/mtd0 $R/dev/mtd4
 sed -i '/^cpu_clock/d' $R/env
 
 # ================================================================ network
@@ -260,6 +315,10 @@ check "pending before the timer" grep -q 'priority=40' $R/etc/wpa_supplicant.con
 sleep 4
 check "rolled back: network.json and wpa_supplicant.conf restored" sh -c "jq -e '.wifi.networks[] | select(.ssid == \"NewNet\") | .priority == 30' $J > /dev/null && grep -q 'priority=30' $R/etc/wpa_supplicant.conf && [ ! -f $R/run/nexus-net/pending ]"
 check "rollback logged" grep -q 'rolled back' $R/syslog
+rc 1 "confirm after the automatic rollback: too late, says so" $NC nonint do_net_confirm
+check "confirm too late: message" grep -q 'already restored' $T/err
+rc 1 "roll back with nothing pending: refused (no stale snapshot)" $NC nonint do_net_rollback
+check "refused rollback left wpa_supplicant.conf alone" grep -q 'priority=30' $R/etc/wpa_supplicant.conf
 rc 3 "change, then rollback now" $NC nonint do_wifi_priority NewNet 45
 rc 0 "do_net_rollback" $NC nonint do_net_rollback
 check "rollback now restored priority 30" grep -q 'priority=30' $R/etc/wpa_supplicant.conf
@@ -273,6 +332,13 @@ check "network.json has no hostname" sh -c "! jq -e 'has(\"hostname\")' $J > /de
 rc 1 "nexus-net validate: bad schema" sh -c "echo '{\"schema\": 2}' > $T/bad.json && $R/usr/sbin/nexus-net validate $T/bad.json"
 
 # ================================================================ Bluetooth
+rm -rf $R/mnt/data/nexus2
+rc 0 "bluetooth off before the station exists" $NC nonint do_bluetooth off
+check "Player switch off even without a station directory" sh -c "jq -e '.bt_off == true' $R/mnt/data/nexus2/player.json > /dev/null"
+check "Player file 0600" [ "$(mode $R/mnt/data/nexus2/player.json)" = -rw------- ]
+rm -rf $R/mnt/data/nexus2
+rc 0 "S39bluetooth off at a first boot (no station directory)" $R/etc/init.d/S39bluetooth start
+check "S39bluetooth created the Player's file" sh -c "jq -e '.bt_off == true' $R/mnt/data/nexus2/player.json > /dev/null"
 echo '{"device": "AA:BB:CC:DD:EE:FF", "volume_db": -3, "bt_off": false}' > $R/mnt/data/nexus2/player.json
 rc 0 "bluetooth off without bluetoothd: no bluetoothctl call (it would block)" $NC nonint do_bluetooth off
 check "no bluetoothctl without bluetoothd" sh -c "! grep -q '^bluetoothctl' $R/argv.log && grep -q 'next boot' $T/out"
@@ -328,8 +394,17 @@ rc 0 "get station_login" $NC get station_login
 $NC nonint do_role slave > /dev/null
 rc 1 "station restart refused in the slave role" $NC nonint do_station_restart
 $NC nonint do_role master > /dev/null; : > $R/argv.log
+# the init script starts a long-lived child (like S97app's supervisor): it must not inherit the lock
+cat > $R/etc/init.d/S97app <<F
+#!/bin/sh
+echo "S97app \$*" >> "$R/argv.log"; echo "S97app \$*" >> "$R/argv.all"
+sleep 30 & echo \$! > $T/daemon.pid
+F
 rc 0 "station restart" $NC nonint do_station_restart
 check "S97app restart called" grep -qx 'S97app restart' $R/argv.log
+check "the lock is free while the started daemon runs" sh -c "kill -0 \$(cat $T/daemon.pid) && flock -n $R/run/nexus-config.lock true"
+kill $(cat $T/daemon.pid) 2>/dev/null
+printf '#!/bin/sh\necho "S97app $*" >> "$NEXUS_ROOT/argv.log"; echo "S97app $*" >> "$NEXUS_ROOT/argv.all"\n' > $R/etc/init.d/S97app
 printf 'line1\nline2\nline3\n' > $R/var/log/nexus.log
 rc 0 "station log tail" $NC nonint do_station_log 2
 check "log tail 2 lines" [ "$(cat $T/out)" = "$(printf 'line2\nline3')" ]
@@ -342,6 +417,10 @@ rc 0 "backup to a directory" $NC nonint do_backup /media/usb
 f=$(ls $R/media/usb/nexus-data-*.tar.gz)
 check "backup 0600 and holds network.json" sh -c "[ \"\$(ls -ln $f | cut -c1-10)\" = -rw------- ] && tar -tzf $f | grep -q 'network/network.json'"
 rc 1 "backup inside /mnt/data refused" $NC nonint do_backup /mnt/data/x.tar.gz
+rc 1 "backup to a relative path refused" $NC nonint do_backup x.tar.gz
+ln -s $R/mnt/data/network $R/media/into-data
+rc 1 "backup through a link into /mnt/data refused" $NC nonint do_backup /media/into-data
+check "nothing written into /mnt/data" sh -c "! ls $R/mnt/data/network | grep -q nexus-data"
 rc 0 "backup to stdout (pipe)" sh -c "$NC nonint do_backup - | gzip -t"
 rc 2 "factory reset without the token" $NC nonint do_factory_reset
 rc 2 "factory reset with a wrong token" $NC nonint do_factory_reset yes
@@ -377,7 +456,43 @@ if [ -n "${PB_DIR:-}" ] && [ -f "$PB_DIR/update.sh" ]; then
 	check "update.sh: 1100_750 without cooling keeps the previous clock" sh -c "grep -qx cpu_clock=950_600 $R/env"
 	check "update.sh: bluetooth off edited on the drive" sh -c "grep -qx bluetooth=off $R/env"
 	check "S40network writes the bluetooth key" grep -q 'bluetooth = \$BT_STATE' $PB_DIR/S40network
+	# 1100_750 set without the cooling confirmation installs standard; confirming it on the drive changes
+	# what S22clock installs: reboot
+	sed -i 's/^cpu_clock=.*/cpu_clock=1100_750/; s/^cpu_clock_cooling_confirmed=.*/cpu_clock_cooling_confirmed=no/' $R/env
+	sed 's/^cpu_clock = .*/cpu_clock = 1100_750\r/' /opt/config.drive > $T/drive && cp $T/drive /opt/config.drive
+	sed 's/^cpu_clock_cooling_confirmed = .*/cpu_clock_cooling_confirmed = yes\r/' /opt/config.drive > /mnt/msd/config.txt
+	( flash_indication_on() { :; }; flash_indication_off() { :; }; reset() { :; }; dfu() { :; }; do_reset=0; . $T/upd.sh; process_ini /mnt/msd/config.txt; echo "$do_reset" > $T/do_reset ) > /dev/null 2>&1
+	check "update.sh: confirming the cooling of 1100_750 reboots to apply it" sh -c "grep -qx cpu_clock_cooling_confirmed=yes $R/env && [ \"\$(cat $T/do_reset)\" = 1 ]"
+	sed 's/^bluetooth = .*/bluetooth = on\r/' /opt/config.drive > /mnt/msd/config.txt
+	( flash_indication_on() { :; }; flash_indication_off() { :; }; reset() { :; }; dfu() { :; }; do_reset=0; . $T/upd.sh; process_ini /mnt/msd/config.txt; echo "$do_reset" > $T/do_reset ) > /dev/null 2>&1
+	check "update.sh: an edit that leaves the installed clock alone does not reboot" [ "$(cat $T/do_reset)" = 0 ]
 else echo "skip update.sh tests (STOCK_BOARD_DIR not given)"; fi
+
+# ================================================================ S97app supervisor (container only: real /opt, /var/run)
+if [ -n "${NEXUS_TEST_CONTAINER:-}" ]; then
+	mkdir -p /opt/apps/nexus /mnt/data/nexus2 /var/run /var/log
+	printf '#!/bin/sh\necho "$$ $APPS_DIR $DATA_DIR $(pwd)" >> /tmp/start.calls\nexec sleep 1000\n' > /opt/apps/nexus/start.sh
+	chmod 755 /opt/apps/nexus/start.sh; rm -f /tmp/start.calls
+	sed -i '/^operating_mode=/d' $R/env; echo operating_mode=master >> $R/env
+	S97=$OVL/etc/init.d/S97app
+	( exec 9> $T/caller.lock; flock -n 9 && $S97 start > $T/s97.out 2>&1 )
+	sleep 1
+	check "S97app: start.sh runs with APPS_DIR/DATA_DIR in /mnt/data/nexus2" grep -q ' /opt/apps /mnt/data /mnt/data/nexus2$' /tmp/start.calls
+	check "S97app: the supervisor does not hold its caller's lock" flock -n $T/caller.lock true
+	rc 0 "S97app start again: idempotent" $S97 start
+	check "S97app: already running, not started twice" sh -c "grep -q 'already running' $T/out && [ \$(wc -l < /tmp/start.calls) = 1 ]"
+	child=$(cut -d' ' -f1 /tmp/start.calls); sup=$(cat /var/run/nexus.pid)
+	rc 0 "S97app stop" $S97 stop
+	check "S97app stop: supervisor and child gone (nothing orphaned)" sh -c "! kill -0 $child 2>/dev/null && ! kill -0 $sup 2>/dev/null"
+	kill $child 2>/dev/null
+	# the child exits by itself: started again after the fixed 15 s, not at once
+	printf '#!/bin/sh\necho "$$" >> /tmp/start.calls\nexit 3\n' > /opt/apps/nexus/start.sh; rm -f /tmp/start.calls
+	$S97 start > /dev/null; sleep 3
+	check "S97app: an exiting child is not restarted in a tight loop" [ "$(wc -l < /tmp/start.calls)" = 1 ]
+	$S97 stop > /dev/null
+	check "S97app: log records the exit" grep -q 'exit 3' /var/log/nexus.log
+	sed -i '/^operating_mode=/d' $R/env
+else echo "skip S97app supervisor tests (container only: NEXUS_TEST_CONTAINER)"; fi
 
 # ================================================================ secrets
 leak=0

@@ -10,11 +10,12 @@ start)
 	B=$(fw_printenv -n bluetooth 2>/dev/null); [ "$B" = off ] || B=on
 	if [ "$B" = off ]; then A=false; else A=true; fi
 	[ -f $MC ] && sed -i "s/^AutoEnable=.*/AutoEnable=$A/" $MC
-	if [ "$B" = off ] && [ -d $P/mnt/data/nexus2 ]; then
+	# the station directory may not exist yet (first boot, slave role): the Player must start off anyway
+	if [ "$B" = off ] && [ -d $P/mnt/data ] && mkdir -p -m 0700 $P/mnt/data/nexus2; then
 		if [ -s $PJ ] && jq -e 'type == "object"' $PJ > /dev/null 2>&1; then
 			jq '.bt_off = true' $PJ > $PJ.tmp && mv $PJ.tmp $PJ
 		else echo '{"bt_off": true}' > $PJ.tmp && mv $PJ.tmp $PJ; fi
-		chmod 600 $PJ
+		chmod 600 $PJ 2>/dev/null
 	fi
 	echo "Bluetooth: $B"; logger -t bluetooth "bluetooth $B (AutoEnable=$A)" ;;
 esac

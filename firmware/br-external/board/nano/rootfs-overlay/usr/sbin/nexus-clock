@@ -14,10 +14,12 @@
 # apply: the rest of the installed boot image must be Tezuka's (else refused); qspi-bootcopy gets the
 # new image first (read back), then block 0 of qspi-fsbl-uboot is erased and written (read back; on a
 # mismatch the saved block is written back at once); success = one reboot. A power cut during that
-# < 1 s write needs DFU/JTAG recovery.
+# < 1 s write needs DFU/JTAG recovery. A failed write is not tried again at the following boots
+# (/mnt/data/nexus-clock.failed) until the setting changes (set) or the marker is removed.
 . ${NEXUS_ROOT:-}/usr/sbin/apps-flash-lib.sh
 P=${NEXUS_ROOT:-}   # tests only: prefix of every file path
 C=$P/usr/share/nexus-clock; VARIANTS="standard 495_396 950_600 1100_750"
+FAILED=$P/mnt/data/nexus-clock.failed
 log() { logger -t nexus-clock "$*"; echo "nexus-clock: $*"; }
 valid() { for v in $VARIANTS; do [ "$1" = "$v" ] && return 0; done; return 1; }
 cooling() { [ "$(fw_printenv -n cpu_clock_cooling_confirmed 2>/dev/null)" = yes ] && echo yes || echo no; }
@@ -41,7 +43,8 @@ status)
 	# PS_CLK 33.333 MHz (Nano): PLL = FDIV x PS_CLK; CPU = ARM PLL / divisor; DDR clock = DDR PLL / DDR_3X divisor
 	echo "{\"configured\":\"$raw\",\"effective\":\"$(configured)\",\"installed\":\"$(installed)\",\"cooling_confirmed\":$( [ $(cooling) = yes ] && echo true || echo false),\
 \"arm_pll_mhz\":$((af * 33333 / 1000)),\"cpu_mhz\":$(( af * 33333 / 1000 / ad )),\
-\"ddr_pll_mhz\":$((df * 33333 / 1000)),\"ddr_mts\":$(( 2 * df * 33333 / 1000 / d3 ))}" ;;
+\"ddr_pll_mhz\":$((df * 33333 / 1000)),\"ddr_mts\":$(( 2 * df * 33333 / 1000 / d3 )),\
+\"apply_failed\":$( [ -f $FAILED ] && echo true || echo false)}" ;;
 set)
 	v=${2:?variant: $VARIANTS}; valid "$v" || { echo "unknown variant $v ($VARIANTS)" >&2; exit 2; }
 	if [ "$v" = 1100_750 ]; then
@@ -49,6 +52,7 @@ set)
 		fw_setenv cpu_clock_cooling_confirmed yes || exit 1
 	fi
 	fw_setenv cpu_clock "$v" || exit 1
+	rm -f $FAILED
 	log "cpu_clock = $v (applied at the next boot)" ;;
 apply)
 	[ -f $C/SHA256SUMS ] && (cd $C && sha256sum -c SHA256SUMS > /dev/null 2>&1) || { log "clock images missing or corrupt, nothing done"; exit 1; }
@@ -61,7 +65,11 @@ apply)
 	ZD=$(mtddev $Z); T=$P/tmp/nexus-clock.$$; mkdir -p $T
 	dd if=$ZD of=$T/cur bs=65536 count=16 2>/dev/null
 	head -c 65536 $T/cur > $T/old.blk0
-	[ "$(sum < $T/old.blk0)" = "$(sum < $C/$want.blk0)" ] && { rm -rf $T; exit 0; }
+	[ "$(sum < $T/old.blk0)" = "$(sum < $C/$want.blk0)" ] && { rm -rf $T $FAILED; exit 0; }
+	# one attempt per setting: a block that did not verify is not erased again at every boot
+	if [ "$(cat $FAILED 2>/dev/null)" = "$want $(sum < $T/old.blk0)" ]; then
+		log "the $want write failed before; not tried again (nexus-clock set, or remove $FAILED)"; rm -rf $T; exit 1
+	fi
 	. $C/layout
 	[ "$(dd if=$T/cur bs=65536 skip=1 2>/dev/null | head -c $((boot_len - 65536)) | sum)" = "$(sum < $C/boot-rest.bin)" ] || \
 		{ log "installed boot image is not Tezuka v0.3.24 (install boot.frm first), clock not changed"; rm -rf $T; exit 1; }
@@ -79,8 +87,9 @@ apply)
 		if [ "$(dd if=$ZD bs=65536 count=1 2>/dev/null | sum)" = "$(sum < $T/old.blk0)" ]; then
 			log "CRITICAL: the new FSBL block did not verify; the previous one was written back"
 		else log "CRITICAL: FSBL block 0 neither new nor old after the write: do not power off, restore boot.frm or use DFU"; fi
-		[ -n "$B" ] && flashcp $T/cur $BD; rm -rf $T; exit 1
+		[ -n "$B" ] && flashcp $T/cur $BD
+		[ -d $P/mnt/data ] && echo "$want $(sum < $T/old.blk0)" > $FAILED; rm -rf $T; exit 1
 	fi
 	rm -rf $T; sync; log "FSBL clock $want installed, rebooting once"; sleep 2; reboot ;;
-*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 2 ;;
 esac

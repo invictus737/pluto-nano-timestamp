@@ -114,12 +114,15 @@ u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master|slave) ;; *) operat
                      "\t\tcase \"$bluetooth\" in on|off) ;; *) bluetooth=$old_bt ;; esac\n"
                      "\t\techo \"bluetooth $bluetooth\" >> /opt/fw_set.tmp\n"
                      "\t\told_clock=`fw_printenv -n cpu_clock 2> /dev/null || echo standard`\n"
+                     "\t\told_cool=`fw_printenv -n cpu_clock_cooling_confirmed 2> /dev/null || echo no`\n"
                      "\t\tcase \"$cpu_clock\" in standard|495_396|950_600|1100_750) ;; *) cpu_clock=$old_clock ;; esac\n"
-                     "\t\tcase \"$cpu_clock_cooling_confirmed\" in yes|no) ;; *) cpu_clock_cooling_confirmed=`fw_printenv -n cpu_clock_cooling_confirmed 2> /dev/null || echo no` ;; esac\n"
+                     "\t\tcase \"$cpu_clock_cooling_confirmed\" in yes|no) ;; *) cpu_clock_cooling_confirmed=$old_cool ;; esac\n"
                      "\t\tif [ \"$cpu_clock\" = 1100_750 ] && [ \"$cpu_clock_cooling_confirmed\" != yes ]; then logger -t nexus-clock \"cpu_clock 1100_750 refused: cpu_clock_cooling_confirmed is not yes\"; cpu_clock=$old_clock; fi\n"
                      "\t\techo \"cpu_clock $cpu_clock\" >> /opt/fw_set.tmp\n"
                      "\t\techo \"cpu_clock_cooling_confirmed $cpu_clock_cooling_confirmed\" >> /opt/fw_set.tmp\n"
-                     "\t\t[ \"$cpu_clock\" != \"$old_clock\" ] && do_reset=1\n")
+                     # the variant S22clock installs (nexus-clock configured): 1100_750 needs the cooling confirmation
+                     "\t\tclock_eff() { case \"$1\" in standard|495_396|950_600) echo $1 ;; 1100_750) [ \"$2\" = yes ] && echo $1 || echo standard ;; *) echo standard ;; esac; }\n"
+                     "\t\t[ \"`clock_eff $cpu_clock $cpu_clock_cooling_confirmed`\" != \"`clock_eff $old_clock $old_cool`\" ] && do_reset=1\n")
 d = "\t\ttouch /mnt/msd/SUCCESS_ENV_UPDATE\n"
 assert u.count(d) == 1, "update.sh: SUCCESS_ENV_UPDATE not found"
 u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n"

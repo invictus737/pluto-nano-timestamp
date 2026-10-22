@@ -3,11 +3,26 @@
 # with NAME= (process name), RUN= (command line, run in /mnt/data/<name>) and CONF= (configuration
 # file that must exist). Applications built into the image under /opt/<name>/app.conf still work;
 # their configuration is taken from /mnt/data/<name>/, else /mnt/jffs2/<name>/.
-# Each starts only when its configuration exists, restarts after any exit (5 s), and logs to
+# Each starts only when its configuration exists, restarts after any exit (fixed 15 s), and logs to
 # /var/log/<name>.log (RAM). Only in the master role (nexus-role master); in the default slave role
 # the Pluto is an SDR for NexusBS on another computer and starts nothing.
 # The application slot's start.sh (S95apps) follows the same rule.
 if [ "$1" = restart ]; then "$0" stop; exec "$0" start; fi
+# supervise LOG CMD...: run CMD in the current directory, again 15 s after any exit, until TERM. The
+# supervisor holds none of its caller's descriptors (a caller's lock or terminal), and TERM stops the
+# running child too (the child is not found by name: start.sh may be waiting on a broken
+# configuration), so stop leaves nothing behind.
+supervise() {
+  L=$1; shift
+  trap 'kill $c 2>/dev/null; exit 0' TERM; c=
+  while :; do
+    [ -f "$L" ] && [ "$(wc -c < "$L")" -gt 2000000 ] && mv "$L" "$L.1"
+    echo "--- $(date) start" >> "$L"
+    "$@" >> "$L" 2>&1 < /dev/null & c=$!; wait $c
+    echo "--- $(date) exit $?" >> "$L"
+    sleep 15 & c=$!; wait $c
+  done
+}
 [ "$1" = start ] && [ "$(fw_printenv -n operating_mode 2>/dev/null || echo slave)" != master ] && \
   { echo "role slave: SDR for an external NexusBS host (nexus-role master to run it here)"; exit 0; }
 # The application slot (S95apps, apps.frm): /opt/apps/nexus/start.sh, run in /mnt/data/nexus2, restarted
@@ -23,12 +38,8 @@ if [ -x $NS ]; then
     if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "nexus (application slot) already running"; else
     mkdir -p /mnt/data/nexus2
     ( cd /mnt/data/nexus2 || exit 1
-      while :; do
-        [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 2000000 ] && mv "$LOG" "$LOG.1"
-        echo "--- $(date) start" >> "$LOG"
-        APPS_DIR=/opt/apps DATA_DIR=/mnt/data $NS >> "$LOG" 2>&1 < /dev/null
-        echo "--- $(date) exit $?" >> "$LOG"; sleep 5
-      done ) > /dev/null 2>&1 &
+      export APPS_DIR=/opt/apps DATA_DIR=/mnt/data
+      supervise "$LOG" $NS ) < /dev/null > /dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
     echo $! > "$PID"; echo "nexus (application slot) started (log $LOG)"; fi ;;
   stop)
     [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"
@@ -49,12 +60,7 @@ for A in /mnt/data/*/app.conf /opt/*/app.conf; do
     [ -f "$DIR/$CONF" ] || { echo "$NAME: no $DIR/$CONF, not started"; continue; }
     [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null && { echo "$NAME already running"; continue; }
     ( cd "$DIR" || exit 1
-      while :; do
-        [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 2000000 ] && mv "$LOG" "$LOG.1"
-        echo "--- $(date) start" >> "$LOG"
-        sh -c "$RUN" >> "$LOG" 2>&1 < /dev/null
-        echo "--- $(date) exit $?" >> "$LOG"; sleep 5
-      done ) > /dev/null 2>&1 &
+      supervise "$LOG" sh -c "$RUN" ) < /dev/null > /dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
     echo $! > "$PID"; echo "$NAME started (log $LOG)" ;;
   stop)
     [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"

@@ -68,7 +68,10 @@ the FIT length from the FIT header (`fdt header get ... totalsize`; boot.frm ove
 pluto.frm just set), keeps the stock reset-cause DFU/RAM boot (`device_reboot sf|ram`), releases the
 PS-PL level shifters/resets, and carries no network names or credentials. Writing boot.frm has no
 fallback: a power loss during those seconds needs DFU/JTAG recovery. Later updates use the same
-files (our update.sh keeps both handlers).
+files (our update.sh keeps both handlers). boot.frm also replaces the whole U-Boot environment, so
+every config.txt key (host name, Wi-Fi, xo_correction, role, CPU clock, ...) returns to the image
+default: once installed, update with pluto.frm (and apps.frm) alone. network.json and everything else
+on /mnt/data are kept.
 
 ## Application slot (apps.frm)
 
@@ -91,15 +94,19 @@ mirror); writes header + payload to qspi-apps (flashcp, then readback), and chec
 bank (U-Boot environment, FIT) did not change. Only then a carried boot.bin is written: only the
 64 KiB blocks that differ from the installed boot, qspi-bootcopy first, then qspi-fsbl-uboot from the
 last block to block 0, each read back. Variants: `apps.frm` (no FSBL) and `apps-stock-clock.frm` (the Tezuka standard-clock FSBL, a
-recovery path back from an overclock). The CPU/DDR clock is otherwise a setting (see "CPU/DDR
-clock" below), not a separate file.
+recovery path back from an overclock: the U-Boot env `cpu_clock` is set to the variant just written,
+`standard`, so S22clock does not put the overclock back at the next boot). The CPU/DDR clock is
+otherwise a setting (see "CPU/DDR clock" below), not a separate file.
 Exactly one `boot*.frm` and one `apps*.frm` may be on the drive. For the Tezuka FSBL variants only block 0 differs (36 bytes
 of ps7_init data; U-Boot is byte-identical), so U-Boot is not rewritten and the unsafe window is one
 64 KiB erase+program. /mnt/data is never touched.
 
 At boot `S95apps` verifies the slot (header, payload md5) and unpacks it to `/opt/apps`, runs
 `provision.sh`; `S97app` runs `start.sh` in `/mnt/data/nexus2` in the master role (a legacy
-`/mnt/data/nexus2/app.conf` is then not started). An invalid or missing slot leaves a standalone SDR.
+`/mnt/data/nexus2/app.conf` is then not started), again a fixed 15 s after any exit. The supervisor
+holds none of its caller's descriptors and `S97app stop` ends the running child with it (also a
+`start.sh` that waits on a configuration that does not start). An invalid or missing slot leaves a
+standalone SDR.
 Built on CI by `.github/workflows/apps.yml` (`firmware/build-apps-frm.sh`): inputs are the assets of a
 release in this repository (`nexus2`, `nexus-apps.tar.xz` = contrib/pluto/apps with `provision.sh` and
 `start.sh` at its top level, `svxlink-root.tar.xz` = `bin lib share var etc/svxlink` at its top level,
@@ -185,7 +192,7 @@ network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and bac
 | 1 System: Host name | `do_hostname NAME` | U-Boot `hostname` + `/etc/hostname` now, avahi restarted (`NAME.local`); DHCP leases carry it from their next renewal. network.json no longer holds a host name |
 | Station role | `do_role master\|slave` | `nexus-role` (USB composite rebuilt, NexusBS started/stopped) |
 | USB mode | `do_usb_mode peripheral\|auto\|host` | next boot; `host` = a computer on USB-C no longer sees the Pluto |
-| Crystal correction | `do_xo_correction HZ\|default [--now]` | the measured 40 MHz reference in Hz, 8 digits within 250 ppm (39990000-40010000); shown as Hz and ppm, ppm = (xo - 40e6) / 40e6 x 1e6 (39999331 = -16.725 ppm); next boot, `--now` also writes the AD9361 (restart NexusBS then) |
+| Crystal correction | `do_xo_correction HZ\|default [--now]` | the measured 40 MHz reference in Hz, 8 digits within +/-250 ppm (39990000-40010000); shown as Hz and ppm, ppm = (xo - 40e6) / 40e6 x 1e6 (39999331 = -16.725 ppm; slow crystal = tunes low = below 40000000); next boot, `--now` also writes the AD9363 (restart NexusBS then); same value again = no change; keep `[radio] ppm = 0` (see "Crystal correction") |
 | CPU/DDR clock | `do_cpu_clock VARIANT [--cooling-confirmed]` | `standard` (default, recommended), `495_396` and `950_600` (Tezuka files, not tested on the reference board), `1100_750` (tested on the reference board with heatsinks and a fan only; above the -1 speed grade spec; active cooling required: refused without `--cooling-confirmed`, the menu asks explicitly). The boot block is rewritten at the next restart: a power cut during that < 1 s write needs DFU/JTAG recovery. The menu offers the restart |
 | Reboot / Shut down | `do_reboot`, `do_shutdown` | |
 | 2 Network: Status | `get network` (JSON) | IP per interface, gateway, DNS, SSID, signal, pending change |
@@ -207,8 +214,8 @@ network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and bac
 | NexusBS log | `do_station_log [LINES]` | tail of `/var/log/nexus.log` |
 | 5 Update: Versions | `get versions` | firmware, application slot, U-Boot, FSBL clock variant, kernel |
 | How to update | | the USB drive `.frm` procedure (pluto.frm, boot.frm, apps*.frm, nexus-setup.txt) |
-| Backup /mnt/data | `do_backup PATH\|-` | tar.gz (0600; holds passwords and keys) to a file or directory (a stick under /media, or /tmp = RAM), or to stdout: `ssh root@pluto.local nexus-config nonint do_backup - > pluto-data.tar.gz`. Restore: `gunzip -c FILE \| tar -x -C /mnt/data` (busybox tar has no -z here) and reboot |
-| Factory reset | `do_factory_reset ERASE-ALL-DATA` | erases /mnt/data (network, NexusBS station, pairings, SSH host keys; the U-Boot env stays); the menu asks twice. Reboot afterwards |
+| Backup /mnt/data | `do_backup PATH\|-` | tar.gz (0600; holds passwords and keys) to an absolute file or directory path outside /mnt/data (links resolved; a stick under /media, or /tmp = RAM), or to stdout: `ssh root@pluto.local nexus-config nonint do_backup - > pluto-data.tar.gz`. Restore: `gunzip -c FILE \| tar -x -C /mnt/data` (busybox tar has no -z here) and reboot |
+| Factory reset | `do_factory_reset ERASE-ALL-DATA` | erases /mnt/data (network, NexusBS station, pairings, SSH host keys; the U-Boot env stays, so Wi-Fi/Ethernet fall back to the config.txt settings); the menu asks twice. Reboot afterwards |
 | 6 About / help | `help` | |
 
 `get` items: `hostname role usb_mode xo_correction xo_ppm cpu_clock clock bluetooth bt country wifi
@@ -223,7 +230,8 @@ once); `nonint` exits 3 and prints the rollback time, `nexus-config nonint do_ne
 change. The timer survives the SSH connection dropping. Over the serial console or the USB network no
 rollback is needed. `--rollback S` forces one, `--no-rollback` skips it, `--no-apply` only saves
 network.json (apply later with `do_net_apply`). While a change waits for confirmation every further
-network change is refused.
+network change is refused. `do_net_rollback` acts only on a change that waits for confirmation;
+`do_net_confirm` after the automatic rollback exits 1 and says the change was already rolled back.
 
 ### Examples
 
@@ -334,11 +342,57 @@ with the configured variant; identical = no flash write. Otherwise, provided the
 boot image is Tezuka's: the new 1 MiB boot image goes to qspi-bootcopy first (read back), block 0 of
 qspi-fsbl-uboot is erased and written (read back; on a mismatch the saved block is written back at once
 and CRITICAL is logged), and the Pluto reboots once. A power cut during that < 1 s write needs DFU/JTAG
-recovery. `nexus-clock status` (JSON: configured, effective (what apply installs), installed,
-cooling_confirmed, ARM/DDR PLL and the resulting CPU MHz / DDR MT/s from the SLCR registers),
-`nexus-clock set VARIANT [--cooling-confirmed]` (environment only). Changing cpu_clock in config.txt
-reboots once to apply it. apply also refuses while update.sh has the USB drive image mounted
+recovery. A write that failed (logged CRITICAL) is not tried again at the following boots: the marker
+`/mnt/data/nexus-clock.failed` holds the variant and the block it found, and apply skips that same
+combination until `nexus-clock set` (or `nexus-config`) sets the clock again or the marker is removed.
+`nexus-clock status` (JSON: configured, effective (what apply installs), installed,
+cooling_confirmed, ARM/DDR PLL and the resulting CPU MHz / DDR MT/s from the SLCR registers, apply_failed),
+`nexus-clock set VARIANT [--cooling-confirmed]` (environment only). A config.txt edit that changes the
+variant apply installs (cpu_clock, or the cooling confirmation of 1100_750) reboots once to apply it. apply also refuses while update.sh has the USB drive image mounted
 (`/mnt/msd`), and erases by the partition's real erase block size.
+
+## Crystal correction (xo_correction)
+
+The AD9363 derives the RX/TX local oscillators **and** the ADC/DAC sample clocks from one 40 MHz
+crystal, which on a Pluto-class board is off by several to a few tens of ppm. `xo_correction` (U-Boot
+env, config.txt `[SYSTEM]`) is the crystal's **measured** frequency in Hz; U-Boot hands it to the
+driver at boot, which then computes both the synthesizers and the sample clock from the true value.
+
+    ppm           = (xo_correction - 40000000) / 40000000 x 1e6
+    xo_correction = 40000000 x (1 + ppm / 1e6)
+    carrier error = f_rf x ppm / 1e6        (1 ppm = 438 Hz at 438 MHz, same sign as ppm)
+
+A crystal that runs slow makes the radio tune low and has `xo_correction` **below** 40000000 (the
+reference board: -16.73 ppm, -7.33 kHz at 438.3625 MHz, `xo_correction = 39999331`). Accepted range
++/-250 ppm (39990000-40010000).
+
+Why NexusBS's `[radio] ppm` is not enough on a Pluto: it only moves the LO request, the sample clock
+stays wrong by the same ppm and TETRA timing drifts against the terminals (reference board: voice cut
+after 4-11 s with LO-only ppm, clean 40 s+ calls with the crystal corrected). **Correct the crystal
+and keep `[radio] ppm = 0` in nexus2.toml**, also when the Pluto is the radio of a Pi (slave role).
+
+Set it (all write the same U-Boot key `xo_correction`; one value per physical board, measured after
+warm-up):
+
+| way | how | effective |
+|---|---|---|
+| nexus-config | System -> Crystal correction (Hz and ppm shown), or `nexus-config nonint do_xo_correction 39999331 [--now]` | next boot; `--now` / "apply now" also writes the AD9363 |
+| config.txt | `[SYSTEM] xo_correction = 39999331`, save, eject | next boot |
+| nexus-setup.txt | `XO_CORRECTION=39999331` | next power-up |
+| shell | `fw_setenv xo_correction 39999331` | next boot |
+
+`nexus-setup.txt` / `do_station_set XO_CORRECTION` go through `nexus2 provision`, which only checks
+the value and leaves it in `/mnt/data/nexus2/xo_correction.pending`; that path has one writer of the
+U-Boot key, `nexus-config do_xo_correction` (called by nexus-config itself, and by the application slot's
+provision.sh at boot), with the same range check, idempotent for an unchanged value. `default`
+removes it (40000000 nominal). nexus-config warns when the station's nexus2.toml has a non-zero
+`[radio] ppm`.
+
+Check it: `cat /sys/bus/iio/devices/iio:device*/xo_correction` (the value in use), the NexusBS log's
+LO readback line (e.g. `LO=438387498 Hz; expected PLL=438387500 Hz`: within a few Hz of the plan),
+and a new measurement of the carrier: the residual must be close to zero. Re-measure after changing
+cooling or the CPU clock, and every few months. Full guide (measurement methods, direction of the
+sign, symptoms): NexusBS `Docs/PLUTO-CRYSTAL-CORRECTION.md`.
 
 ## Network settings: network.json (nexus-net)
 
@@ -369,8 +423,9 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
                                      (the timer runs in its own session with SIGHUP ignored, so it
                                      survives the SSH connection it is meant to rescue); refused while
                                      an earlier apply waits for confirmation
-    nexus-net confirm                keep the applied settings
-    nexus-net revert                 return to the settings before the pending apply now
+    nexus-net confirm                keep the applied settings (exit 1 if already rolled back)
+    nexus-net revert                 return to the settings before the pending apply now (only while
+                                     one waits for confirmation)
     nexus-net plan                   print the interfaces an apply would restart (nothing changes)
 
 ## USB-C role, SSH host keys, Bluetooth
@@ -386,7 +441,8 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
   the USB role switch) is powered at once. config.txt `[SYSTEM] bluetooth = on|off` (U-Boot env
   `bluetooth`, default on; `nexus-config`): with off, `S39bluetooth` (before bluetoothd) sets
   `AutoEnable=false` in the RAM copy of main.conf and `bt_off` in the NexusBS Player's
-  `/mnt/data/nexus2/player.json`, so the controller stays powered off from boot on.
+  `/mnt/data/nexus2/player.json` (creating the station directory when it does not exist yet), so the
+  controller stays powered off from boot on.
 
 ## SSH, SCP, SFTP
 

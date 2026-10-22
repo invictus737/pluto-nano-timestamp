@@ -6,8 +6,10 @@
 #   nexus-net apply [--rollback S]    render + restart only the interfaces whose settings changed; with
 #                                     --rollback the previous state comes back after S seconds unless
 #                                     'nexus-net confirm' runs first
-#   nexus-net confirm                 keep the applied settings (ends a pending rollback)
-#   nexus-net revert                  return to the settings before the pending apply at once
+#   nexus-net confirm                 keep the applied settings (ends a pending rollback; exit 1 when
+#                                     the automatic rollback already restored the previous ones)
+#   nexus-net revert                  return to the settings before the pending apply at once (only
+#                                     while an apply waits for confirmation)
 #   nexus-net plan                    print the interfaces an apply would restart (nothing changes)
 #   nexus-net validate FILE           check FILE against the schema (exit 1 + "field.path: reason")
 #   nexus-net render-boot             (S40network) render and install without restarting anything
@@ -135,14 +137,15 @@ snapshot() { rm -rf $R/prev && mkdir -p $R/prev && cp $IFAC $R/prev/interfaces &
 	[ -f $WPA ] && cp $WPA $R/prev/wpa_supplicant.conf; [ -d $R/wifi ] && cp -r $R/wifi $R/prev/wifi
 	for f in dns eth0.conf eth0.dns; do [ -f $R/$f ] && cp $R/$f $R/prev/$f; done; return 0; }
 revert() {
-	[ -d $R/prev ] || die "nothing to roll back"
+	# only the snapshot of an unconfirmed apply: after a confirm it is older than the files in use
+	[ -f $R/pending ] && [ -d $R/prev ] || die "nothing to roll back: no network change waits for confirmation"
 	if [ -f "$APPLIED" ]; then cp "$APPLIED" "$J"; else rm -f "$J"; fi
 	mkdir -p $R/back/wifi; cp $R/prev/interfaces $R/back/; cp $R/prev/hostname $R/back/
 	[ -f $R/prev/wpa_supplicant.conf ] && cp $R/prev/wpa_supplicant.conf $R/back/
 	[ -d $R/prev/wifi ] && cp $R/prev/wifi/* $R/back/wifi/ 2>/dev/null
 	for f in dns eth0.conf eth0.dns; do [ -f $R/prev/$f ] && cp $R/prev/$f $R/back/$f; done
 	: >> $R/back/dns; [ -f $R/back/eth0.conf ] || echo MODE=dhcp > $R/back/eth0.conf
-	ch=$(install_rendered $R/back); rm -rf $R/back $R/pending
+	ch=$(install_rendered $R/back); rm -rf $R/back $R/pending; date +%s > $R/rolled-back
 	restart_if $ch; log "rolled back to the previous network settings"
 }
 
@@ -165,7 +168,7 @@ apply)
 	[ -f $R/pending ] && die "a previous apply waits for 'nexus-net confirm' (or its rollback); not applied"
 	m=$(validate "$J") || die "network.json rejected: $m"
 	render $R/new || die "render failed"
-	snapshot
+	snapshot; rm -f $R/rolled-back
 	ch=$(install_rendered $R/new); rm -rf $R/new; restart_if $ch
 	if [ -n "$RB" ]; then
 		t=$(date +%s); echo $t > $R/pending
@@ -176,7 +179,12 @@ apply)
 		echo "applied (changed:${ch:- none}); rolls back in $RB s unless 'nexus-net confirm'"
 	else cp "$J" "$APPLIED"; rm -f $R/pending; echo "applied (changed:${ch:- none})"; fi
 	log "applied, changed:${ch:- none}${RB:+, rollback in ${RB}s}" ;;
-confirm) [ -f $R/pending ] || { echo "nothing pending"; exit 0; }; rm -f $R/pending; cp "$J" "$APPLIED"; echo confirmed; log confirmed ;;
+confirm)
+	if [ ! -f $R/pending ]; then
+		[ -f $R/rolled-back ] && die "too late: the previous network settings were already restored (the change was rolled back); apply it again"
+		echo "nothing pending"; exit 0
+	fi
+	rm -f $R/pending; cp "$J" "$APPLIED"; echo confirmed; log confirmed ;;
 revert) revert ;;
 status)
 	ips() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | jq -R . | jq -sc .; }
@@ -193,5 +201,5 @@ status)
 		'{hostname: $h, interfaces: $i, gateway: ($gw | if . == "" then null else . end), dns: $dns,
 		  wifi: {ssid: ($ssid | if . == "" then null else . end), signal_dbm: ($sig | if . == "" then null else tonumber end)},
 		  source: $src, rollback_pending: ($pend == "true")}' ;;
-*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 2 ;;
 esac

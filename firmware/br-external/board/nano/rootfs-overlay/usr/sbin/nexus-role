@@ -23,5 +23,5 @@ status)
 	for p in ${NEXUS_ROOT:-}/var/run/*.pid; do n=$(basename $p .pid); [ -f /mnt/data/$n/app.conf ] || [ -f /opt/$n/app.conf ] || \
 		{ [ $n = nexus ] && [ -x /opt/apps/nexus/start.sh ]; } || continue
 		kill -0 "$(cat $p)" 2>/dev/null && echo "running: $n (log /var/log/$n.log)"; done ;;
-*) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 2 ;;
 esac
