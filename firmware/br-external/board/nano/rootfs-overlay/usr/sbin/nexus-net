@@ -1,0 +1,178 @@
+#!/bin/sh
+# Network settings from /mnt/data/network/network.json (written by the NexusBS dashboard), rendered into
+# /etc/network/interfaces (eth0/wlan0 stanzas), /etc/wpa_supplicant.conf, /etc/resolv.conf and the host
+# name. Secrets (PSKs) never reach stdout, stderr or the log.
+#   nexus-net status                  JSON: hostname, IPv4 per interface, gateway, DNS, SSID, signal, mode
+#   nexus-net apply [--rollback S]    render + restart only the interfaces whose settings changed; with
+#                                     --rollback the previous state comes back after S seconds unless
+#                                     'nexus-net confirm' runs first
+#   nexus-net confirm                 keep the applied settings (ends a pending rollback)
+#   nexus-net validate FILE           check FILE against the schema (exit 1 + "field.path: reason")
+#   nexus-net render-boot             (S40network) render and install without restarting anything
+# Per-network static IPv4 on Wi-Fi: every network gets id_str "netN"; wpa_cli -a nexus-net-wifi-event
+# runs on CONNECTED/DISCONNECTED and applies /run/nexus-net/wifi/netN.conf (DHCP or the static address).
+set -u
+J=${NEXUS_NET_JSON:-/mnt/data/network/network.json}; APPLIED=${J}.applied
+R=/run/nexus-net; IFAC=/etc/network/interfaces; WPA=/etc/wpa_supplicant.conf
+log() { logger -t nexus-net "$*"; }
+die() { echo "nexus-net: $*" >&2; log "$*"; exit 1; }
+
+validate() {
+	[ -r "$1" ] || { echo "file: not readable"; return 1; }
+	jq -e . "$1" > /dev/null 2>&1 || { echo "file: not valid JSON"; return 1; }
+	out=$(jq -r '
+	def ip4: type == "string" and test("^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$");
+	def cidr: type == "string" and (split("/") | length == 2 and (.[0] | ip4) and (.[1] | test("^([0-9]|[12][0-9]|3[0-2])$")));
+	def dnslist(p): if (type != "array") or (length > 3) or (all(.[]; ip4) | not) then "\(p): must be a list of up to 3 IPv4 addresses" else empty end;
+	def v4(p): if type != "object" then "\(p): must be an object"
+		elif .mode == "dhcp" then empty
+		elif .mode == "static" then
+			(if (.address | cidr) | not then "\(p).address: must be IPv4/prefix, e.g. 192.168.1.119/24" else empty end),
+			(if has("gateway") and ((.gateway | ip4) | not) then "\(p).gateway: must be an IPv4 address" else empty end),
+			(if has("dns") then (.dns | dnslist("\(p).dns")) else empty end)
+		else "\(p).mode: must be \"dhcp\" or \"static\"" end;
+	if type != "object" then "file: must be a JSON object" else
+	(if .schema != 1 then "schema: must be 1" else empty end),
+	(if has("hostname") and (((.hostname | type) != "string") or ((.hostname | test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")) | not)) then "hostname: letters, digits and -, 1-63 characters" else empty end),
+	(if has("dns") then (.dns | dnslist("dns")) else empty end),
+	(if has("wifi") then
+		(if (.wifi | type) != "object" or ((.wifi.networks | type) != "array") then "wifi.networks: must be a list"
+		else (.wifi.networks | to_entries[] | .key as $i | .value | "wifi.networks[\($i)]" as $p |
+			if type != "object" then "\($p): must be an object" else
+			(if ((.ssid | type) != "string") or ((.ssid | utf8bytelength) < 1) or ((.ssid | utf8bytelength) > 32) or (.ssid | explode | any(. < 32)) then "\($p).ssid: must be 1-32 bytes without control characters" else empty end),
+			(if (.psk // "") != "" and (((.psk | type) != "string") or (((.psk | test("^[ -~]{8,63}$")) or (.psk | test("^[0-9A-Fa-f]{64}$"))) | not)) then "\($p).psk: must be 8-63 printable ASCII characters or 64 hex digits" else empty end),
+			(if has("priority") and (((.priority | type) != "number") or (.priority < 0) or (.priority > 1000) or ((.priority | floor) != .priority)) then "\($p).priority: must be an integer 0-1000" else empty end),
+			(if has("ipv4") then (.ipv4 | v4("\($p).ipv4")) else empty end)
+			end) end)
+	else empty end),
+	(if has("ethernet") then (if (.ethernet | type) != "object" then "ethernet: must be an object" elif (.ethernet | has("ipv4")) then (.ethernet.ipv4 | v4("ethernet.ipv4")) else empty end) else empty end)
+	end' "$1" 2>/dev/null) || { echo "file: cannot be checked"; return 1; }
+	[ -z "$out" ] || { echo "$out" | head -1; return 1; }
+	return 0
+}
+
+mask() { p=$1; m=""; for i in 1 2 3 4; do if [ $p -ge 8 ]; then o=255; p=$((p-8)); else o=$((256 - (1 << (8 - p)))); [ $p -eq 0 ] && o=0; p=0; fi; m="$m${m:+.}$o"; done; echo $m; }
+country() { c=$(fw_printenv -n country_wlan 2>/dev/null); echo "$c" | grep -qx '[A-Z][A-Z]' || c=RO; echo $c; }
+
+# render into directory $1: interfaces, wpa_supplicant.conf, hostname, dns, wifi/netN.conf, eth0.conf
+render() {
+	D=$1; rm -rf "$D"; mkdir -p "$D/wifi"; chmod 700 "$D"
+	H=$(jq -r '.hostname // empty' "$J"); [ -n "$H" ] || H=$(cat /etc/hostname 2>/dev/null || echo plutosdr)
+	echo "$H" > "$D/hostname"
+	jq -r '(.dns // [])[]' "$J" > "$D/dns"
+	# interfaces: the S40network file without its eth0/wlan0 stanzas, plus ours
+	awk 'BEGIN{skip=0} /^(auto|allow-hotplug|iface) (eth0|wlan0)([ \t]|$)/ {skip=1; next} /^[^ \t]/ {skip=0} !skip' "$IFAC" > "$D/interfaces"
+	EM=$(jq -r '.ethernet.ipv4.mode // "dhcp"' "$J")
+	if [ "$EM" = static ]; then
+		A=$(jq -r '.ethernet.ipv4.address' "$J"); G=$(jq -r '.ethernet.ipv4.gateway // empty' "$J")
+		{ echo "auto eth0"; echo "iface eth0 inet static"; echo "	address ${A%/*}"; echo "	netmask $(mask ${A#*/})"
+		  [ -n "$G" ] && echo "	gateway $G"; echo; } >> "$D/interfaces"
+		jq -r '(.ethernet.ipv4.dns // [])[]' "$J" > "$D/eth0.dns"
+	else
+		{ echo "auto eth0"; echo "iface eth0 inet dhcp"; echo "	hostname $H"; echo "	udhcpc_opts -b"; echo; } >> "$D/interfaces"
+	fi
+	echo "MODE=$EM" > "$D/eth0.conf"
+	n=$(jq -r '(.wifi.networks // []) | length' "$J")
+	if [ "$n" -gt 0 ]; then
+		{ echo "auto wlan0"; echo "iface wlan0 inet manual"; echo "	wpa-conf $WPA"
+		  echo "	post-up /usr/sbin/nexus-net-wifi-event start wlan0"
+		  echo "	pre-down /usr/sbin/nexus-net-wifi-event stop wlan0"; echo; } >> "$D/interfaces"
+		{ echo "ctrl_interface=/run/wpa_supplicant"; echo "update_config=0"; echo "country=$(country)"; echo; } > "$D/wpa_supplicant.conf"
+		i=0; while [ $i -lt "$n" ]; do
+			ssid=$(jq -r ".wifi.networks[$i].ssid" "$J")
+			hex=$(printf '%s' "$ssid" | od -An -tx1 -v | tr -d ' \n')
+			[ -n "$hex" ] || { echo "nexus-net: wifi.networks[$i].ssid could not be encoded" >&2; return 1; }
+			pri=$(jq -r ".wifi.networks[$i].priority // 0" "$J")
+			{ echo "network={"; echo "	ssid=$hex"; echo "	scan_ssid=1"; echo "	priority=$pri"; echo "	id_str=\"net$i\""
+			  if [ "$(jq -r ".wifi.networks[$i].psk // \"\"" "$J" | wc -c)" -le 1 ]; then echo "	key_mgmt=NONE"
+			  elif jq -r ".wifi.networks[$i].psk" "$J" | grep -qx '[0-9A-Fa-f]\{64\}'; then echo "	psk=$(jq -r ".wifi.networks[$i].psk" "$J")"
+			  else jq -r ".wifi.networks[$i].psk" "$J" | wpa_passphrase "$ssid" 2>/dev/null | sed -n 's/^[[:space:]]*psk=\([0-9a-f]\{64\}\)$/	psk=\1/p'; fi
+			  echo "}"; } >> "$D/wpa_supplicant.conf"
+			M=$(jq -r ".wifi.networks[$i].ipv4.mode // \"dhcp\"" "$J")
+			{ echo "MODE=$M"
+			  if [ "$M" = static ]; then echo "ADDRESS=$(jq -r ".wifi.networks[$i].ipv4.address" "$J")"
+				echo "GATEWAY=$(jq -r ".wifi.networks[$i].ipv4.gateway // empty" "$J")"
+				echo "DNS=\"$(jq -r "(.wifi.networks[$i].ipv4.dns // []) | join(\" \")" "$J")\""; fi; } > "$D/wifi/net$i.conf"
+			i=$((i+1)); done
+		grep -c '^	psk=\|key_mgmt=NONE' "$D/wpa_supplicant.conf" | grep -qx "$n" || { echo "nexus-net: a Wi-Fi key could not be derived" >&2; return 1; }
+		chmod 600 "$D/wpa_supplicant.conf"
+	fi
+	return 0
+}
+stanza() { awk -v i="$2" 'BEGIN{p=0} /^(auto|iface) / {p=($2==i)} p' "$1" 2>/dev/null; }
+install_rendered() {   # install_rendered <dir>: copy into place; prints the interfaces that changed
+	D=$1; ch=""
+	[ "$(stanza "$D/interfaces" eth0; cat "$D/eth0.conf" "$D/eth0.dns" 2>/dev/null)" = "$(stanza $IFAC eth0; cat $R/eth0.conf $R/eth0.dns 2>/dev/null)" ] || ch="$ch eth0"
+	[ "$(stanza "$D/interfaces" wlan0; cat "$D/wpa_supplicant.conf" "$D"/wifi/* 2>/dev/null)" = "$(stanza $IFAC wlan0; cat $WPA $R/wifi/* 2>/dev/null)" ] || ch="$ch wlan0"
+	mkdir -p $R && cp "$D/interfaces" $IFAC
+	if [ -f "$D/wpa_supplicant.conf" ]; then cp "$D/wpa_supplicant.conf" $WPA; chmod 600 $WPA; else rm -f $WPA; fi
+	rm -rf $R/wifi && cp -r "$D/wifi" $R/wifi; cp "$D/dns" $R/dns; cp "$D/eth0.conf" $R/eth0.conf
+	if [ -f "$D/eth0.dns" ]; then cp "$D/eth0.dns" $R/eth0.dns; else rm -f $R/eth0.dns; fi
+	if [ "$(cat /etc/hostname 2>/dev/null)" != "$(cat "$D/hostname")" ]; then
+		cp "$D/hostname" /etc/hostname; hostname -F /etc/hostname
+		/etc/init.d/S50avahi-daemon stop > /dev/null 2>&1; /etc/init.d/S50avahi-daemon start > /dev/null 2>&1
+	fi
+	static_resolv
+	echo $ch
+}
+# resolv.conf for static interfaces / global DNS (DHCP leases write it through the udhcpc script, which
+# also honours the global list in /run/nexus-net/dns)
+static_resolv() {
+	s=$(cat $R/dns 2>/dev/null); [ -n "$s" ] || s=$(cat $R/eth0.dns 2>/dev/null)
+	[ -n "$s" ] || return 0
+	f=$(readlink -f /etc/resolv.conf); { for d in $s; do echo "nameserver $d"; done; } > "$f.$$" && mv "$f.$$" "$f"
+}
+restart_if() { for i in "$@"; do [ -e /sys/class/net/$i ] || continue; ifdown -f $i > /dev/null 2>&1; ifup $i > /dev/null 2>&1; log "$i restarted"; done; }
+snapshot() { rm -rf $R/prev && mkdir -p $R/prev && cp $IFAC $R/prev/interfaces && cp /etc/hostname $R/prev/hostname
+	[ -f $WPA ] && cp $WPA $R/prev/wpa_supplicant.conf; [ -d $R/wifi ] && cp -r $R/wifi $R/prev/wifi
+	for f in dns eth0.conf eth0.dns; do [ -f $R/$f ] && cp $R/$f $R/prev/$f; done; return 0; }
+revert() {
+	[ -d $R/prev ] || die "nothing to roll back"
+	if [ -f "$APPLIED" ]; then cp "$APPLIED" "$J"; else rm -f "$J"; fi
+	mkdir -p $R/back/wifi; cp $R/prev/interfaces $R/back/; cp $R/prev/hostname $R/back/
+	[ -f $R/prev/wpa_supplicant.conf ] && cp $R/prev/wpa_supplicant.conf $R/back/
+	[ -d $R/prev/wifi ] && cp $R/prev/wifi/* $R/back/wifi/ 2>/dev/null
+	for f in dns eth0.conf eth0.dns; do [ -f $R/prev/$f ] && cp $R/prev/$f $R/back/$f; done
+	: >> $R/back/dns; [ -f $R/back/eth0.conf ] || echo MODE=dhcp > $R/back/eth0.conf
+	ch=$(install_rendered $R/back); rm -rf $R/back $R/pending
+	restart_if $ch; log "rolled back to the previous network settings"
+}
+
+case "${1:-status}" in
+validate) validate "${2:?file}" ;;
+render-boot)
+	[ -f "$J" ] || exit 0
+	if ! m=$(validate "$J"); then log "network.json ignored: $m"; exit 0; fi
+	render $R/new && install_rendered $R/new > /dev/null && cp "$J" "$APPLIED" && log "settings from network.json"; rm -rf $R/new ;;
+apply)
+	RB=; [ "${2:-}" = --rollback ] && RB=${3:?seconds}
+	[ -f "$J" ] || die "no $J"
+	m=$(validate "$J") || die "network.json rejected: $m"
+	render $R/new || die "render failed"
+	snapshot
+	ch=$(install_rendered $R/new); rm -rf $R/new; restart_if $ch
+	if [ -n "$RB" ]; then
+		t=$(date +%s); echo $t > $R/pending
+		( sleep "$RB"; [ "$(cat $R/pending 2>/dev/null)" = "$t" ] && "$0" revert ) > /dev/null 2>&1 < /dev/null &
+		echo "applied (changed:${ch:- none}); rolls back in $RB s unless 'nexus-net confirm'"
+	else cp "$J" "$APPLIED"; rm -f $R/pending; echo "applied (changed:${ch:- none})"; fi
+	log "applied, changed:${ch:- none}${RB:+, rollback in ${RB}s}" ;;
+confirm) [ -f $R/pending ] || { echo "nothing pending"; exit 0; }; rm -f $R/pending; cp "$J" "$APPLIED"; echo confirmed; log confirmed ;;
+revert) revert ;;
+status)
+	ips() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | jq -R . | jq -sc .; }
+	ifs=$(for i in wlan0 eth0 $(ls /sys/class/net 2>/dev/null | grep '^usb'); do [ -e /sys/class/net/$i ] || continue
+		m=dhcp; case $i in (eth0) [ -f $R/eth0.conf ] && . $R/eth0.conf && m=$MODE ;;
+		(wlan0) id=$(wpa_cli -p /run/wpa_supplicant -i wlan0 status 2>/dev/null | sed -n 's/^id_str=//p'); [ -n "$id" ] && [ -f $R/wifi/$id.conf ] && m=$(sed -n 's/^MODE=//p' $R/wifi/$id.conf) ;;
+		(usb*) m=$(awk -v i=$i '$1=="iface" && $2==i {print $4}' $IFAC) ;; esac
+		jq -nc --arg n $i --argjson a "$(ips $i)" --arg m "$m" '{($n): {ipv4: $a, mode: $m}}'; done | jq -sc 'add // {}')
+	ssid=$(wpa_cli -p /run/wpa_supplicant -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')
+	sig=$(iw dev wlan0 link 2>/dev/null | sed -n 's/^[[:space:]]*signal: \(-*[0-9]*\) dBm.*/\1/p')
+	jq -n --arg h "$(hostname)" --argjson i "$ifs" --arg gw "$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')" \
+		--argjson dns "$(sed -n 's/^nameserver[[:space:]]*\([^[:space:]#]*\).*/\1/p' /etc/resolv.conf 2>/dev/null | jq -R . | jq -sc .)" \
+		--arg ssid "$ssid" --arg sig "$sig" --arg src "$([ -f "$APPLIED" ] && echo network.json || echo config.txt)" --arg pend "$([ -f $R/pending ] && echo true || echo false)" \
+		'{hostname: $h, interfaces: $i, gateway: ($gw | if . == "" then null else . end), dns: $dns,
+		  wifi: {ssid: ($ssid | if . == "" then null else . end), signal_dbm: ($sig | if . == "" then null else tonumber end)},
+		  source: $src, rollback_pending: ($pend == "true")}' ;;
+*) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

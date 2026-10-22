@@ -65,6 +65,8 @@ case "$1" in
 		tmpfile="$realconf-$$"
 		> "$tmpfile"
 		[ -n "$domain" ] && echo "search $domain" >> "$tmpfile"
+		# nexus-net: a global DNS list from network.json replaces the servers of the lease
+		[ -s /run/nexus-net/dns ] && dns=$(cat /run/nexus-net/dns)
 		for i in $dns ; do
 			echo " Adding DNS server $i"
 			echo "nameserver $i" >> "$tmpfile"

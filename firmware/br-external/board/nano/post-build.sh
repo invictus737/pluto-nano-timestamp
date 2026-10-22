@@ -52,6 +52,9 @@ rep('\t\techo -e "iface eth0 inet dhcp\\n" >> $IFAC\n',
 rep('\t\t\techo -e "iface wlan0 inet dhcp" >> $IFAC\n',
     '\t\t\techo -e "iface wlan0 inet dhcp\\n\\thostname $HOSTNAME\\n\\tudhcpc_opts -b" >> $IFAC\n')
 # country before any interface comes up; resolv.conf (a link into /tmp) exists for avahi/udhcpc
+# network.json (nexus-net, /mnt/data/network) wins over the config.txt/U-Boot Wi-Fi settings when present
+rep("\t/sbin/ifup -a 2>&1 | logger\n",
+    "\t[ -x /usr/sbin/nexus-net ] && /usr/sbin/nexus-net render-boot\n\t/sbin/ifup -a 2>&1 | logger\n")
 rep("\t/bin/hostname -F /etc/hostname\n",
     "\t/bin/hostname -F /etc/hostname\n"
     "\tiw reg set \"$WLAN_COUNTRY\" 2>&1 | logger -t network\n"
@@ -64,6 +67,15 @@ assert s.count(b) == 1, "S40network: usb_ethernet_mode line not found"
 s = s.replace(b, b + "\techo \"# NexusBS station role [slave|master]: slave = SDR for NexusBS on another computer,\"$'\\r' >> $CONF\n"
                      "\techo \"# master = NexusBS runs on this Pluto\"$'\\r' >> $CONF\n"
                      "\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n")
+# config.txt [SYSTEM] usb_mode (S96usbrole): peripheral (default) | auto | host
+rep("\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n",
+    "\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n"
+    "\tUSB_MODE=`fw_printenv -n usb_mode 2> /dev/null || echo peripheral`\n")
+rep("\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n",
+    "\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n"
+    "\techo \"# USB-C role [peripheral|auto|host]: peripheral = a computer is the host (default), host = hub with a\"$'\\r' >> $CONF\n"
+    "\techo \"# Wi-Fi/Ethernet adapter, auto = host when no computer configures the port (applied at the next boot)\"$'\\r' >> $CONF\n"
+    "\techo \"usb_mode = $USB_MODE\"$'\\r' >> $CONF\n")
 open(net, "w").write(s)
 u = open(upd).read()
 w = "\t\techo \"pwd_wlan $pwd_wlan\" >> /opt/fw_set.tmp\n"
@@ -72,7 +84,9 @@ u = u.replace(w, w + "\t\techo \"country_wlan $country_wlan\" >> /opt/fw_set.tmp
 c = "\t\techo \"netmask_eth $netmask_eth\" >> /opt/fw_set.tmp\n"
 assert u.count(c) == 1, "update.sh: netmask_eth line not found"
 u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master) ;; *) operating_mode=slave ;; esac\n"
-                     "\t\techo \"operating_mode $operating_mode\" >> /opt/fw_set.tmp\n")
+                     "\t\techo \"operating_mode $operating_mode\" >> /opt/fw_set.tmp\n"
+                     "\t\tcase \"$usb_mode\" in auto|host) ;; *) usb_mode=peripheral ;; esac\n"
+                     "\t\techo \"usb_mode $usb_mode\" >> /opt/fw_set.tmp\n")
 d = "\t\ttouch /mnt/msd/SUCCESS_ENV_UPDATE\n"
 assert u.count(d) == 1, "update.sh: SUCCESS_ENV_UPDATE not found"
 u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n")
@@ -139,6 +153,8 @@ open(p, "w").write(s)
 PY
 # mount point of the persistent data partition (S21data)
 mkdir -p "$T/mnt/data"
+# SSH host keys persist on the data partition: generated once (dropbear -R) and kept across reboots
+rm -rf "$T/etc/dropbear" && ln -s /mnt/data/dropbear "$T/etc/dropbear"
 # Bluetooth pairings (bluetoothd) persist on the data partition, as with the former BT add-on
 rm -rf "$T/var/lib/bluetooth" && ln -s /mnt/data/bt/lib "$T/var/lib/bluetooth"
 # btop refuses to start without a UTF-8 locale; musl has C.UTF-8 built in, the shell just never sets it

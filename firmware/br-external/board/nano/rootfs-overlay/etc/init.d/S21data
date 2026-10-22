@@ -52,10 +52,11 @@ start() {
 }
 case "$1" in
 format) umount $MNT 2>/dev/null; ubidetach -d 0 2>/dev/null; FORCE_FORMAT=1; D=$(mtd qspi-data)
-	[ -n "$D" ] && ubiformat /dev/mtd$D -y -q && say "qspi-data erased"; start; mkdir -p -m 0700 $MNT/bt/lib ;;
+	[ -n "$D" ] && ubiformat /dev/mtd$D -y -q && say "qspi-data erased"; start; mkdir -p -m 0700 $MNT/bt/lib $MNT/dropbear $MNT/network ;;
 start) start
 	# Bluetooth pairing store (/var/lib/bluetooth links here): persistent when the partition is mounted
-	mkdir -p -m 0700 $MNT/bt/lib ;;
+	# also the persistent SSH host keys (/etc/dropbear links here) and network.json (nexus-net)
+	mkdir -p -m 0700 $MNT/bt/lib $MNT/dropbear $MNT/network ;;
 stop) umount $MNT 2>/dev/null; ubidetach -d 0 2>/dev/null; true ;;
 esac
 exit 0

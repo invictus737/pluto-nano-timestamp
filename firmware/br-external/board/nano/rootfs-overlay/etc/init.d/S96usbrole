@@ -28,6 +28,7 @@ case "$1" in
 start)
   [ -n "$ROLE" ] || exit 0
   M=$(fw_printenv -n usb_mode 2>/dev/null || echo peripheral)
+  echo "USB role mode: $M (config.txt [SYSTEM] usb_mode = peripheral|auto|host)"; logger -t usbrole "usb_mode $M"
   case "$M" in
   host) set_role host ;;
   auto) (loop) > /dev/null 2>&1 & echo $! > /var/run/usbrole.pid ;;

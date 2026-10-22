@@ -204,6 +204,46 @@ peer refuses handshakes stamped 1970 as replays) and a default route exists. IPv
 AllowedIPs routes are handled (0.0.0.0/0 as two /1 routes, endpoint kept on the old gateway);
 DNS/PostUp and the like are ignored. `fw_setenv wireguard 0` disables it.
 
+## Network settings: network.json (nexus-net)
+
+`/mnt/data/network/network.json` (0600, written by the NexusBS dashboard) overrides the config.txt /
+U-Boot Wi-Fi and Ethernet settings when it exists (S40network runs `nexus-net render-boot` before
+`ifup -a`; an invalid file is ignored and logged). Without it the stock config.txt behaviour stays.
+
+    {"schema": 1, "hostname": "plutosdr", "dns": ["1.1.1.1"],
+     "wifi": {"networks": [{"ssid": "...", "psk": "...", "priority": 10, "ipv4": {"mode": "dhcp"}},
+                           {"ssid": "...", "psk": "...", "priority": 5,
+                            "ipv4": {"mode": "static", "address": "192.168.1.119/24",
+                                     "gateway": "192.168.1.1", "dns": ["192.168.1.1"]}}]},
+     "ethernet": {"ipv4": {"mode": "dhcp"}}}
+
+`hostname`, `dns` (global list, replaces DHCP DNS), `wifi`, `ethernet` and `psk` (8-63 characters or
+64 hex digits; absent/empty = open network) are optional. Every network goes into
+`/etc/wpa_supplicant.conf` (0600) with its priority (highest = preferred), the SSID hex-encoded, the
+PSK as the derived 256-bit key (`wpa_passphrase`, the passphrase is never written), `id_str "netN"`
+and the country of config.txt `country_wlan` (default RO). wlan0 is `inet manual`: `wpa_cli -a
+/usr/sbin/nexus-net-wifi-event` applies `/run/nexus-net/wifi/netN.conf` on CONNECTED (udhcpc with the
+host name, or the static address, default route and DNS) and drops it on DISCONNECTED, so each SSID
+keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a normal ifupdown stanza.
+
+    nexus-net status                 JSON: hostname, IPv4 and mode per interface, gateway, DNS, SSID, signal
+    nexus-net validate FILE          exit 1 with "field.path: reason" (values are never printed)
+    nexus-net apply [--rollback S]   render, restart only eth0/wlan0 if their settings changed; with
+                                     --rollback the previous files (and network.json) return after S s
+    nexus-net confirm                keep the applied settings
+
+## USB-C role, SSH host keys, Bluetooth
+
+- config.txt `[SYSTEM] usb_mode = peripheral|auto|host` (U-Boot env `usb_mode`, default peripheral)
+  is written into config.txt at boot, read back on eject like `operating_mode`, and takes effect at
+  the next boot; S96usbrole prints the mode at boot. A Wi-Fi stick directly on the Pluto needs `auto`
+  (or `host`).
+- SSH host keys: `/etc/dropbear` links to `/mnt/data/dropbear`; dropbear generates the keys once
+  (`-R`) and they survive reboots and firmware updates (stock keys saved with device_persistent_keys
+  in /mnt/jffs2 are still restored by S21misc).
+- `/etc/bluetooth/main.conf`: `[Policy] AutoEnable=true`, so an adapter that enumerates late (after
+  the USB role switch) is powered at once.
+
 ## SSH, SCP, SFTP
 
 Dropbear (`dropbearmulti`: server, client, `scp`) and the Green End SFTP server as
