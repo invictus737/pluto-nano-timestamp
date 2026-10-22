@@ -15,10 +15,27 @@ start() {
 	[ -n "$D" ] && [ -n "$L" ] || { say "no qspi-data partition"; return 0; }
 	if dmesg | grep -q "failed to read ear reg"; then say "flash bank register unreadable, upper bank not used"; return 0; fi
 	# lower-bank mirror of qspi-data (0x1A00000 - 16 MiB = 0xA00000) is qspi-linux block 128
-	FF=77bf78858def32720f676f33cdca75c5  # md5 of an erased 64 KiB block: erased flash on both sides proves nothing
+	FF=ecb99e6ffea7be1e5419350f725da86b  # md5 of an erased 64 KiB block (65536 x 0xFF): erased flash on both sides proves nothing
 	if [ "$(first64k $D)" = "$(first64k $L 128)" ] && [ "$(first64k $L 128)" != $FF ] && [ "$(first64k $D 1)" = "$(first64k $L 129)" ]; then say "qspi-data reads the lower bank (aliased), not used"; return 0; fi
-	[ -n "$B" ] && [ -n "$F" ] && [ "$(first64k $B)" != "$(first64k $F)" ] && \
-		say "WARNING: qspi-bootcopy differs from qspi-fsbl-uboot (a reset with EAR=1 would not boot)"
+	# qspi-bootcopy (0x1000000) is what a reset with EAR=1 boots: keep it equal to the boot loader.
+	# Only reached when the upper bank is proven addressable (checks above); the copy is read back.
+	if [ -n "$B" ] && [ -n "$F" ] && [ "$(md5sum < /dev/mtd$B)" != "$(md5sum < /dev/mtd$F)" ]; then
+		dd if=/dev/mtd$F of=/tmp/bootcopy.$$ 2>/dev/null && flash_unlock /dev/mtd$B > /dev/null 2>&1
+		if flashcp /tmp/bootcopy.$$ /dev/mtd$B && [ "$(md5sum < /dev/mtd$B)" = "$(md5sum < /tmp/bootcopy.$$)" ]; then
+			say "qspi-bootcopy synced from qspi-fsbl-uboot"
+		else
+			say "WARNING: qspi-bootcopy differs from qspi-fsbl-uboot and could not be synced (a reset with EAR=1 would not boot)"
+		fi
+		rm -f /tmp/bootcopy.$$
+	fi
+	# /mnt/jffs2 (qspi-nvmfs): some factory images (HamGeek Nano) ship it unformatted, so it never
+	# mounts; give it an empty JFFS2 once, like the stock `device_format_jffs2`.
+	N=$(mtd qspi-nvmfs)
+	if [ -n "$N" ] && ! grep -q " /mnt/jffs2 " /proc/mounts; then
+		if ! mount -t jffs2 mtd$N /mnt/jffs2 2>/dev/null; then
+			flash_erase -j -q /dev/mtd$N 0 0 && mount -t jffs2 mtd$N /mnt/jffs2 && say "qspi-nvmfs was not JFFS2: formatted, /mnt/jffs2 mounted"
+		fi
+	fi
 	if ! ubiattach -m "$D" -d 0 > /dev/null 2>&1; then
 		# UBI erase-counter headers ("UBI#") that do not attach here belong to another partition
 		# layout (before v0.39-std the data partition started at 0x1100000): never wipe them silently

@@ -124,6 +124,17 @@ rep("\tmkdir -p /dev/sdr_gadget_ffs\n\tmount sdr_gadget_ffs -t functionfs /dev/s
 rep("\tif [ \"$SDR_USB_GADGET_DEBUG\" == \"1\" ]\n", "\tif [ $SDRG = 0 ]\n\tthen\n\t\t:\n\telif [ \"$SDR_USB_GADGET_DEBUG\" == \"1\" ]\n")
 rep("\trm $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n", "\trm -f $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n")
 rep("\trmdir $GADGET/functions/ffs.sdr_gadget_ffs\n", "\trmdir $GADGET/functions/ffs.sdr_gadget_ffs 2> /dev/null\n")
+# master role: no iiod either (NexusBS owns the radio; iiod next to it would share the AD9361), so the
+# IIO FunctionFS function leaves the composite with it (a FunctionFS function without its daemon blocks the bind)
+rep("\tmkdir -p $GADGET/functions/ffs.iio_ffs\n", "\t[ $SDRG = 1 ] && mkdir -p $GADGET/functions/ffs.iio_ffs\n")
+rep("\tln -s $GADGET/functions/ffs.iio_ffs $GADGET/configs/c.1/ffs.iio_ffs\n",
+    "\t[ $SDRG = 1 ] && ln -s $GADGET/functions/ffs.iio_ffs $GADGET/configs/c.1/ffs.iio_ffs\n")
+rep("\tmkdir -p /dev/iio_ffs\n\tmount iio_ffs -t functionfs /dev/iio_ffs 2> /dev/null\n",
+    "\t[ $SDRG = 1 ] && mkdir -p /dev/iio_ffs && mount iio_ffs -t functionfs /dev/iio_ffs 2> /dev/null\n")
+rep("\tstart-stop-daemon -S -b -q -m -p /var/run/iiod.pid -x  /usr/sbin/iiod  -- $IIOD_OPTS\n",
+    "\t[ $SDRG = 1 ] && start-stop-daemon -S -b -q -m -p /var/run/iiod.pid -x  /usr/sbin/iiod  -- $IIOD_OPTS\n")
+rep("\trm $GADGET/configs/c.1/ffs.iio_ffs\n", "\trm -f $GADGET/configs/c.1/ffs.iio_ffs\n")
+rep("\trmdir $GADGET/functions/ffs.iio_ffs\n", "\trmdir $GADGET/functions/ffs.iio_ffs 2> /dev/null\n")
 open(p, "w").write(s)
 PY
 # mount point of the persistent data partition (S21data)
