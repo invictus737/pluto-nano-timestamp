@@ -90,10 +90,12 @@ when the upper bank is not addressable (EAR unreadable, or the slot reads like i
 mirror); writes header + payload to qspi-apps (flashcp, then readback), and checks that the lower
 bank (U-Boot environment, FIT) did not change. Only then a carried boot.bin is written: only the
 64 KiB blocks that differ from the installed boot, qspi-bootcopy first, then qspi-fsbl-uboot from the
-last block to block 0, each read back. Variants: `apps.frm` (no FSBL), `apps-stock-clock.frm` (standard clocks), `apps-cpu1100-ddr750.frm`
-(CPU 1100 MHz / DDR 750 MT/s: tested on the reference board only (HamGeek Pluto Nano Rev.B) WITH
-HEATSINKS AND A FAN INSTALLED, ran for days; not a Tezuka-published test result; above the -1 speed
-grade spec — do not use without active cooling); likewise `boot.frm` / `boot-cpu1100-ddr750.frm`.
+last block to block 0, each read back. Variants (Tezuka v0.3.24 Nano files, sha256-pinned in `tezuka-boot.sh`): `apps.frm` (no FSBL),
+`apps-stock-clock.frm` (standard clocks, Tezuka default), `apps-cpu495-ddr396.frm` and
+`apps-cpu950-ddr600.frm` (Tezuka files, not tested on the reference board), `apps-cpu1100-ddr750.frm`
+(tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed, ran for
+days; above the -1 speed grade spec, active cooling required); likewise `boot.frm`, `boot-cpu495-ddr396.frm`,
+`boot-cpu950-ddr600.frm`, `boot-cpu1100-ddr750.frm`.
 Exactly one `boot*.frm` and one `apps*.frm` may be on the drive. For the Tezuka CPU1100_DDR750 FSBL only block 0 differs (36
 bytes of ps7_init data; U-Boot is byte-identical), so U-Boot is not rewritten and the unsafe window is
 one 64 KiB erase+program. /mnt/data is never touched.

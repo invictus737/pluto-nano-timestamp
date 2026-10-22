@@ -3,7 +3,9 @@
 # + 128 KiB U-Boot environment + the Pluto mtd-info block + md5, the layout plutosdr-fw builds.
 # boot.bin: Tezuka v0.3.24 Nano images (tezuka-boot.sh), environment: uboot/uboot-env-nexus.txt.
 #   boot.frm                 standard clocks
-#   boot-cpu1100-ddr750.frm  FSBL with CPU 1100 MHz / DDR 750 MT/s: tested on the reference board only (HamGeek Pluto Nano Rev.B) WITH HEATSINKS AND A FAN INSTALLED, ran for days; not a Tezuka-published test result; above the -1 speed grade spec — do not use without active cooling
+#   boot-cpu495-ddr396.frm   Tezuka FSBL CPU 495 MHz / DDR 396 MT/s
+#   boot-cpu950-ddr600.frm   Tezuka FSBL CPU 950 MHz / DDR 600 MT/s
+#   boot-cpu1100-ddr750.frm  Tezuka FSBL CPU 1100 MHz / DDR 750 MT/s   (labels: tezuka_label)
 # All share U-Boot and environment; the build checks they differ from boot.frm only in FSBL bytes of
 # the first 64 KiB block. The STOCK update.sh only looks for the name boot.frm.
 # usage: build-boot-frm.sh <plutosdr-fw checkout or -> <output dir>
@@ -31,7 +33,7 @@ done
 python3 -I - "$OUT" <<'PY'
 import sys, os
 d = sys.argv[1]; ref = open(os.path.join(d, 'boot.frm'), 'rb').read()
-for n in ('boot-cpu1100-ddr750.frm',):
+for n in ('boot-cpu495-ddr396.frm', 'boot-cpu950-ddr600.frm', 'boot-cpu1100-ddr750.frm'):
     b = open(os.path.join(d, n), 'rb').read()
     assert len(b) == len(ref), n
     diff = [i for i in range(len(ref) - 33) if ref[i] != b[i]]

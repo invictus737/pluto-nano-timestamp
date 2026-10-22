@@ -4,7 +4,9 @@
 # usage: build-apps-frm.sh <inputs dir> <output dir>
 # Outputs (same payload, only the carried boot.bin differs):
 #   apps.frm                  no boot.bin: the installed FSBL/clock stays
-#   apps-cpu1100-ddr750.frm   + Tezuka FSBL CPU 1100 MHz / DDR 750 MT/s: tested on the reference board only (HamGeek Pluto Nano Rev.B) WITH HEATSINKS AND A FAN INSTALLED, ran for days; not a Tezuka-published test result; above the -1 speed grade spec — do not use without active cooling
+#   apps-cpu495-ddr396.frm    + Tezuka FSBL CPU 495 MHz / DDR 396 MT/s
+#   apps-cpu950-ddr600.frm    + Tezuka FSBL CPU 950 MHz / DDR 600 MT/s
+#   apps-cpu1100-ddr750.frm   + Tezuka FSBL CPU 1100 MHz / DDR 750 MT/s   (labels: tezuka_label)
 #   apps-stock-clock.frm      + Tezuka standard-clock FSBL (back from an overclock)
 #   inputs: nexus2 (stripped ARMv7 musl ELF), nexus-apps.tar.xz (contrib/pluto/apps: provision.sh,
 #   start.sh, defaults/...), svxlink-root.tar.xz (bin lib share var etc/svxlink), SHA256SUMS (all three).
@@ -87,7 +89,7 @@ PY
 }
 xz -t "$S/payload"
 assemble apps.frm "" none
-for v in cpu1100-ddr750 std; do
+for v in cpu495-ddr396 cpu950-ddr600 cpu1100-ddr750 std; do
 	tezuka_boot "$v" "$S/boot-$v.bin"
 	case $v in std) n=apps-stock-clock.frm ;; *) n=apps-$v.frm ;; esac
 	assemble "$n" "$S/boot-$v.bin" "$TZ_DESC"

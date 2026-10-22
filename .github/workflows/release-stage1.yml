@@ -1,6 +1,7 @@
 name: stage-1 release
-# Publishes the stage-1 files of a finished firmware.yml run (pluto.frm, pluto.dfu, boot*.frm) as release
-# stage1-<short sha> with one SHA256SUMS and a README table.
+# Publishes the stage-1 files of a finished firmware.yml run as release stage1-<short sha>: pluto.frm and
+# pluto.dfu from the run, every boot*.frm (one per Tezuka v0.3.24 Nano FSBL, firmware/build-boot-frm.sh;
+# those the run also built must be byte-identical), one SHA256SUMS and a README table.
 on:
   # push only registers the workflow on this (non-default) branch; the job runs on dispatch
   push: { branches: [v0.39-std], paths: ['.github/workflows/release-stage1.yml'] }
@@ -20,43 +21,39 @@ jobs:
         run: |
           [ "$(gh run view "$RUN" --json workflowName,conclusion -q '.workflowName + " " + .conclusion')" = "firmware (GitHub-hosted, Vivado installed in the job) success" ] || { echo "not a successful firmware.yml run"; exit 1; }
           SHA=$(gh run view "$RUN" --json headSha -q .headSha); echo "SHA=$SHA" >> "$GITHUB_ENV"; echo "TAG=stage1-${SHA:0:7}" >> "$GITHUB_ENV"
-          gh run download "$RUN" -n pluto-nano-timestamp-frm -D out
-          cd out && rm -f *.md5 && ls -la
-          # the 950/600 variant is not published (untested); older runs still built it
-          rm -f boot-cpu950-ddr600.frm
-          for f in pluto.frm boot.frm boot-cpu1100-ddr750.frm; do [ -s $f ] || { echo "missing $f"; exit 1; }; done
-          [ $(stat -c %s pluto.frm) -le 14680064 ] || { echo "pluto.frm above 14 MiB"; exit 1; }
-          sha256sum pluto.frm pluto.dfu boot*.frm > SHA256SUMS
+          gh run download "$RUN" -n pluto-nano-timestamp-frm -D run
+          ls -la run
+          [ -s run/pluto.frm ] && [ -s run/pluto.dfu ] || { echo "pluto.frm/pluto.dfu missing"; exit 1; }
+          [ $(stat -c %s run/pluto.frm) -le 14680064 ] || { echo "pluto.frm above 14 MiB"; exit 1; }
+      - name: boot*.frm (every Tezuka FSBL)
+        run: |
+          sudo apt-get install -y -q u-boot-tools > /dev/null
+          firmware/build-boot-frm.sh - boot
+          for f in run/boot*.frm; do cmp "$f" "boot/${f#run/}" || { echo "${f#run/} differs from the run's"; exit 1; }; echo "${f#run/} identical to the run's"; done
+          mkdir -p out && cp run/pluto.frm run/pluto.dfu boot/boot*.frm out/
+          cd out && sha256sum pluto.frm pluto.dfu boot*.frm > SHA256SUMS && cat SHA256SUMS
       - name: README
         run: |
+          . firmware/tezuka-boot.sh
           cd out
           { echo "# $TAG"
             echo
             echo "Stage 1 standalone firmware for the HamGeek Pluto Nano (pluto-nano-timestamp ${SHA:0:7}, firmware.yml run $RUN)."
-            echo "From the STOCK firmware: copy \`pluto.frm\` and **one** boot file to the USB drive, then eject."
-            echo "The stock update.sh only recognises the name \`boot.frm\`: to install an overclock variant from stock,"
-            echo "rename it to \`boot.frm\` on the drive (this firmware accepts the long names, exactly one at a time)."
+            echo "Copy \`pluto.frm\` and **exactly one** boot file to the USB drive, then eject."
+            echo "From the STOCK firmware the update only recognises the name \`boot.frm\`: rename the chosen boot file"
+            echo "to \`boot.frm\` on the drive. This firmware accepts the long names (exactly one at a time)."
             echo
             echo "| file | content | bytes | sha256 |"
             echo "|---|---|---|---|"
-            for f in pluto.frm pluto.dfu boot.frm boot-cpu1100-ddr750.frm; do
-              case $f in
-                pluto.frm) c="OS (FIT + md5), for every variant" ;; pluto.dfu) c="the same FIT without trailer, for a U-Boot DFU RAM boot only" ;;
-                boot.frm) c="Tezuka FSBL standard clocks + U-Boot + NexusBS env" ;;
-                boot-cpu1100-ddr750.frm) c="FSBL CPU 1100 MHz / DDR 750 MT/s, same U-Boot + env; tested on the reference board only (HamGeek Pluto Nano Rev.B) WITH HEATSINKS AND A FAN INSTALLED, ran for days; not a Tezuka-published test result; above the -1 speed grade spec — do not use without active cooling" ;;
-              esac
-              echo "| \`$f\` | $c | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
+            echo "| \`pluto.frm\` | OS (FIT + md5), for every boot variant | $(stat -c %s pluto.frm) | \`$(sha256sum pluto.frm | cut -c1-16)…\` |"
+            echo "| \`pluto.dfu\` | the same FIT without trailer, for a U-Boot DFU RAM boot only | $(stat -c %s pluto.dfu) | \`$(sha256sum pluto.dfu | cut -c1-16)…\` |"
+            for v in $TZ_VARIANTS; do
+              case $v in std) f=boot.frm ;; *) f=boot-$v.frm ;; esac
+              echo "| \`$f\` | FSBL $(tezuka_label $v); same U-Boot + NexusBS env | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
             done
             echo
-            echo "The boot variants differ from \`boot.frm\` only in FSBL bytes of the first 64 KiB block (and the md5 trailer)."
+            echo "All boot files are Tezuka v0.3.24 Nano images (sha256-pinned) with the same U-Boot; they differ from \`boot.frm\` only in FSBL bytes of the first 64 KiB block (and the md5 trailer). Full checksums: SHA256SUMS."
           } > README.md
-          python3 - <<'PY'
-          ref = open('boot.frm', 'rb').read()
-          for n in ('boot-cpu1100-ddr750.frm',):
-              b = open(n, 'rb').read(); d = [i for i in range(len(ref) - 33) if ref[i] != b[i]]
-              assert len(b) == len(ref) and d and d[-1] < 0x10000
-              print(n, len(d), 'bytes differ, 0x%x..0x%x' % (d[0], d[-1]))
-          PY
           cat README.md
       - name: Release
         run: |
