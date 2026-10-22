@@ -85,10 +85,15 @@ fake hostname <<'F'
 [ $# = 0 ] && cat "$NEXUS_ROOT/etc/hostname"; exit 0
 F
 fake bluetoothctl <<'F'
+# BT_VERSION emulates the installed BlueZ (default 5.65: `devices Paired`; < 5.65: `paired-devices`);
+# BT_LIST=empty makes both list nothing (the storage fallback answers then)
+V=${BT_VERSION:-5.65}; new=$(echo "$V" | awk -F. '{print ($1>5 || ($1==5 && $2>=65)) ? 1 : 0}')
+[ "$1" = --version ] && { echo "bluetoothctl: $V"; exit 0; }
 [ "$1" = --timeout ] && shift 2
 case "$1" in
 show) printf 'Controller 11:22:33:44:55:66 (public)\n\tName: plutosdr\n\tPowered: yes\n\tPairable: yes\n' ;;
-paired-devices) echo "Device AA:BB:CC:DD:EE:FF AirPods" ;;
+paired-devices) [ $new = 0 ] && [ "$BT_LIST" != empty ] && echo "Device AA:BB:CC:DD:EE:FF AirPods" || echo "Invalid command in menu main: paired-devices" ;;
+devices) [ "$2" = Paired ] && [ $new = 1 ] && [ "$BT_LIST" != empty ] && echo "Device AA:BB:CC:DD:EE:FF AirPods" ;;
 esac; exit 0
 F
 fake dmesg <<'F'
@@ -360,6 +365,12 @@ printf '[General]\nName=SeenOnly\n' > "$R/var/lib/bluetooth/11:22:33:44:55:66/CC
 rc 0 "bluetooth status" $NC get bt
 check "bluetooth status shows controller and paired device" sh -c "grep -q 'controller: 11:22:33:44:55:66' $T/out && grep -q 'Powered: yes' $T/out && grep -q 'AirPods' $T/out"
 check "bluetooth status lists only paired devices (LinkKey), never a seen-only one" sh -c "grep -q 'AA:BB:CC:DD:EE:FF AirPods' $T/out && ! grep -q SeenOnly $T/out"
+BT_VERSION=5.55 $NC get bt > $T/out 2>&1
+check "BlueZ 5.55 (paired-devices syntax) lists the paired device" grep -q 'AA:BB:CC:DD:EE:FF AirPods' $T/out
+BT_VERSION=5.72 $NC get bt > $T/out 2>&1
+check "BlueZ 5.72 (devices Paired syntax) lists the paired device" grep -q 'AA:BB:CC:DD:EE:FF AirPods' $T/out
+BT_LIST=empty $NC get bt > $T/out 2>&1
+check "bluetoothctl lists nothing: storage fallback, paired only" sh -c "grep -q 'AA:BB:CC:DD:EE:FF AirPods' $T/out && ! grep -q SeenOnly $T/out && ! grep -q Invalid $T/out"
 
 # ================================================================ NexusBS station
 rc 1 "station set without an apps slot" $NC nonint do_station_set CALLSIGN YO3TCO
