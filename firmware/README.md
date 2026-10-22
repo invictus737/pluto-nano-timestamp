@@ -192,7 +192,7 @@ network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and bac
 | 1 System: Host name | `do_hostname NAME` | U-Boot `hostname` + `/etc/hostname` now, avahi restarted (`NAME.local`); DHCP leases carry it from their next renewal. network.json no longer holds a host name |
 | Station role | `do_role master\|slave` | `nexus-role` (USB composite rebuilt, NexusBS started/stopped) |
 | USB mode | `do_usb_mode peripheral\|auto\|host` | next boot; `host` = a computer on USB-C no longer sees the Pluto |
-| Crystal correction | `do_xo_correction HZ\|default [--now]` | the measured 40 MHz reference in Hz, 8 digits within +/-250 ppm (39990000-40010000); shown as Hz and ppm, ppm = (xo - 40e6) / 40e6 x 1e6 (39999331 = -16.725 ppm; slow crystal = tunes low = below 40000000); next boot, `--now` also writes the AD9363 (restart NexusBS then); same value again = no change; keep `[radio] ppm = 0` (see "Crystal correction") |
+| Crystal correction | `do_xo_correction HZ\|default [--now]` | the measured 40 MHz reference in Hz, 8 digits within +/-250 ppm (39990000-40010000); shown as Hz and ppm, ppm = (xo - 40e6) / 40e6 x 1e6 (39999331 = -16.725 ppm; slow crystal = tunes low = below 40000000); next boot, `--now` also writes the AD9363 (restart NexusBS then); same value again = no change; keep `[radio] ppm = 0` in nexus2.toml |
 | CPU/DDR clock | `do_cpu_clock VARIANT [--cooling-confirmed]` | `standard` (default, recommended), `495_396` and `950_600` (Tezuka files, not tested on the reference board), `1100_750` (tested on the reference board with heatsinks and a fan only; above the -1 speed grade spec; active cooling required: refused without `--cooling-confirmed`, the menu asks explicitly). The boot block is rewritten at the next restart: a power cut during that < 1 s write needs DFU/JTAG recovery. The menu offers the restart |
 | Reboot / Shut down | `do_reboot`, `do_shutdown` | |
 | 2 Network: Status | `get network` (JSON) | IP per interface, gateway, DNS, SSID, signal, pending change |
@@ -350,49 +350,6 @@ cooling_confirmed, ARM/DDR PLL and the resulting CPU MHz / DDR MT/s from the SLC
 `nexus-clock set VARIANT [--cooling-confirmed]` (environment only). A config.txt edit that changes the
 variant apply installs (cpu_clock, or the cooling confirmation of 1100_750) reboots once to apply it. apply also refuses while update.sh has the USB drive image mounted
 (`/mnt/msd`), and erases by the partition's real erase block size.
-
-## Crystal correction (xo_correction)
-
-The AD9363 derives the RX/TX local oscillators **and** the ADC/DAC sample clocks from one 40 MHz
-crystal, which on a Pluto-class board is off by several to a few tens of ppm. `xo_correction` (U-Boot
-env, config.txt `[SYSTEM]`) is the crystal's **measured** frequency in Hz; U-Boot hands it to the
-driver at boot, which then computes both the synthesizers and the sample clock from the true value.
-
-    ppm           = (xo_correction - 40000000) / 40000000 x 1e6
-    xo_correction = 40000000 x (1 + ppm / 1e6)
-    carrier error = f_rf x ppm / 1e6        (1 ppm = 438 Hz at 438 MHz, same sign as ppm)
-
-A crystal that runs slow makes the radio tune low and has `xo_correction` **below** 40000000 (the
-reference board: -16.73 ppm, -7.33 kHz at 438.3625 MHz, `xo_correction = 39999331`). Accepted range
-+/-250 ppm (39990000-40010000).
-
-Why NexusBS's `[radio] ppm` is not enough on a Pluto: it only moves the LO request, the sample clock
-stays wrong by the same ppm and TETRA timing drifts against the terminals (reference board: voice cut
-after 4-11 s with LO-only ppm, clean 40 s+ calls with the crystal corrected). **Correct the crystal
-and keep `[radio] ppm = 0` in nexus2.toml**, also when the Pluto is the radio of a Pi (slave role).
-
-Set it (all write the same U-Boot key `xo_correction`; one value per physical board, measured after
-warm-up):
-
-| way | how | effective |
-|---|---|---|
-| nexus-config | System -> Crystal correction (Hz and ppm shown), or `nexus-config nonint do_xo_correction 39999331 [--now]` | next boot; `--now` / "apply now" also writes the AD9363 |
-| config.txt | `[SYSTEM] xo_correction = 39999331`, save, eject | next boot |
-| nexus-setup.txt | `XO_CORRECTION=39999331` | next power-up |
-| shell | `fw_setenv xo_correction 39999331` | next boot |
-
-`nexus-setup.txt` / `do_station_set XO_CORRECTION` go through `nexus2 provision`, which only checks
-the value and leaves it in `/mnt/data/nexus2/xo_correction.pending`; that path has one writer of the
-U-Boot key, `nexus-config do_xo_correction` (called by nexus-config itself, and by the application slot's
-provision.sh at boot), with the same range check, idempotent for an unchanged value. `default`
-removes it (40000000 nominal). nexus-config warns when the station's nexus2.toml has a non-zero
-`[radio] ppm`.
-
-Check it: `cat /sys/bus/iio/devices/iio:device*/xo_correction` (the value in use), the NexusBS log's
-LO readback line (e.g. `LO=438387498 Hz; expected PLL=438387500 Hz`: within a few Hz of the plan),
-and a new measurement of the carrier: the residual must be close to zero. Re-measure after changing
-cooling or the CPU clock, and every few months. Full guide (measurement methods, direction of the
-sign, symptoms): NexusBS `Docs/PLUTO-CRYSTAL-CORRECTION.md`.
 
 ## Network settings: network.json (nexus-net)
 

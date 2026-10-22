@@ -33,7 +33,7 @@ netmask_eth = 255.255.255.0
 [SYSTEM]
 # the measured frequency of this board's 40 MHz reference in Hz (empty = 40000000 nominal), e.g.
 # 39999331 = -16.725 ppm (ppm = (xo_correction - 40000000) / 40000000 x 1e6); active at the next boot
-# (a slow crystal tunes low: below 40000000; keep [radio] ppm = 0 in nexus2.toml; see the README)
+# (a slow crystal tunes low: below 40000000; keep [radio] ppm = 0 in nexus2.toml)
 xo_correction =
 udc_handle_suspend = 0
 # USB Communication Device Class Compatibility Mode [rndis|ncm|ecm]
