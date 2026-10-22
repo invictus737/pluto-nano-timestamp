@@ -5,11 +5,9 @@
 # Options in /etc/default/bluealsa (BLUEALSA_ARGS).
 DAEMON=/usr/bin/bluealsa
 PIDFILE=/var/run/bluealsa.pid
-# Mono, low-quality SBC: voice from 8-16 kHz sources loses nothing, and the stream takes about a third
-# of the stereo airtime on the antenna it shares with 2.4 GHz Wi-Fi (measured with an A2DP stream
-# running, router ping from the Pluto: stereo high 15.7 ms avg / 84 ms max, mono low 6.7 / 22 ms).
-# Players read the negotiated channel count from `bluealsa-cli info`.
-BLUEALSA_ARGS="-p a2dp-source --a2dp-force-mono --sbc-quality=low"
+# Stereo SBC at bluealsa's default (high) quality. Mono / low quality was tried to save 2.4 GHz Wi-Fi
+# airtime: it played voice slowed down on a real speaker and saves no meaningful CPU, so it is not used.
+BLUEALSA_ARGS="-p a2dp-source"
 [ -r /etc/default/bluealsa ] && . /etc/default/bluealsa
 case "$1" in
 start)
