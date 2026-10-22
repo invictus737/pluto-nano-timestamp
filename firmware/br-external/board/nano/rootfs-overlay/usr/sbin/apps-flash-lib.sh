@@ -12,7 +12,7 @@ upper_bank_ok() {
 	dmesg | grep -q "failed to read ear reg" && { echo "flash bank register unreadable"; return 1; }
 	A=$(mtdnum qspi-apps); E=$(mtdnum qspi-uboot-env); N=$(mtdnum qspi-nvmfs)
 	[ -n "$A" ] && [ -n "$E" ] && [ -n "$N" ] || { echo "partitions missing"; return 1; }
-	same=0; FF=ce9cc82861eb570cc9633a7cb22269f1  # md5 of an erased 128 KiB range
+	same=0; FF=41d2e2c0c0edfccf76fa1c3e38bc1cf2  # md5 of an erased 128 KiB range (131072 x 0xFF)
 	a=$(blkmd5 $A 0 2); [ "$a" = "$(blkmd5 $E 0 2)" ] && same=$((same+1))
 	b=$(blkmd5 $A 2 2); [ "$b" = "$(blkmd5 $N 0 2)" ] && [ "$b" != $FF ] && same=$((same+1))
 	[ $same -eq 0 ] || { echo "qspi-apps reads like its lower-bank mirror (aliased)"; return 1; }
