@@ -6,7 +6,7 @@
 #   950_600   CPU 950 MHz / DDR 600 MT/s: Tezuka file, not tested on the reference board
 #   1100_750  CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B)
 #             with heatsinks and a fan installed, ran for days; above the -1 speed grade spec, active
-#             cooling required (needs cpu_clock_cooling_confirmed = yes)
+#             cooling required (needs cpu_clock_cooling_confirmed = yes, else standard is used)
 # U-Boot environment: cpu_clock (unset/invalid = standard), cpu_clock_cooling_confirmed = yes.
 #   nexus-clock status                       JSON: configured, installed, running PLLs, cooling_confirmed
 #   nexus-clock set VARIANT [--cooling-confirmed]   writes the environment only (never flashes)
@@ -15,26 +15,33 @@
 # new image first (read back), then block 0 of qspi-fsbl-uboot is erased and written (read back; on a
 # mismatch the saved block is written back at once); success = one reboot. A power cut during that
 # < 1 s write needs DFU/JTAG recovery.
-. /usr/sbin/apps-flash-lib.sh
-C=/usr/share/nexus-clock; VARIANTS="standard 495_396 950_600 1100_750"
+. ${NEXUS_ROOT:-}/usr/sbin/apps-flash-lib.sh
+P=${NEXUS_ROOT:-}   # tests only: prefix of every file path
+C=$P/usr/share/nexus-clock; VARIANTS="standard 495_396 950_600 1100_750"
 log() { logger -t nexus-clock "$*"; echo "nexus-clock: $*"; }
 valid() { for v in $VARIANTS; do [ "$1" = "$v" ] && return 0; done; return 1; }
-configured() { v=$(fw_printenv -n cpu_clock 2>/dev/null); valid "$v" || v=standard; echo $v; }
 cooling() { [ "$(fw_printenv -n cpu_clock_cooling_confirmed 2>/dev/null)" = yes ] && echo yes || echo no; }
+# the variant to install: 1100_750 without the cooling confirmation falls back to standard
+configured() { v=$(fw_printenv -n cpu_clock 2>/dev/null); valid "$v" || v=standard
+	[ "$v" = 1100_750 ] && [ "$(cooling)" != yes ] && v=standard; echo $v; }
 sum() { sha256sum | cut -d' ' -f1; }
 installed() {
-	Z=$(mtdnum qspi-fsbl-uboot); b=$(dd if=/dev/mtd$Z bs=65536 count=1 2>/dev/null | sum)
+	Z=$(mtdnum qspi-fsbl-uboot); b=$(dd if=$(mtddev $Z) bs=65536 count=1 2>/dev/null | sum)
 	for v in $VARIANTS; do [ "$b" = "$(sum < $C/$v.blk0)" ] && { echo $v; return; }; done; echo unknown
 }
-reg() { printf '%d' "$(devmem "$1" 32)"; }
+reg() { printf '%d' "$(devmem "$1" 32 2>/dev/null || echo 0)"; }
+# erase the first 64 KiB of mtdN, whatever the erase block size
+erase64k() { es=$(mtderasesize $1); [ "$es" -gt 0 ] 2>/dev/null || es=65536; flash_erase $(mtddev $1) 0 $(( (65536 + es - 1) / es )) > /dev/null 2>&1; }
 case "${1:-status}" in
 status)
 	a=$(reg 0xF8000100); ac=$(reg 0xF8000120); d=$(reg 0xF8000104); dc=$(reg 0xF8000124)
 	af=$(( (a >> 12) & 0x7F )); ad=$(( (ac >> 8) & 0x3F )); df=$(( (d >> 12) & 0x7F )); d3=$(( (dc >> 20) & 0x3F ))
+	[ $ad -gt 0 ] || ad=1; [ $d3 -gt 0 ] || d3=1
+	raw=$(fw_printenv -n cpu_clock 2>/dev/null); valid "$raw" || raw=standard
 	# PS_CLK 33.333 MHz (Nano): PLL = FDIV x PS_CLK; CPU = ARM PLL / divisor; DDR clock = DDR PLL / DDR_3X divisor
-	echo "{\"configured\":\"$(configured)\",\"installed\":\"$(installed)\",\"cooling_confirmed\":$( [ $(cooling) = yes ] && echo true || echo false),\
-\"arm_pll_mhz\":$((af * 33333 / 1000)),\"cpu_mhz\":$(( af * 33333 / 1000 / (ad > 0 ? ad : 1) )),\
-\"ddr_pll_mhz\":$((df * 33333 / 1000)),\"ddr_mts\":$(( 2 * df * 33333 / 1000 / (d3 > 0 ? d3 : 1) ))}" ;;
+	echo "{\"configured\":\"$raw\",\"effective\":\"$(configured)\",\"installed\":\"$(installed)\",\"cooling_confirmed\":$( [ $(cooling) = yes ] && echo true || echo false),\
+\"arm_pll_mhz\":$((af * 33333 / 1000)),\"cpu_mhz\":$(( af * 33333 / 1000 / ad )),\
+\"ddr_pll_mhz\":$((df * 33333 / 1000)),\"ddr_mts\":$(( 2 * df * 33333 / 1000 / d3 ))}" ;;
 set)
 	v=${2:?variant: $VARIANTS}; valid "$v" || { echo "unknown variant $v ($VARIANTS)" >&2; exit 2; }
 	if [ "$v" = 1100_750 ]; then
@@ -45,11 +52,14 @@ set)
 	log "cpu_clock = $v (applied at the next boot)" ;;
 apply)
 	[ -f $C/SHA256SUMS ] && (cd $C && sha256sum -c SHA256SUMS > /dev/null 2>&1) || { log "clock images missing or corrupt, nothing done"; exit 1; }
-	pidof update.sh > /dev/null 2>&1 && ls /mnt/msd/*.frm > /dev/null 2>&1 && { log "a firmware update is in progress, not now"; exit 0; }
+	# update.sh mounts the USB drive image at /mnt/msd while it handles a copied .frm/config.txt
+	grep -q ' /mnt/msd ' $P/proc/mounts 2>/dev/null && { log "a mass-storage update is in progress, not now"; exit 0; }
 	want=$(configured)
-	if [ "$want" = 1100_750 ] && [ "$(cooling)" != yes ]; then log "cpu_clock 1100_750 refused: cpu_clock_cooling_confirmed is not yes"; exit 0; fi
-	Z=$(mtdnum qspi-fsbl-uboot); B=$(mtdnum qspi-bootcopy); T=/tmp/nexus-clock.$$; mkdir -p $T
-	dd if=/dev/mtd$Z of=$T/cur bs=65536 count=16 2>/dev/null
+	[ "$(fw_printenv -n cpu_clock 2>/dev/null)" = 1100_750 ] && [ "$want" = standard ] && \
+		log "cpu_clock 1100_750 refused: cpu_clock_cooling_confirmed is not yes; using standard"
+	Z=$(mtdnum qspi-fsbl-uboot); B=$(mtdnum qspi-bootcopy); [ -n "$Z" ] || { log "no qspi-fsbl-uboot partition"; exit 1; }
+	ZD=$(mtddev $Z); T=$P/tmp/nexus-clock.$$; mkdir -p $T
+	dd if=$ZD of=$T/cur bs=65536 count=16 2>/dev/null
 	head -c 65536 $T/cur > $T/old.blk0
 	[ "$(sum < $T/old.blk0)" = "$(sum < $C/$want.blk0)" ] && { rm -rf $T; exit 0; }
 	. $C/layout
@@ -59,18 +69,18 @@ apply)
 	{ cat $C/$want.blk0; tail -c +65537 $T/cur; } > $T/new
 	log "changing the FSBL clock: $(installed) -> $want"
 	if [ -n "$B" ]; then
-		flash_unlock /dev/mtd$B > /dev/null 2>&1
-		flashcp $T/new /dev/mtd$B && [ "$(sum < /dev/mtd$B)" = "$(sum < $T/new)" ] || { log "qspi-bootcopy write/verify failed, clock not changed"; rm -rf $T; exit 1; }
+		BD=$(mtddev $B); flash_unlock $BD > /dev/null 2>&1
+		flashcp $T/new $BD && [ "$(sum < $BD)" = "$(sum < $T/new)" ] || { log "qspi-bootcopy write/verify failed, clock not changed"; rm -rf $T; exit 1; }
 	fi
-	flash_unlock /dev/mtd$Z > /dev/null 2>&1
-	flash_erase /dev/mtd$Z 0 1 > /dev/null 2>&1 && dd if=$C/$want.blk0 of=/dev/mtd$Z bs=65536 count=1 conv=notrunc 2>/dev/null
-	if [ "$(dd if=/dev/mtd$Z bs=65536 count=1 2>/dev/null | sum)" != "$(sum < $C/$want.blk0)" ]; then
-		flash_erase /dev/mtd$Z 0 1 > /dev/null 2>&1; dd if=$T/old.blk0 of=/dev/mtd$Z bs=65536 count=1 conv=notrunc 2>/dev/null
-		if [ "$(dd if=/dev/mtd$Z bs=65536 count=1 2>/dev/null | sum)" = "$(sum < $T/old.blk0)" ]; then
+	flash_unlock $ZD > /dev/null 2>&1
+	erase64k $Z && dd if=$C/$want.blk0 of=$ZD bs=65536 count=1 conv=notrunc 2>/dev/null
+	if [ "$(dd if=$ZD bs=65536 count=1 2>/dev/null | sum)" != "$(sum < $C/$want.blk0)" ]; then
+		erase64k $Z; dd if=$T/old.blk0 of=$ZD bs=65536 count=1 conv=notrunc 2>/dev/null
+		if [ "$(dd if=$ZD bs=65536 count=1 2>/dev/null | sum)" = "$(sum < $T/old.blk0)" ]; then
 			log "CRITICAL: the new FSBL block did not verify; the previous one was written back"
 		else log "CRITICAL: FSBL block 0 neither new nor old after the write: do not power off, restore boot.frm or use DFU"; fi
-		[ -n "$B" ] && flashcp $T/cur /dev/mtd$B; rm -rf $T; exit 1
+		[ -n "$B" ] && flashcp $T/cur $BD; rm -rf $T; exit 1
 	fi
 	rm -rf $T; sync; log "FSBL clock $want installed, rebooting once"; sleep 2; reboot ;;
-*) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

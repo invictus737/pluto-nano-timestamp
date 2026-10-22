@@ -2,24 +2,26 @@
 # Station role of this Pluto (config.txt [SYSTEM] operating_mode, U-Boot environment, default slave):
 #   slave   SDR for NexusBS running elsewhere (a Raspberry Pi over USB or the network): iiod and the
 #           timestamp SDR gadgets (USB FunctionFS, UDP 30432/30433) serve the radio, nothing else runs.
-#   master  NexusBS runs on the Pluto itself (S97app starts /mnt/data/<name>/app.conf) and uses the
-#           radio directly (uri=local:); both SDR gadgets are stopped.
+#   master  NexusBS runs on the Pluto itself (S97app starts the application slot, /opt/apps/nexus) and
+#           uses the radio directly (uri=local:); both SDR gadgets are stopped.
 # usage: nexus-role [slave|master|status]   (the change is applied now and kept across reboots)
+I=${NEXUS_ROOT:-}/etc/init.d   # NEXUS_ROOT: tests only
 R=$(fw_printenv -n operating_mode 2>/dev/null || echo slave)
 case "${1:-status}" in
 slave|master)
 	[ "$1" = "$R" ] || fw_setenv operating_mode "$1" || exit 1
 	if [ "$1" != "$R" ]; then
 		# the USB composite is rebuilt without/with the SDR function: a USB link drops for a few seconds
-		[ "$1" = master ] && /etc/init.d/S55sdr_ip_gadget stop
-		/etc/init.d/S23udc stop > /dev/null 2>&1; /etc/init.d/S23udc start > /dev/null 2>&1
-		[ "$1" = slave ] && /etc/init.d/S55sdr_ip_gadget start
+		[ "$1" = master ] && $I/S55sdr_ip_gadget stop
+		$I/S23udc stop > /dev/null 2>&1; $I/S23udc start > /dev/null 2>&1
+		[ "$1" = slave ] && $I/S55sdr_ip_gadget start
 	fi
-	if [ "$1" = master ]; then /etc/init.d/S97app start; else /etc/init.d/S97app stop; fi
+	if [ "$1" = master ]; then $I/S97app start; else $I/S97app stop; fi
 	logger -t nexus-role "role $1"; echo "role: $1" ;;
 status)
 	echo "role: $R"
-	for p in /var/run/*.pid; do n=$(basename $p .pid); [ -f /mnt/data/$n/app.conf ] || [ -f /opt/$n/app.conf ] || continue
+	for p in ${NEXUS_ROOT:-}/var/run/*.pid; do n=$(basename $p .pid); [ -f /mnt/data/$n/app.conf ] || [ -f /opt/$n/app.conf ] || \
+		{ [ $n = nexus ] && [ -x /opt/apps/nexus/start.sh ]; } || continue
 		kill -0 "$(cat $p)" 2>/dev/null && echo "running: $n (log /var/log/$n.log)"; done ;;
 *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -3,9 +3,10 @@
 # (WPA_ID_STR = netN of the associated network); ifupdown calls "start|stop <ifname>" (post-up/pre-down).
 # CONNECTED applies /run/nexus-net/wifi/netN.conf: DHCP (udhcpc with the host name) or the static
 # address, gateway and DNS. DISCONNECTED drops the lease and the address.
-R=/run/nexus-net; P=/run/wpa_supplicant
+X=${NEXUS_ROOT:-}   # tests only: prefix of every file path
+R=$X/run/nexus-net; P=$X/run/wpa_supplicant
 log() { logger -t nexus-net "$*"; }
-down() { [ -f /run/udhcpc.$1.pid ] && kill "$(cat /run/udhcpc.$1.pid)" 2>/dev/null; rm -f /run/udhcpc.$1.pid; ip -4 addr flush dev "$1" 2>/dev/null; }
+down() { [ -f $X/run/udhcpc.$1.pid ] && kill "$(cat $X/run/udhcpc.$1.pid)" 2>/dev/null; rm -f $X/run/udhcpc.$1.pid; ip -4 addr flush dev "$1" 2>/dev/null; }
 up() {
 	IF=$1; ID=$2; C=$R/wifi/$ID.conf; MODE=dhcp ADDRESS= GATEWAY= DNS=
 	[ -f "$C" ] && . "$C"
@@ -14,23 +15,23 @@ up() {
 		ip addr add "$ADDRESS" dev $IF
 		[ -n "$GATEWAY" ] && ip route replace default via "$GATEWAY" dev $IF
 		s=$(cat $R/dns 2>/dev/null); [ -n "$s" ] || s=$DNS
-		if [ -n "$s" ]; then f=$(readlink -f /etc/resolv.conf); { for d in $s; do echo "nameserver $d"; done; } > "$f.$$" && mv "$f.$$" "$f"; fi
+		if [ -n "$s" ]; then f=$(readlink -f $X/etc/resolv.conf); { for d in $s; do echo "nameserver $d"; done; } > "$f.$$" && mv "$f.$$" "$f"; fi
 		log "$IF: $ID static $ADDRESS"
 	else
-		udhcpc -b -R -i $IF -x hostname:"$(hostname)" -p /run/udhcpc.$IF.pid > /dev/null 2>&1
+		udhcpc -b -R -i $IF -x hostname:"$(hostname)" -p $X/run/udhcpc.$IF.pid > /dev/null 2>&1
 		log "$IF: $ID dhcp"
 	fi
-	echo $(ip -4 -o addr show $IF | awk '{print $4}' | cut -d/ -f1) > /opt/ipaddr-$IF 2>/dev/null
+	echo $(ip -4 -o addr show $IF | awk '{print $4}' | cut -d/ -f1) > $X/opt/ipaddr-$IF 2>/dev/null
 }
 case "$1" in
 start)	# attach the action listener; replay the state if the association finished before it attached
-	IF=$2; [ -f /run/wpa_cli.$IF.pid ] && kill "$(cat /run/wpa_cli.$IF.pid)" 2>/dev/null
+	IF=$2; [ -f $X/run/wpa_cli.$IF.pid ] && kill "$(cat $X/run/wpa_cli.$IF.pid)" 2>/dev/null
 	n=0; while [ ! -S $P/$IF ] && [ $n -lt 10 ]; do sleep 1; n=$((n+1)); done
-	wpa_cli -p $P -i $IF -a "$0" -B -P /run/wpa_cli.$IF.pid
+	wpa_cli -p $P -i $IF -a "$0" -B -P $X/run/wpa_cli.$IF.pid
 	st=$(wpa_cli -p $P -i $IF status 2>/dev/null)
 	echo "$st" | grep -q '^wpa_state=COMPLETED' && up $IF "$(echo "$st" | sed -n 's/^id_str=//p')"
 	exit 0 ;;
-stop)	IF=$2; [ -f /run/wpa_cli.$IF.pid ] && kill "$(cat /run/wpa_cli.$IF.pid)" 2>/dev/null; rm -f /run/wpa_cli.$IF.pid; down $IF; exit 0 ;;
+stop)	IF=$2; [ -f $X/run/wpa_cli.$IF.pid ] && kill "$(cat $X/run/wpa_cli.$IF.pid)" 2>/dev/null; rm -f $X/run/wpa_cli.$IF.pid; down $IF; exit 0 ;;
 esac
 case "$2" in
 CONNECTED) up "$1" "$WPA_ID_STR" ;;

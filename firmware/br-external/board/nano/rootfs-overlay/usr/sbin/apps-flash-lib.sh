@@ -1,10 +1,14 @@
 # shell library for the application slot (qspi-apps) and the apps.frm handler; sourced, busybox sh
 # Slot layout: 4096-byte text header (NUL padded) + payload (xz-compressed tar), at the start of qspi-apps.
 APPS_MAGIC="NEXUSBS-APPS-FRM 1"
-mtdnum() { grep "\"$1\"" /proc/mtd | cut -d: -f1 | tr -dc 0-9; }
-mtdsize() { printf '%d' "0x$(grep "\"$1\"" /proc/mtd | awk '{print $2}')"; }
+# NEXUS_ROOT (tests only) prefixes /proc/mtd and /dev/mtdN
+mtdnum() { grep "\"$1\"" ${NEXUS_ROOT:-}/proc/mtd | cut -d: -f1 | tr -dc 0-9; }
+mtdsize() { printf '%d' "0x$(grep "\"$1\"" ${NEXUS_ROOT:-}/proc/mtd | awk '{print $2}')"; }
+# erase block size of mtdN in bytes
+mtderasesize() { printf '%d' "0x$(grep "^mtd$1:" ${NEXUS_ROOT:-}/proc/mtd | awk '{print $3}')"; }
+mtddev() { echo "${NEXUS_ROOT:-}/dev/mtd$1"; }
 hdrval() { sed -n "s/^$2=//p" "$1" | head -1; }
-blkmd5() { dd if="/dev/mtd$1" bs=65536 skip="$2" count="${3:-1}" 2>/dev/null | md5sum | cut -d' ' -f1; }
+blkmd5() { dd if="$(mtddev $1)" bs=65536 skip="$2" count="${3:-1}" 2>/dev/null | md5sum | cut -d' ' -f1; }
 # Linux addresses the upper 16 MiB bank only with the Winbond EAR patch: refuse when the bank register
 # is not readable, or when the start of the slot reads exactly like its lower-bank mirror (offset
 # -16 MiB: U-Boot environment + nvmfs), which is what a wrapped (aliased) access returns.
