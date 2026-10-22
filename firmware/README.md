@@ -90,15 +90,12 @@ when the upper bank is not addressable (EAR unreadable, or the slot reads like i
 mirror); writes header + payload to qspi-apps (flashcp, then readback), and checks that the lower
 bank (U-Boot environment, FIT) did not change. Only then a carried boot.bin is written: only the
 64 KiB blocks that differ from the installed boot, qspi-bootcopy first, then qspi-fsbl-uboot from the
-last block to block 0, each read back. Variants (Tezuka v0.3.24 Nano files, sha256-pinned in `tezuka-boot.sh`): `apps.frm` (no FSBL),
-`apps-stock-clock.frm` (standard clocks, Tezuka default), `apps-cpu495-ddr396.frm` and
-`apps-cpu950-ddr600.frm` (Tezuka files, not tested on the reference board), `apps-cpu1100-ddr750.frm`
-(tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed, ran for
-days; above the -1 speed grade spec, active cooling required); likewise `boot.frm`, `boot-cpu495-ddr396.frm`,
-`boot-cpu950-ddr600.frm`, `boot-cpu1100-ddr750.frm`.
-Exactly one `boot*.frm` and one `apps*.frm` may be on the drive. For the Tezuka CPU1100_DDR750 FSBL only block 0 differs (36
-bytes of ps7_init data; U-Boot is byte-identical), so U-Boot is not rewritten and the unsafe window is
-one 64 KiB erase+program. /mnt/data is never touched.
+last block to block 0, each read back. Variants: `apps.frm` (no FSBL) and `apps-stock-clock.frm` (the Tezuka standard-clock FSBL, a
+recovery path back from an overclock). The CPU/DDR clock is otherwise a setting (see "CPU/DDR
+clock" below), not a separate file.
+Exactly one `boot*.frm` and one `apps*.frm` may be on the drive. For the Tezuka FSBL variants only block 0 differs (36 bytes
+of ps7_init data; U-Boot is byte-identical), so U-Boot is not rewritten and the unsafe window is one
+64 KiB erase+program. /mnt/data is never touched.
 
 At boot `S95apps` verifies the slot (header, payload md5) and unpacks it to `/opt/apps`, runs
 `provision.sh`; `S97app` runs `start.sh` in `/mnt/data/nexus2` in the master role (a legacy
@@ -203,6 +200,30 @@ Kernel WireGuard + `wg`. Put a wg-quick style file in `/mnt/data/wireguard/wg0.c
 peer refuses handshakes stamped 1970 as replays) and a default route exists. IPv4 Address/MTU and
 AllowedIPs routes are handled (0.0.0.0/0 as two /1 routes, endpoint kept on the old gateway);
 DNS/PostUp and the like are ignored. `fw_setenv wireguard 0` disables it.
+
+## CPU/DDR clock (nexus-clock)
+
+The clock is the FSBL's ps7_init PLL data in the first 64 KiB block of qspi-fsbl-uboot. The image
+carries block 0 of each Tezuka v0.3.24 Nano boot image and the rest of the standard BOOT.bin
+(`/usr/share/nexus-clock`, `build-clock-blocks.sh`; the build fails unless the variants differ only
+inside block 0). Setting: config.txt `[SYSTEM] cpu_clock` = U-Boot env `cpu_clock`, default `standard`
+when unset or invalid:
+
+| cpu_clock | |
+|---|---|
+| `standard` | Tezuka default clocks |
+| `495_396` | CPU 495 MHz / DDR 396 MT/s: Tezuka file, not tested on the reference board |
+| `950_600` | CPU 950 MHz / DDR 600 MT/s: Tezuka file, not tested on the reference board |
+| `1100_750` | CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed, ran for days; above the -1 speed grade spec, active cooling required. Needs `cpu_clock_cooling_confirmed = yes`, otherwise refused and logged |
+
+`S22clock` (`nexus-clock apply`, at boot, after the upper-bank checks of S21data) compares block 0
+with the configured variant; identical = no flash write. Otherwise, provided the rest of the installed
+boot image is Tezuka's: the new 1 MiB boot image goes to qspi-bootcopy first (read back), block 0 of
+qspi-fsbl-uboot is erased and written (read back; on a mismatch the saved block is written back at once
+and CRITICAL is logged), and the Pluto reboots once. A power cut during that < 1 s write needs DFU/JTAG
+recovery. `nexus-clock status` (JSON: configured, installed, cooling_confirmed, ARM/DDR PLL and the
+resulting CPU MHz / DDR MT/s from the SLCR registers), `nexus-clock set VARIANT [--cooling-confirmed]`
+(environment only). Changing cpu_clock in config.txt reboots once to apply it.
 
 ## Network settings: network.json (nexus-net)
 

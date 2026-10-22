@@ -59,7 +59,7 @@ if [ "$BS" -gt 0 ]; then
 		for i in $blocks; do
 			ok=0; for try in 1 2 3; do
 				flash_erase /dev/mtd$Z $((i * 65536)) 1 > /dev/null 2>&1 &&
-				dd if="$T/new" of=/dev/mtd$Z bs=65536 skip=$i seek=$i count=1 2>/dev/null &&
+				dd if="$T/new" of=/dev/mtd$Z bs=65536 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null &&
 				[ "$(blkmd5 $Z $i)" = "$(dd if="$T/new" bs=65536 skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1)" ] && { ok=1; break; }
 			done
 			[ $ok = 1 ] || { echo "block $i" > "$MSD/BOOT_UPDATE_FAILED"; fail "CRITICAL: qspi-fsbl-uboot block $i did not verify; do not power off, retry apps.frm or restore boot.dfu over DFU"; }

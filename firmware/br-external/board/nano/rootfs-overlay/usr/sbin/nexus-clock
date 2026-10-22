@@ -1,0 +1,76 @@
+#!/bin/sh
+# CPU/DDR clock of the Pluto Nano = the FSBL's ps7_init PLL settings in the first 64 KiB of
+# qspi-fsbl-uboot. Variants (Tezuka v0.3.24 Nano FSBLs, sha256-pinned, /usr/share/nexus-clock):
+#   standard  Tezuka default clocks (the default)
+#   495_396   CPU 495 MHz / DDR 396 MT/s: Tezuka file, not tested on the reference board
+#   950_600   CPU 950 MHz / DDR 600 MT/s: Tezuka file, not tested on the reference board
+#   1100_750  CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B)
+#             with heatsinks and a fan installed, ran for days; above the -1 speed grade spec, active
+#             cooling required (needs cpu_clock_cooling_confirmed = yes)
+# U-Boot environment: cpu_clock (unset/invalid = standard), cpu_clock_cooling_confirmed = yes.
+#   nexus-clock status                       JSON: configured, installed, running PLLs, cooling_confirmed
+#   nexus-clock set VARIANT [--cooling-confirmed]   writes the environment only (never flashes)
+#   nexus-clock apply                        (S22clock, at boot) flashes block 0 only if it differs
+# apply: the rest of the installed boot image must be Tezuka's (else refused); qspi-bootcopy gets the
+# new image first (read back), then block 0 of qspi-fsbl-uboot is erased and written (read back; on a
+# mismatch the saved block is written back at once); success = one reboot. A power cut during that
+# < 1 s write needs DFU/JTAG recovery.
+. /usr/sbin/apps-flash-lib.sh
+C=/usr/share/nexus-clock; VARIANTS="standard 495_396 950_600 1100_750"
+log() { logger -t nexus-clock "$*"; echo "nexus-clock: $*"; }
+valid() { for v in $VARIANTS; do [ "$1" = "$v" ] && return 0; done; return 1; }
+configured() { v=$(fw_printenv -n cpu_clock 2>/dev/null); valid "$v" || v=standard; echo $v; }
+cooling() { [ "$(fw_printenv -n cpu_clock_cooling_confirmed 2>/dev/null)" = yes ] && echo yes || echo no; }
+sum() { sha256sum | cut -d' ' -f1; }
+installed() {
+	Z=$(mtdnum qspi-fsbl-uboot); b=$(dd if=/dev/mtd$Z bs=65536 count=1 2>/dev/null | sum)
+	for v in $VARIANTS; do [ "$b" = "$(sum < $C/$v.blk0)" ] && { echo $v; return; }; done; echo unknown
+}
+reg() { printf '%d' "$(devmem "$1" 32)"; }
+case "${1:-status}" in
+status)
+	a=$(reg 0xF8000100); ac=$(reg 0xF8000120); d=$(reg 0xF8000104); dc=$(reg 0xF8000124)
+	af=$(( (a >> 12) & 0x7F )); ad=$(( (ac >> 8) & 0x3F )); df=$(( (d >> 12) & 0x7F )); d3=$(( (dc >> 20) & 0x3F ))
+	# PS_CLK 33.333 MHz (Nano): PLL = FDIV x PS_CLK; CPU = ARM PLL / divisor; DDR clock = DDR PLL / DDR_3X divisor
+	echo "{\"configured\":\"$(configured)\",\"installed\":\"$(installed)\",\"cooling_confirmed\":$( [ $(cooling) = yes ] && echo true || echo false),\
+\"arm_pll_mhz\":$((af * 33333 / 1000)),\"cpu_mhz\":$(( af * 33333 / 1000 / (ad > 0 ? ad : 1) )),\
+\"ddr_pll_mhz\":$((df * 33333 / 1000)),\"ddr_mts\":$(( 2 * df * 33333 / 1000 / (d3 > 0 ? d3 : 1) ))}" ;;
+set)
+	v=${2:?variant: $VARIANTS}; valid "$v" || { echo "unknown variant $v ($VARIANTS)" >&2; exit 2; }
+	if [ "$v" = 1100_750 ]; then
+		[ "${3:-}" = --cooling-confirmed ] || { log "1100_750 refused: it needs heatsinks and a fan; confirm with --cooling-confirmed"; exit 1; }
+		fw_setenv cpu_clock_cooling_confirmed yes || exit 1
+	fi
+	fw_setenv cpu_clock "$v" || exit 1
+	log "cpu_clock = $v (applied at the next boot)" ;;
+apply)
+	[ -f $C/SHA256SUMS ] && (cd $C && sha256sum -c SHA256SUMS > /dev/null 2>&1) || { log "clock images missing or corrupt, nothing done"; exit 1; }
+	pidof update.sh > /dev/null 2>&1 && ls /mnt/msd/*.frm > /dev/null 2>&1 && { log "a firmware update is in progress, not now"; exit 0; }
+	want=$(configured)
+	if [ "$want" = 1100_750 ] && [ "$(cooling)" != yes ]; then log "cpu_clock 1100_750 refused: cpu_clock_cooling_confirmed is not yes"; exit 0; fi
+	Z=$(mtdnum qspi-fsbl-uboot); B=$(mtdnum qspi-bootcopy); T=/tmp/nexus-clock.$$; mkdir -p $T
+	dd if=/dev/mtd$Z of=$T/cur bs=65536 count=16 2>/dev/null
+	head -c 65536 $T/cur > $T/old.blk0
+	[ "$(sum < $T/old.blk0)" = "$(sum < $C/$want.blk0)" ] && { rm -rf $T; exit 0; }
+	. $C/layout
+	[ "$(dd if=$T/cur bs=65536 skip=1 2>/dev/null | head -c $((boot_len - 65536)) | sum)" = "$(sum < $C/boot-rest.bin)" ] || \
+		{ log "installed boot image is not Tezuka v0.3.24 (install boot.frm first), clock not changed"; rm -rf $T; exit 1; }
+	R=$(upper_bank_ok) || { log "upper flash bank not addressable ($R), clock not changed"; rm -rf $T; exit 1; }
+	{ cat $C/$want.blk0; tail -c +65537 $T/cur; } > $T/new
+	log "changing the FSBL clock: $(installed) -> $want"
+	if [ -n "$B" ]; then
+		flash_unlock /dev/mtd$B > /dev/null 2>&1
+		flashcp $T/new /dev/mtd$B && [ "$(sum < /dev/mtd$B)" = "$(sum < $T/new)" ] || { log "qspi-bootcopy write/verify failed, clock not changed"; rm -rf $T; exit 1; }
+	fi
+	flash_unlock /dev/mtd$Z > /dev/null 2>&1
+	flash_erase /dev/mtd$Z 0 1 > /dev/null 2>&1 && dd if=$C/$want.blk0 of=/dev/mtd$Z bs=65536 count=1 conv=notrunc 2>/dev/null
+	if [ "$(dd if=/dev/mtd$Z bs=65536 count=1 2>/dev/null | sum)" != "$(sum < $C/$want.blk0)" ]; then
+		flash_erase /dev/mtd$Z 0 1 > /dev/null 2>&1; dd if=$T/old.blk0 of=/dev/mtd$Z bs=65536 count=1 conv=notrunc 2>/dev/null
+		if [ "$(dd if=/dev/mtd$Z bs=65536 count=1 2>/dev/null | sum)" = "$(sum < $T/old.blk0)" ]; then
+			log "CRITICAL: the new FSBL block did not verify; the previous one was written back"
+		else log "CRITICAL: FSBL block 0 neither new nor old after the write: do not power off, restore boot.frm or use DFU"; fi
+		[ -n "$B" ] && flashcp $T/cur /dev/mtd$B; rm -rf $T; exit 1
+	fi
+	rm -rf $T; sync; log "FSBL clock $want installed, rebooting once"; sleep 2; reboot ;;
+*) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

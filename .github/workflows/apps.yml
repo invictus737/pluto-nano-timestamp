@@ -4,8 +4,8 @@ name: apps.frm (application slot)
 #   nexus-apps.tar.xz    contrib/pluto/apps verbatim (provision.sh, start.sh, defaults/ at the top level)
 #   svxlink-root.tar.xz  sanitized SvxLink tree (bin lib share var etc/svxlink at the top level)
 #   SHA256SUMS           sha256sum lines for the three files above
-# plus the pinned Tezuka v0.3.24 Nano boot images, and publishes apps.frm (no FSBL), apps-stock-clock.frm,
-# apps-cpu495-ddr396.frm, apps-cpu950-ddr600.frm, apps-cpu1100-ddr750.frm, SHA256SUMS and README.md as an artifact and as release
+# plus the pinned Tezuka v0.3.24 Nano standard boot image, and publishes apps.frm (no FSBL), apps-stock-clock.frm
+# (standard-clock FSBL, recovery), SHA256SUMS and README.md as an artifact and as release
 # apps-<inputs_tag>.
 on:
   # push only registers the workflow on this (non-default) branch; the job runs on dispatch
@@ -42,12 +42,12 @@ jobs:
             echo "| file | FSBL written | bytes | sha256 |"
             echo "|---|---|---|---|"
             echo "| \`apps.frm\` | none: the installed FSBL/clock is kept | $(stat -c %s apps.frm) | \`$(sha256sum apps.frm | cut -c1-16)…\` |"
-            for v in $TZ_VARIANTS; do
-              case $v in std) f=apps-stock-clock.frm ;; *) f=apps-$v.frm ;; esac
-              echo "| \`$f\` | $(tezuka_label $v) | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
-            done
+            echo "| \`apps-stock-clock.frm\` | standard clocks (Tezuka default): recovery path back from an overclock | $(stat -c %s apps-stock-clock.frm) | \`$(sha256sum apps-stock-clock.frm | cut -c1-16)…\` |"
             echo
-            echo "FSBLs: Tezuka v0.3.24 Nano files, sha256-pinned. Inputs: release \`$APPS_INPUTS_TAG\`; built by run ${{ github.run_id }} at $(git rev-parse --short HEAD). Full checksums: SHA256SUMS."
+            echo "Change the CPU/DDR clock with config.txt \`[SYSTEM] cpu_clock\` / \`nexus-clock\` instead:"
+            for v in $TZ_VARIANTS; do echo "- \`cpu_clock = $(tezuka_setting $v)\`: $(tezuka_label $v)"; done
+            echo
+            echo "FSBL: Tezuka v0.3.24 Nano BOOT.bin, sha256-pinned. Inputs: release \`$APPS_INPUTS_TAG\`; built by run ${{ github.run_id }} at $(git rev-parse --short HEAD). Full checksums: SHA256SUMS."
           } > README.md
           cat README.md
       - uses: actions/upload-artifact@v4

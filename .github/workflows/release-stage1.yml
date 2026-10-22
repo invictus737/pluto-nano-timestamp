@@ -29,6 +29,7 @@ jobs:
         run: |
           sudo apt-get install -y -q u-boot-tools > /dev/null
           firmware/build-boot-frm.sh - boot
+          rm -f run/boot-cpu*.frm   # older runs also built clock variants: not published
           for f in run/boot*.frm; do cmp "$f" "boot/${f#run/}" || { echo "${f#run/} differs from the run's"; exit 1; }; echo "${f#run/} identical to the run's"; done
           mkdir -p out && cp run/pluto.frm run/pluto.dfu boot/boot*.frm out/
           cd out && sha256sum pluto.frm pluto.dfu boot*.frm > SHA256SUMS && cat SHA256SUMS
@@ -39,20 +40,17 @@ jobs:
           { echo "# $TAG"
             echo
             echo "Stage 1 standalone firmware for the HamGeek Pluto Nano (pluto-nano-timestamp ${SHA:0:7}, firmware.yml run $RUN)."
-            echo "Copy \`pluto.frm\` and **exactly one** boot file to the USB drive, then eject."
-            echo "From the STOCK firmware the update only recognises the name \`boot.frm\`: rename the chosen boot file"
-            echo "to \`boot.frm\` on the drive. This firmware accepts the long names (exactly one at a time)."
+            echo "Copy \`pluto.frm\` and \`boot.frm\` together to the USB drive, then eject."
+            echo "The CPU/DDR clock is a setting (config.txt \`[SYSTEM] cpu_clock\`, \`nexus-clock\`), default standard:"
+            for v in $TZ_VARIANTS; do echo "- \`cpu_clock = $(tezuka_setting $v)\`: $(tezuka_label $v)"; done
             echo
             echo "| file | content | bytes | sha256 |"
             echo "|---|---|---|---|"
             echo "| \`pluto.frm\` | OS (FIT + md5), for every boot variant | $(stat -c %s pluto.frm) | \`$(sha256sum pluto.frm | cut -c1-16)…\` |"
             echo "| \`pluto.dfu\` | the same FIT without trailer, for a U-Boot DFU RAM boot only | $(stat -c %s pluto.dfu) | \`$(sha256sum pluto.dfu | cut -c1-16)…\` |"
-            for v in $TZ_VARIANTS; do
-              case $v in std) f=boot.frm ;; *) f=boot-$v.frm ;; esac
-              echo "| \`$f\` | FSBL $(tezuka_label $v); same U-Boot + NexusBS env | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
-            done
+            echo "| \`boot.frm\` | Tezuka FSBL (standard clocks) + U-Boot + NexusBS env | $(stat -c %s boot.frm) | \`$(sha256sum boot.frm | cut -c1-16)…\` |"
             echo
-            echo "All boot files are Tezuka v0.3.24 Nano images (sha256-pinned) with the same U-Boot; they differ from \`boot.frm\` only in FSBL bytes of the first 64 KiB block (and the md5 trailer). Full checksums: SHA256SUMS."
+            echo "boot.frm carries the Tezuka v0.3.24 Nano BOOT.bin (sha256-pinned). Full checksums: SHA256SUMS."
           } > README.md
           cat README.md
       - name: Release

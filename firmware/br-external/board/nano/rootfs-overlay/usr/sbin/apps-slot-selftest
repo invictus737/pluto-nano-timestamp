@@ -15,12 +15,12 @@ MB=112
 dd if=/dev/mtd$L of=$T/mirror bs=65536 skip=$MB count=1 2>/dev/null
 dd if=/dev/urandom of=$T/pat bs=65536 count=1 2>/dev/null
 flash_unlock /dev/mtd$A > /dev/null 2>&1
-flash_erase /dev/mtd$A $((SB * 65536)) 1 > /dev/null && dd if=$T/pat of=/dev/mtd$A bs=65536 seek=$SB count=1 2>/dev/null
+flash_erase /dev/mtd$A $((SB * 65536)) 1 > /dev/null && dd if=$T/pat of=/dev/mtd$A bs=65536 seek=$SB count=1 conv=notrunc 2>/dev/null
 rb=$(blkmd5 $A $SB); pm=$(md5sum < $T/pat | cut -d' ' -f1); mm=$(blkmd5 $L $MB); m0=$(md5sum < $T/mirror | cut -d' ' -f1)
 flash_erase /dev/mtd$A $((SB * 65536)) 1 > /dev/null
 if [ "$mm" != "$m0" ]; then
 	echo "FAILED: the write reached the lower bank (aliasing); restoring the mirror block"
-	flash_erase /dev/mtd$L $((MB * 65536)) 1 > /dev/null && dd if=$T/mirror of=/dev/mtd$L bs=65536 seek=$MB count=1 2>/dev/null
+	flash_erase /dev/mtd$L $((MB * 65536)) 1 > /dev/null && dd if=$T/mirror of=/dev/mtd$L bs=65536 seek=$MB count=1 conv=notrunc 2>/dev/null
 	[ "$(blkmd5 $L $MB)" = "$m0" ] && echo "mirror restored" || echo "CRITICAL: mirror block not restored, reflash pluto.frm"
 	rm -rf $T; exit 1
 fi

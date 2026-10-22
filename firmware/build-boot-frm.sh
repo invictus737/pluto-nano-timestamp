@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 # boot*.frm for the mass-storage update path (update.sh handle_boot_frm): boot.bin (FSBL + U-Boot)
 # + 128 KiB U-Boot environment + the Pluto mtd-info block + md5, the layout plutosdr-fw builds.
-# boot.bin: Tezuka v0.3.24 Nano images (tezuka-boot.sh), environment: uboot/uboot-env-nexus.txt.
-#   boot.frm                 standard clocks
-#   boot-cpu495-ddr396.frm   Tezuka FSBL CPU 495 MHz / DDR 396 MT/s
-#   boot-cpu950-ddr600.frm   Tezuka FSBL CPU 950 MHz / DDR 600 MT/s
-#   boot-cpu1100-ddr750.frm  Tezuka FSBL CPU 1100 MHz / DDR 750 MT/s   (labels: tezuka_label)
-# All share U-Boot and environment; the build checks they differ from boot.frm only in FSBL bytes of
-# the first 64 KiB block. The STOCK update.sh only looks for the name boot.frm.
+# boot.bin: the Tezuka v0.3.24 Nano BOOT.bin with the standard clocks (the CPU/DDR clock is a setting,
+# config.txt cpu_clock / nexus-clock, not a separate boot file); environment: uboot/uboot-env-nexus.txt.
 # usage: build-boot-frm.sh <plutosdr-fw checkout or -> <output dir>
 set -euo pipefail
 FW=${1:?plutosdr-fw or -}; OUT=$(mkdir -p "${2:?out}" && cd "$2" && pwd); HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,21 +17,10 @@ echo "$KEY_SHA  $KEY" | sha256sum -c --status || { echo "mtd-info key checksum m
 grep -v '^#' "$HERE/uboot/uboot-env-nexus.txt" > "$OUT/uboot-env-nexus.txt"
 ! grep -i -E '^(ssid_wlan|pwd_wlan|xo_correction)=' "$OUT/uboot-env-nexus.txt" || { echo "credentials/device values in the env"; exit 1; }
 mkenvimage -s 0x20000 -o "$W/uboot-env.bin" "$OUT/uboot-env-nexus.txt"
-for v in $TZ_VARIANTS; do
+for v in std; do
 	tezuka_boot "$v" "$W/boot-$v.bin"
 	case $v in std) n=boot.frm ;; *) n=boot-$v.frm ;; esac
 	cat "$W/boot-$v.bin" "$W/uboot-env.bin" "$KEY" > "$W/body"
 	{ cat "$W/body"; md5sum "$W/body" | cut -d' ' -f1; } > "$OUT/$n"
 	echo "$n: $TZ_DESC, $(stat -c %s "$OUT/$n") bytes"
 done
-# variants: same length, differences only inside the first 64 KiB (FSBL, ps7_init) and in the trailer
-python3 -I - "$OUT" <<'PY'
-import sys, os
-d = sys.argv[1]; ref = open(os.path.join(d, 'boot.frm'), 'rb').read()
-for n in ('boot-cpu495-ddr396.frm', 'boot-cpu950-ddr600.frm', 'boot-cpu1100-ddr750.frm'):
-    b = open(os.path.join(d, n), 'rb').read()
-    assert len(b) == len(ref), n
-    diff = [i for i in range(len(ref) - 33) if ref[i] != b[i]]
-    assert diff and diff[-1] < 0x10000, (n, hex(diff[-1]) if diff else None)
-    print("%s: %d bytes differ from boot.frm, all in 0x%x..0x%x (FSBL), plus the md5 trailer" % (n, len(diff), diff[0], diff[-1]))
-PY

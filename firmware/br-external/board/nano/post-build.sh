@@ -71,11 +71,24 @@ s = s.replace(b, b + "\techo \"# NexusBS station role [slave|master]: slave = SD
 rep("\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n",
     "\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n"
     "\tUSB_MODE=`fw_printenv -n usb_mode 2> /dev/null || echo peripheral`\n")
+# config.txt [SYSTEM] cpu_clock / cpu_clock_cooling_confirmed (nexus-clock, S22clock)
+rep("\tUSB_MODE=`fw_printenv -n usb_mode 2> /dev/null || echo peripheral`\n",
+    "\tUSB_MODE=`fw_printenv -n usb_mode 2> /dev/null || echo peripheral`\n"
+    "\tCPU_CLOCK=`fw_printenv -n cpu_clock 2> /dev/null`; case \"$CPU_CLOCK\" in standard|495_396|950_600|1100_750) ;; *) CPU_CLOCK=standard ;; esac\n"
+    "\tCPU_COOL=`fw_printenv -n cpu_clock_cooling_confirmed 2> /dev/null`; [ \"$CPU_COOL\" = yes ] || CPU_COOL=no\n")
 rep("\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n",
     "\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n"
     "\techo \"# USB-C role [peripheral|auto|host]: peripheral = a computer is the host (default), host = hub with a\"$'\\r' >> $CONF\n"
     "\techo \"# Wi-Fi/Ethernet adapter, auto = host when no computer configures the port (applied at the next boot)\"$'\\r' >> $CONF\n"
-    "\techo \"usb_mode = $USB_MODE\"$'\\r' >> $CONF\n")
+    "\techo \"usb_mode = $USB_MODE\"$'\\r' >> $CONF\n"
+    "\techo \"# CPU/DDR clock [standard|495_396|950_600|1100_750], applied at the next boot by rewriting the 64 KiB\"$'\\r' >> $CONF\n"
+    "\techo \"# FSBL block (< 1 s; a power cut during it needs DFU/JTAG recovery). standard = Tezuka default.\"$'\\r' >> $CONF\n"
+    "\techo \"# 1100_750 = CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B)\"$'\\r' >> $CONF\n"
+    "\techo \"# with heatsinks and a fan installed only, above the -1 speed grade spec; active cooling required,\"$'\\r' >> $CONF\n"
+    "\techo \"# set cpu_clock_cooling_confirmed = yes or it is refused. 495_396 / 950_600: Tezuka files, not tested\"$'\\r' >> $CONF\n"
+    "\techo \"# on the reference board.\"$'\\r' >> $CONF\n"
+    "\techo \"cpu_clock = $CPU_CLOCK\"$'\\r' >> $CONF\n"
+    "\techo \"cpu_clock_cooling_confirmed = $CPU_COOL\"$'\\r' >> $CONF\n")
 open(net, "w").write(s)
 u = open(upd).read()
 w = "\t\techo \"pwd_wlan $pwd_wlan\" >> /opt/fw_set.tmp\n"
@@ -86,7 +99,14 @@ assert u.count(c) == 1, "update.sh: netmask_eth line not found"
 u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master) ;; *) operating_mode=slave ;; esac\n"
                      "\t\techo \"operating_mode $operating_mode\" >> /opt/fw_set.tmp\n"
                      "\t\tcase \"$usb_mode\" in auto|host) ;; *) usb_mode=peripheral ;; esac\n"
-                     "\t\techo \"usb_mode $usb_mode\" >> /opt/fw_set.tmp\n")
+                     "\t\techo \"usb_mode $usb_mode\" >> /opt/fw_set.tmp\n"
+                     "\t\told_clock=`fw_printenv -n cpu_clock 2> /dev/null || echo standard`\n"
+                     "\t\tcase \"$cpu_clock\" in standard|495_396|950_600|1100_750) ;; *) cpu_clock=standard ;; esac\n"
+                     "\t\t[ \"$cpu_clock_cooling_confirmed\" = yes ] || cpu_clock_cooling_confirmed=no\n"
+                     "\t\tif [ \"$cpu_clock\" = 1100_750 ] && [ \"$cpu_clock_cooling_confirmed\" != yes ]; then logger -t nexus-clock \"cpu_clock 1100_750 refused: cpu_clock_cooling_confirmed is not yes\"; cpu_clock=$old_clock; fi\n"
+                     "\t\techo \"cpu_clock $cpu_clock\" >> /opt/fw_set.tmp\n"
+                     "\t\techo \"cpu_clock_cooling_confirmed $cpu_clock_cooling_confirmed\" >> /opt/fw_set.tmp\n"
+                     "\t\t[ \"$cpu_clock\" != \"$old_clock\" ] && do_reset=1\n")
 d = "\t\ttouch /mnt/msd/SUCCESS_ENV_UPDATE\n"
 assert u.count(d) == 1, "update.sh: SUCCESS_ENV_UPDATE not found"
 u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n")

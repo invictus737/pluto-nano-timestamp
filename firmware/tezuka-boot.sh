@@ -29,3 +29,5 @@ tezuka_label() {
 	cpu1100-ddr750) echo "CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed, ran for days; above the -1 speed grade spec, active cooling required" ;;
 	esac
 }
+# config.txt cpu_clock value of a variant (tezuka_setting <variant>)
+tezuka_setting() { case "$1" in std) echo standard ;; cpu495-ddr396) echo 495_396 ;; cpu950-ddr600) echo 950_600 ;; cpu1100-ddr750) echo 1100_750 ;; esac; }

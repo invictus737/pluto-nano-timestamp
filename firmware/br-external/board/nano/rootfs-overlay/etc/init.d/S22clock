@@ -1,0 +1,5 @@
+#!/bin/sh
+# CPU/DDR clock from the U-Boot environment (config.txt [SYSTEM] cpu_clock): nexus-clock apply writes
+# the FSBL block 0 only when it differs from the configured variant, then reboots once.
+case "$1" in start) [ -x /usr/sbin/nexus-clock ] && /usr/sbin/nexus-clock apply ;; esac
+exit 0

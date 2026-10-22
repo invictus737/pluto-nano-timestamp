@@ -7,6 +7,8 @@ FW=${1:?plutosdr-fw checkout}; XSA=${2:?system_top.xsa}; HERE=$(cd "$(dirname "$
 # generated rootfs overlay (kernel modules, AIC8800 firmware; btop from build-btop.sh), the second
 # entry of BR2_ROOTFS_OVERLAY
 OVLG=$HERE/work-overlay; mkdir -p "$OVLG"
+# CPU/DDR clock variants (FSBL block 0 of each Tezuka Nano image) for nexus-clock
+"$HERE/build-clock-blocks.sh" "$OVLG"
 # AIC8800 Wi-Fi driver into the kernel tree (must precede the kernel configuration)
 "$HERE/aic8800-intree.sh" "$FW/linux" "$OVLG"
 mkdir -p "$FW/build" && cp "$XSA" "$FW/build/system_top.xsa"
