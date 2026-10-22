@@ -1,0 +1,37 @@
+name: apps.frm (application slot)
+# Assembles apps.frm from the release assets of tag `inputs_tag` in this repository:
+#   nexus2               stripped ARMv7 musl (armv7-unknown-linux-musleabihf) ELF
+#   nexus-apps.tar.xz    contrib/pluto/apps verbatim (provision.sh, start.sh, defaults/ at the top level)
+#   svxlink-root.tar.xz  sanitized SvxLink tree (bin lib share var etc/svxlink at the top level)
+#   SHA256SUMS           sha256sum lines for the three files above
+# plus the pinned Tezuka v0.3.24 Nano BOOT_fsbl_CPU1100_DDR750, and publishes apps.frm + SHA256SUMS as an
+# artifact and as release apps-<inputs_tag>.
+on:
+  workflow_dispatch:
+    inputs:
+      inputs_tag: { description: 'release tag holding the inputs', required: true, type: string }
+      with_boot: { description: 'carry the 1100/750 FSBL (boot.bin)', default: true, type: boolean }
+permissions: { contents: write }
+jobs:
+  apps:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}', APPS_INPUTS_TAG: '${{ inputs.inputs_tag }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inputs from release ${{ inputs.inputs_tag }}
+        run: |
+          mkdir -p in
+          for a in nexus2 nexus-apps.tar.xz svxlink-root.tar.xz SHA256SUMS; do
+            gh release download "$APPS_INPUTS_TAG" --pattern "$a" --dir in
+          done
+          ls -la in
+      - name: Assemble apps.frm
+        run: firmware/build-apps-frm.sh in out ${{ inputs.with_boot && ' ' || '--no-boot' }}
+      - uses: actions/upload-artifact@v4
+        with: { name: 'apps-${{ inputs.inputs_tag }}', path: "out/apps.frm\nout/SHA256SUMS", if-no-files-found: error }
+      - name: Release apps-${{ inputs.inputs_tag }}
+        run: |
+          T="apps-$APPS_INPUTS_TAG"
+          gh release view "$T" > /dev/null 2>&1 || gh release create "$T" --title "$T" --notes "apps.frm built by run ${{ github.run_id }} from release $APPS_INPUTS_TAG ($(git rev-parse --short HEAD))" --target "$GITHUB_SHA"
+          gh release upload "$T" out/apps.frm out/SHA256SUMS --clobber

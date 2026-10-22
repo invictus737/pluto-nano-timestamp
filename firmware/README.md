@@ -97,6 +97,11 @@ one 64 KiB erase+program. /mnt/data is never touched.
 At boot `S95apps` verifies the slot (header, payload md5) and unpacks it to `/opt/apps`, runs
 `provision.sh`; `S97app` runs `start.sh` in `/mnt/data/nexus2` in the master role (a legacy
 `/mnt/data/nexus2/app.conf` is then not started). An invalid or missing slot leaves a standalone SDR.
+Built on CI by `.github/workflows/apps.yml` (`firmware/build-apps-frm.sh`): inputs are the assets of a
+release in this repository (`nexus2`, `nexus-apps.tar.xz` = contrib/pluto/apps with `provision.sh` and
+`start.sh` at its top level, `svxlink-root.tar.xz` = `bin lib share var etc/svxlink` at its top level,
+`SHA256SUMS` for those three); the output is attached to release `apps-<tag>`. The build refuses any
+secret-looking `key=value` that is not a placeholder.
 `nexus-setup.txt` on the USB drive is copied to `/mnt/data/nexus2/setup.txt` (0600), removed from the
 drive, and the Pluto reboots. `apps-slot-selftest --yes` is a one-off write test of the upper bank
 (empty slot only).
