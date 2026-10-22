@@ -68,7 +68,7 @@ do_usb_mode() {
 station_ppm() { awk '/^[[:space:]]*\[/ { s = ($0 ~ /^[[:space:]]*\[radio\][[:space:]]*(#.*)?$/) } s && /^[[:space:]]*ppm[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, ""); if ($0 + 0 != 0) print; exit }' "$STATION/nexus2.toml" 2>/dev/null; }
 xo_notes() {
 	say "(ppm = (xo - 40000000) / 40000000 x 1e6; a slow crystal tunes the radio low and has xo below 40000000;"
-	say " 1 ppm = 438 Hz at 438 MHz. Keep [radio] ppm = 0 in nexus2.toml on a Pluto: see the Pluto manual, chapter "Crystal correction")"
+	say " 1 ppm = 438 Hz at 438 MHz. Keep [radio] ppm = 0 in nexus2.toml on a Pluto: see the Pluto manual, chapter 'Crystal correction')"
 	p=$(station_ppm); [ -z "$p" ] || say "WARNING: $STATION/nexus2.toml has [radio] ppm = $p: set it to 0, the crystal correction already covers the LO and the sample clock"
 }
 do_xo_correction() {
@@ -487,7 +487,7 @@ menu_system() {
 				slave "SDR for an external NexusBS" master "NexusBS on this Pluto") && act "Station role" do_role "$v" ;;
 		3) v=$(dlg --title "USB mode" --default-item "$(get usb_mode)" --menu "USB-C port role, applied at the next boot.\nperipheral: a computer is the USB host (USB network, drive, SDR over USB).\nauto: peripheral; host when no computer configures the port within 20 s.\nhost: always host (hub with Wi-Fi/Ethernet adapters); a computer no longer sees the Pluto." 16 76 3 \
 				peripheral "a computer is the host (default)" auto "host when no computer is found" host "always host") && act "USB mode" do_usb_mode "$v" ;;
-		4) v=$(dlg --title "Crystal correction" --inputbox "Measured frequency of this board's 40 MHz crystal in Hz (+/-250 ppm),\ne.g. 39999331. ppm = (xo - 40000000) / 40000000 x 1e6 (39999331 = -16.725).\nA slow crystal tunes the radio low: xo below 40000000. 1 ppm = 438 Hz\nat 438 MHz. Keep [radio] ppm = 0 in nexus2.toml. 'default' removes it.\nActive at the next boot. Pluto manual: chapter "Crystal correction"" 14 78 "$x") || continue
+		4) v=$(dlg --title "Crystal correction" --inputbox "Measured frequency of this board's 40 MHz crystal in Hz (+/-250 ppm),\ne.g. 39999331. ppm = (xo - 40000000) / 40000000 x 1e6 (39999331 = -16.725).\nA slow crystal tunes the radio low: xo below 40000000. 1 ppm = 438 Hz\nat 438 MHz. Keep [radio] ppm = 0 in nexus2.toml. 'default' removes it.\nActive at the next boot. Pluto manual: chapter 'Crystal correction'" 14 78 "$x") || continue
 		   [ "$v" = default ] && { act "Crystal correction" do_xo_correction default; continue; }
 		   now=; dlg --title "Crystal correction" --defaultno --yesno "Apply $v Hz ($(ppm "$v" 2>/dev/null) ppm) to the AD9361 now as well?\nThe radio retunes; a running NexusBS should be restarted afterwards." 9 76 && now=--now
 		   act "Crystal correction" do_xo_correction "$v" $now ;;
