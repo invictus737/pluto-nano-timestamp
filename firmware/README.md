@@ -207,7 +207,7 @@ network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and bac
 | NexusBS log | `do_station_log [LINES]` | tail of `/var/log/nexus.log` |
 | 5 Update: Versions | `get versions` | firmware, application slot, U-Boot, FSBL clock variant, kernel |
 | How to update | | the USB drive `.frm` procedure (pluto.frm, boot.frm, apps*.frm, nexus-setup.txt) |
-| Backup /mnt/data | `do_backup PATH\|-` | tar.gz (0600; holds passwords and keys) to a file or directory (a stick under /media, or /tmp = RAM), or to stdout: `ssh root@pluto.local nexus-config nonint do_backup - > pluto-data.tar.gz`. Restore: `tar -xzf FILE -C /mnt/data` and reboot |
+| Backup /mnt/data | `do_backup PATH\|-` | tar.gz (0600; holds passwords and keys) to a file or directory (a stick under /media, or /tmp = RAM), or to stdout: `ssh root@pluto.local nexus-config nonint do_backup - > pluto-data.tar.gz`. Restore: `gunzip -c FILE \| tar -x -C /mnt/data` (busybox tar has no -z here) and reboot |
 | Factory reset | `do_factory_reset ERASE-ALL-DATA` | erases /mnt/data (network, NexusBS station, pairings, SSH host keys; the U-Boot env stays); the menu asks twice. Reboot afterwards |
 | 6 About / help | `help` | |
 

@@ -355,7 +355,7 @@ do_backup() {
 	case "$d" in /mnt/data|/mnt/data/*) err "the backup cannot be written inside /mnt/data"; return 1 ;; esac
 	[ -d "$P$d" ] && d=$d/nexus-data-$(date +%Y%m%d-%H%M%S).tar.gz
 	tar -c -C "$DATA" . | gzip > "$P$d" && chmod 600 "$P$d" || { rm -f "$P$d"; err "backup failed"; return 1; }
-	log "backup written to $d"; say "backup: $d ($(wc -c < "$P$d") bytes, 0600; it contains passwords and keys; restore: tar -xzf FILE -C /mnt/data)"
+	log "backup written to $d"; say "backup: $d ($(wc -c < "$P$d") bytes, 0600; it contains passwords and keys; restore: gunzip -c FILE | tar -x -C /mnt/data)"
 }
 do_factory_reset() {
 	[ "${1:-}" = ERASE-ALL-DATA ] || { err "do_factory_reset ERASE-ALL-DATA: erases /mnt/data (network, NexusBS station, pairings, SSH host keys)"; return 2; }
