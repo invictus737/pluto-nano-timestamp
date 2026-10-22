@@ -4,8 +4,8 @@ name: apps.frm (application slot)
 #   nexus-apps.tar.xz    contrib/pluto/apps verbatim (provision.sh, start.sh, defaults/ at the top level)
 #   svxlink-root.tar.xz  sanitized SvxLink tree (bin lib share var etc/svxlink at the top level)
 #   SHA256SUMS           sha256sum lines for the three files above
-# plus the pinned Tezuka v0.3.24 Nano boot images, and publishes apps.frm (no FSBL), apps-cpu950-ddr600.frm,
-# apps-cpu1100-ddr750.frm, apps-stock-clock.frm, SHA256SUMS and README.md as an artifact and as release
+# plus the pinned Tezuka v0.3.24 Nano boot images, and publishes apps.frm (no FSBL), apps-cpu1100-ddr750.frm,
+# apps-stock-clock.frm, SHA256SUMS and README.md as an artifact and as release
 # apps-<inputs_tag>.
 on:
   # push only registers the workflow on this (non-default) branch; the job runs on dispatch
@@ -32,7 +32,7 @@ jobs:
       - name: Assemble apps.frm
         run: |
           firmware/build-apps-frm.sh in out | tee build.txt
-          cd out && sha256sum apps*.frm > SHA256SUMS
+          cd out && rm -f apps-cpu950-ddr600.frm && sha256sum apps*.frm > SHA256SUMS
           { echo "# apps-$APPS_INPUTS_TAG"
             echo
             echo "Application slot for the pluto-nano-timestamp v0.39-std firmware (stage 1 must be installed)."
@@ -40,9 +40,9 @@ jobs:
             echo
             echo "| file | FSBL written | bytes | sha256 |"
             echo "|---|---|---|---|"
-            for f in apps.frm apps-stock-clock.frm apps-cpu950-ddr600.frm apps-cpu1100-ddr750.frm; do
+            for f in apps.frm apps-stock-clock.frm apps-cpu1100-ddr750.frm; do
               case $f in apps.frm) c="none (installed clock kept)" ;; apps-stock-clock.frm) c="standard clocks" ;;
-                apps-cpu950-ddr600.frm) c="CPU 950 MHz, DDR 600 MT/s" ;; apps-cpu1100-ddr750.frm) c="CPU 1100 MHz, DDR 750 MT/s" ;; esac
+                apps-cpu1100-ddr750.frm) c="CPU 1100 MHz, DDR 750 MT/s: tested on the reference board only (HamGeek Pluto Nano Rev.B) WITH HEATSINKS AND A FAN INSTALLED, ran for days; not a Tezuka-published test result; above the -1 speed grade spec — do not use without active cooling" ;; esac
               echo "| \`$f\` | $c | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
             done
             echo

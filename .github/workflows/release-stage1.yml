@@ -22,7 +22,9 @@ jobs:
           SHA=$(gh run view "$RUN" --json headSha -q .headSha); echo "SHA=$SHA" >> "$GITHUB_ENV"; echo "TAG=stage1-${SHA:0:7}" >> "$GITHUB_ENV"
           gh run download "$RUN" -n pluto-nano-timestamp-frm -D out
           cd out && rm -f *.md5 && ls -la
-          for f in pluto.frm boot.frm boot-cpu950-ddr600.frm boot-cpu1100-ddr750.frm; do [ -s $f ] || { echo "missing $f"; exit 1; }; done
+          # the 950/600 variant is not published (untested); older runs still built it
+          rm -f boot-cpu950-ddr600.frm
+          for f in pluto.frm boot.frm boot-cpu1100-ddr750.frm; do [ -s $f ] || { echo "missing $f"; exit 1; }; done
           [ $(stat -c %s pluto.frm) -le 14680064 ] || { echo "pluto.frm above 14 MiB"; exit 1; }
           sha256sum pluto.frm pluto.dfu boot*.frm > SHA256SUMS
       - name: README
@@ -37,12 +39,11 @@ jobs:
             echo
             echo "| file | content | bytes | sha256 |"
             echo "|---|---|---|---|"
-            for f in pluto.frm pluto.dfu boot.frm boot-cpu950-ddr600.frm boot-cpu1100-ddr750.frm; do
+            for f in pluto.frm pluto.dfu boot.frm boot-cpu1100-ddr750.frm; do
               case $f in
                 pluto.frm) c="OS (FIT + md5), for every variant" ;; pluto.dfu) c="the same FIT without trailer, for a U-Boot DFU RAM boot only" ;;
                 boot.frm) c="Tezuka FSBL standard clocks + U-Boot + NexusBS env" ;;
-                boot-cpu950-ddr600.frm) c="FSBL CPU 950 MHz / DDR 600 MT/s, same U-Boot + env" ;;
-                boot-cpu1100-ddr750.frm) c="FSBL CPU 1100 MHz / DDR 750 MT/s, same U-Boot + env" ;;
+                boot-cpu1100-ddr750.frm) c="FSBL CPU 1100 MHz / DDR 750 MT/s, same U-Boot + env; tested on the reference board only (HamGeek Pluto Nano Rev.B) WITH HEATSINKS AND A FAN INSTALLED, ran for days; not a Tezuka-published test result; above the -1 speed grade spec — do not use without active cooling" ;;
               esac
               echo "| \`$f\` | $c | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
             done
@@ -51,7 +52,7 @@ jobs:
           } > README.md
           python3 - <<'PY'
           ref = open('boot.frm', 'rb').read()
-          for n in ('boot-cpu950-ddr600.frm', 'boot-cpu1100-ddr750.frm'):
+          for n in ('boot-cpu1100-ddr750.frm',):
               b = open(n, 'rb').read(); d = [i for i in range(len(ref) - 33) if ref[i] != b[i]]
               assert len(b) == len(ref) and d and d[-1] < 0x10000
               print(n, len(d), 'bytes differ, 0x%x..0x%x' % (d[0], d[-1]))
