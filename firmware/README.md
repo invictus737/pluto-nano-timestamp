@@ -34,19 +34,72 @@ The Xilinx spi-nor path on the Zynq QSPI keeps 3-byte addresses above 16 MiB and
 with the flash's extended address register (EAR). It only knew Spansion/Micron/Macronix/PMC: on the
 Winbond the EAR read failed (`failed to read ear reg`) and its write went out without Write Enable,
 so every access above 16 MiB wrapped onto the lower half. Patch 0002 adds Winbond (0xEF: RDEAR 0xC8,
-WREN + WREAR 0xC5); `spi_nor_shutdown` returns the EAR to 0 before a reboot.
+WREN + WREAR 0xC5); `spi_nor_shutdown` returns the EAR to 0 before a reboot. U-Boot (vendor and
+Tezuka 2025.01) addresses the whole flash correctly (verified: `sf read`/`crc32` of blocks at 0x0,
+0x100000, 0xFF0000, 0x1000000 and 0x1100000 equal the Linux mtd reads).
+
+The **stock** HamGeek/ADI kernel lacks that patch and declares qspi-linux as 30 MiB: its update.sh
+`dd`s pluto.frm to mtdblock3, so anything past 0x1000000 lands on 0x0 (FSBL/U-Boot). A pluto.frm
+installed from stock firmware must therefore be <= 14 MiB **including** its md5 trailer
+(`build-fw.sh` checks it, with a 13.5 MiB target).
 
 | offset | size | partition | |
 |---|---|---|---|
-| 0x0000000 | 1 MiB | qspi-fsbl-uboot | vendor FSBL + U-Boot |
-| 0x0100000 | 128 KiB | qspi-uboot-env | |
+| 0x0000000 | 1 MiB | qspi-fsbl-uboot | FSBL + U-Boot (boot.frm; apps.frm may replace the FSBL) |
+| 0x0100000 | 128 KiB | qspi-uboot-env | U-Boot environment (`uboot/uboot-env-nexus.txt`) |
 | 0x0120000 | 896 KiB | qspi-nvmfs | JFFS2 `/mnt/jffs2` (stock) |
-| 0x0200000 | 14 MiB | qspi-linux | `pluto.frm` (FIT), must stay below 16 MiB (`build-fw.sh` checks) |
-| 0x1000000 | 1 MiB | qspi-bootcopy | read-only copy of qspi-fsbl-uboot: the BootROM starts here after a reset with EAR=1 |
-| 0x1100000 | 15 MiB | qspi-data | UBIFS `/mnt/data` (S21data), applications (S97app) and their data |
+| 0x0200000 | 14 MiB | qspi-linux | `pluto.frm` (FIT) |
+| 0x1000000 | 1 MiB | qspi-bootcopy | copy of qspi-fsbl-uboot: the BootROM starts here after a reset with EAR=1; kept equal by apps.frm |
+| 0x1100000 | 9 MiB | qspi-apps | application slot (apps.frm), read only at run time |
+| 0x1A00000 | 6 MiB | qspi-data | UBIFS `/mnt/data` (S21data): configuration and application data |
 
 S21data formats an empty or foreign qspi-data only when the EAR is readable and the partition does
-not read back the lower bank; it warns when qspi-bootcopy differs from qspi-fsbl-uboot.
+not read back its lower-bank mirror; it warns when qspi-bootcopy differs from qspi-fsbl-uboot. (Up to v0.39-std 0af155a qspi-data was at 0x1100000, 15 MiB: a board updated from that layout gets a
+freshly formatted /mnt/data, back it up first.)
+
+## Install from stock firmware
+
+Copy **pluto.frm and boot.frm together** to the Pluto's USB drive and eject. The stock update.sh
+writes pluto.frm (qspi-linux, `fw_setenv fit_size`), then boot.frm (boot.bin to qspi-fsbl-uboot,
+environment to qspi-uboot-env, after checking the mtd table), and reboots once. boot.frm = Tezuka
+v0.3.24 Nano `BOOT.bin` (standard clocks) + `uboot/uboot-env-nexus.txt` + the plutosdr-fw mtd-info
+block + md5 (`build-boot-frm.sh`). The environment boots with `fit_config=config@1` (Rev.B), takes
+the FIT length from the FIT header (`fdt header get ... totalsize`; boot.frm overwrites the fit_size
+pluto.frm just set), keeps the stock reset-cause DFU/RAM boot (`device_reboot sf|ram`), releases the
+PS-PL level shifters/resets, and carries no network names or credentials. Writing boot.frm has no
+fallback: a power loss during those seconds needs DFU/JTAG recovery. Later updates use the same
+files (our update.sh keeps both handlers).
+
+## Application slot (apps.frm)
+
+Accepted only by this firmware (qspi-apps exists): copy `apps.frm` to the USB drive and eject.
+
+    apps.frm = header (4096 bytes) | payload | [boot.bin] | md5 trailer (33 bytes)
+
+- header: text lines, NUL padded to 4096 bytes; line 1 `NEXUSBS-APPS-FRM 1`, then `key=value`:
+  `payload_size`, `payload_md5`, `bootbin_size` (0 = none), `bootbin_md5`, `bootbin_desc`,
+  `version`, `created`.
+- payload: a tar archive compressed with xz (`--check=crc32`), unpacked at boot to `/opt/apps`.
+  Contract: `nexus/provision.sh <slot dir> /mnt/data` (idempotent, fills only missing files) and
+  `nexus/start.sh` (the application, restarted after any exit).
+- boot.bin: optional Zynq boot image (FSBL + U-Boot), at most 0xFF000 bytes.
+- trailer: md5 of everything before it, hex + newline (the .frm convention).
+
+`apps-frm-install` (called by update.sh): checks the trailer, header, sizes and payload md5; refuses
+when the upper bank is not addressable (EAR unreadable, or the slot reads like its lower-bank
+mirror); writes header + payload to qspi-apps (flashcp, then readback), and checks that the lower
+bank (U-Boot environment, FIT) did not change. Only then a carried boot.bin is written: only the
+64 KiB blocks that differ from the installed boot, qspi-bootcopy first, then qspi-fsbl-uboot from the
+last block to block 0, each read back. For the Tezuka CPU1100_DDR750 FSBL only block 0 differs (36
+bytes of ps7_init data; U-Boot is byte-identical), so U-Boot is not rewritten and the unsafe window is
+one 64 KiB erase+program. /mnt/data is never touched.
+
+At boot `S95apps` verifies the slot (header, payload md5) and unpacks it to `/opt/apps`, runs
+`provision.sh`; `S97app` runs `start.sh` in `/mnt/data/nexus2` in the master role (a legacy
+`/mnt/data/nexus2/app.conf` is then not started). An invalid or missing slot leaves a standalone SDR.
+`nexus-setup.txt` on the USB drive is copied to `/mnt/data/nexus2/setup.txt` (0600), removed from the
+drive, and the Pluto reboots. `apps-slot-selftest --yes` is a one-off write test of the upper bank
+(empty slot only).
 
 ## USB adapters (OTG host)
 

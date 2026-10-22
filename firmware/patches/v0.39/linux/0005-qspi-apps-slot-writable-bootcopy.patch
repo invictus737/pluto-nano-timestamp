@@ -1,0 +1,25 @@
+--- a/arch/arm/boot/dts/zynq-pluto-sdr.dtsi
++++ b/arch/arm/boot/dts/zynq-pluto-sdr.dtsi
+@@ -78,14 +78,19 @@
+ 			reg = <0x200000 0xE00000>; /* 14M: the FIT stays in the lower 16 MiB bank */
+ 		};
+ 		partition@qspi-bootcopy {
+-			/* copy of qspi-fsbl-uboot: the BootROM starts here after a reset with EAR=1 */
++			/* copy of qspi-fsbl-uboot: the BootROM starts here after a reset with EAR=1.
++			 * Writable: the apps.frm handler keeps it equal to qspi-fsbl-uboot. */
+ 			label = "qspi-bootcopy";
+ 			reg = <0x1000000 0x100000>; /* 1M */
+-			read-only;
++		};
++		partition@qspi-apps {
++			/* application slot (apps.frm): 4 KiB header + compressed payload, see firmware/README */
++			label = "qspi-apps";
++			reg = <0x1100000 0x900000>; /* 9M */
+ 		};
+ 		partition@qspi-data {
+ 			label = "qspi-data";
+-			reg = <0x1100000 0xF00000>; /* 15M, UBIFS at /mnt/data */
++			reg = <0x1A00000 0x600000>; /* 6M, UBIFS at /mnt/data */
+ 		};
+ 	};
+ };

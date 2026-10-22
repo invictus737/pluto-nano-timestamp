@@ -28,7 +28,7 @@ jobs:
           ls -la fw/build/ || true
           du -sh fw/buildroot/output/target 2>/dev/null || true
           find fw/buildroot/output/target -name '*.ko' 2>/dev/null | head -20 || true
-          mkdir -p review && cp fw-size-report.txt fw/linux/.config fw/build/rootfs.cpio.zst review/ 2>/dev/null || true
+          mkdir -p review && cp fw-size-report.txt fw/build/rootfs.cpio.xz review/ 2>/dev/null || true; cp fw/linux/.config review/kernel.config 2>/dev/null || true
           (cd fw/buildroot/output/target && find . | sort) > review/rootfs-files.txt 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()

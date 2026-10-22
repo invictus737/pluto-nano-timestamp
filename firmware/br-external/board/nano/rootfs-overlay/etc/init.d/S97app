@@ -6,8 +6,34 @@
 # Each starts only when its configuration exists, restarts after any exit (5 s), and logs to
 # /var/log/<name>.log (RAM). Only in the master role (nexus-role master); in the default slave role
 # the Pluto is an SDR for NexusBS on another computer and starts nothing.
+# The application slot's start.sh (S95apps) follows the same rule.
 [ "$1" = start ] && [ "$(fw_printenv -n operating_mode 2>/dev/null || echo slave)" != master ] && \
   { echo "role slave: SDR for an external NexusBS host (nexus-role master to run it here)"; exit 0; }
+# The application slot (S95apps, apps.frm): /opt/apps/nexus/start.sh, run in /mnt/data/nexus2, restarted
+# after any exit like the app.conf applications. When it is present, a legacy /mnt/data/nexus2/app.conf
+# is not started as well.
+NS=/opt/apps/nexus/start.sh
+if [ -x $NS ]; then
+  : > /var/run/nexus2.seen
+  PID=/var/run/nexus.pid; LOG=/var/log/nexus.log
+  case "$1" in
+  start)
+    mkdir -p /mnt/data/nexus2
+    ( cd /mnt/data/nexus2 || exit 1
+      while :; do
+        [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 2000000 ] && mv "$LOG" "$LOG.1"
+        echo "--- $(date) start" >> "$LOG"
+        APPS_DIR=/opt/apps DATA_DIR=/mnt/data $NS >> "$LOG" 2>&1 < /dev/null
+        echo "--- $(date) exit $?" >> "$LOG"; sleep 5
+      done ) > /dev/null 2>&1 &
+    echo $! > "$PID"; echo "nexus (application slot) started (log $LOG)" ;;
+  stop)
+    [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"
+    for n in nexus2 svxlink; do pids=$(pidof $n) && kill $pids 2>/dev/null; done
+    sleep 3; for n in nexus2 svxlink; do pids=$(pidof $n) && kill -9 $pids 2>/dev/null; done
+    echo "nexus (application slot) stopped" ;;
+  esac
+fi
 for A in /mnt/data/*/app.conf /opt/*/app.conf; do
   [ -f "$A" ] || continue
   NAME= RUN= CONF=; . "$A"

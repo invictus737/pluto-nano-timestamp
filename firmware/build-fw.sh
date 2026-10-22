@@ -52,12 +52,12 @@ if [ ! -x "$HERE/work-linaro/$LINARO/bin/arm-linux-gnueabihf-gcc" ]; then
 fi
 export PATH="$HERE/work-linaro/$LINARO/bin:$PATH"
 arm-linux-gnueabihf-gcc --version | head -1
-# zstd ramdisk: the plutosdr-fw Makefile and FIT source name rootfs.cpio.gz and mark it gzip
-sed -i 's#rootfs\.cpio\.gz#rootfs.cpio.zst#g' "$FW/Makefile"
+# xz ramdisk: the plutosdr-fw Makefile and FIT source name rootfs.cpio.gz and mark it gzip
+sed -i 's#rootfs\.cpio\.gz#rootfs.cpio.xz#g' "$FW/Makefile"
 python3 - "$FW/scripts/pluto.its" <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
-s, n = re.subn(r'(ramdisk@1 \{[^}]*?)rootfs\.cpio\.gz("\);[^}]*?compression = )"gzip"', r'\1rootfs.cpio.zst\2"none"', s, flags=re.S)
+s, n = re.subn(r'(ramdisk@1 \{[^}]*?)rootfs\.cpio\.gz("\);[^}]*?compression = )"gzip"', r'\1rootfs.cpio.xz\2"none"', s, flags=re.S)
 assert n == 1, "ramdisk@1 node not found in " + p
 open(p, 'w').write(s)
 PY
@@ -87,9 +87,15 @@ ls -la build/pluto.frm; sha256sum build/pluto.frm
 [ "$(stat -c %s build/pluto.frm)" -le $((14 * 1024 * 1024)) ] || { echo "pluto.frm is larger than the 14 MiB qspi-linux partition"; exit 1; }
 # size report: FIT images, ramdisk content (informational, never fails the build)
 { echo "== FIT"; mkimage -l build/pluto.itb || true
-  ls -la build/zImage build/rootfs.cpio.zst build/pluto.itb build/pluto.frm || true
+  ls -la build/zImage build/rootfs.cpio.xz build/pluto.itb build/pluto.frm || true
   echo "== rootfs (uncompressed, KiB)"; du -sk buildroot/output/target || true
   du -k -a buildroot/output/target | sort -rn | awk '$1 >= 100' | head -60 || true; } > "$HERE/../fw-size-report.txt" 2>&1 || true
 cat "$HERE/../fw-size-report.txt"
+# pluto.dfu for U-Boot DFU (RAM boot test, dfu_sf): the bare FIT, without the md5 trailer
+cp build/pluto.itb build/pluto.dfu
+# boot.frm for the stock mass-storage path (Tezuka FSBL + U-Boot, standard clocks, NexusBS env)
+"$HERE/build-boot-frm.sh" "$FW" "$FW/build"
+# the stock mass-storage update writes pluto.frm with a kernel that cannot address above 16 MiB:
+# pluto.frm (trailer included) must fit the 14 MiB below 0x1000000; keep a margin as well
 # and a safety margin under U-Boot's 14 MiB fit_size window (a 19.66 MB image bricked a board)
 [ "$(stat -c %s build/pluto.frm)" -le $((27 * 512 * 1024)) ] || { echo "pluto.frm is larger than the 13.5 MiB target"; exit 1; }

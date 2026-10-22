@@ -1,0 +1,72 @@
+#!/bin/sh
+# Install an apps.frm (from update.sh after a mass-storage copy, or by hand over SSH):
+#   apps-frm-install <apps.frm>      writes markers APPS_SUCCESS / APPS_FAILED into $MSD (default /mnt/msd)
+# apps.frm = 4096-byte header + payload (xz tar) + optional boot.bin + 33-byte md5 trailer (md5 of
+# everything before it, newline). Header keys: payload_size payload_md5 bootbin_size bootbin_md5 version.
+# 1. checks the trailer, header, sizes and payload md5; 2. refuses if the upper flash bank is not
+# addressed correctly (apps-flash-lib.sh upper_bank_ok) and checks afterwards that the lower-bank mirror
+# (U-Boot environment, FIT) did not change; 3. writes header+payload to qspi-apps with flashcp (erase,
+# write, verify) and reads it back; 4. only then, if a boot.bin is carried (FSBL + U-Boot), writes the
+# 64 KiB blocks that differ from the installed boot: qspi-bootcopy first, then qspi-fsbl-uboot from the
+# last block to block 0, each read back. /mnt/data is never touched.
+. /usr/sbin/apps-flash-lib.sh
+F=${1:?apps.frm}; MSD=${MSD:-/mnt/msd}; T=/tmp/apps-frm.$$
+say() { echo "apps.frm: $*"; logger -t apps-frm "$*"; }
+fail() { say "FAILED: $*"; [ -d "$MSD" ] && echo "$*" > "$MSD/APPS_FAILED"; rm -rf "$T"; exit 1; }
+rm -f "$MSD/APPS_SUCCESS" "$MSD/APPS_FAILED" "$MSD/BOOT_UPDATE_SUCCESS" "$MSD/BOOT_UPDATE_FAILED" 2>/dev/null
+mkdir -p "$T"
+SIZE=$(wc -c < "$F")
+[ "$(tail -c 33 "$F" | head -c 32)" = "$(head -c $((SIZE - 33)) "$F" | md5sum | cut -d' ' -f1)" ] || fail "md5 trailer mismatch"
+head -c 4096 "$F" | tr -d '\000' > "$T/hdr"
+[ "$(head -1 "$T/hdr")" = "$APPS_MAGIC" ] || fail "not an apps.frm (header)"
+PS=$(hdrval "$T/hdr" payload_size); PM=$(hdrval "$T/hdr" payload_md5)
+BS=$(hdrval "$T/hdr" bootbin_size); BM=$(hdrval "$T/hdr" bootbin_md5); BS=${BS:-0}
+[ $((4096 + PS + BS + 33)) -eq "$SIZE" ] || fail "sizes do not add up"
+A=$(mtdnum qspi-apps); [ -n "$A" ] || fail "no qspi-apps partition (base firmware too old)"
+[ $((4096 + PS)) -le "$(mtdsize qspi-apps)" ] || fail "payload larger than qspi-apps"
+head -c $((4096 + PS)) "$F" > "$T/slot"
+[ "$(tail -c "$PS" "$T/slot" | md5sum | cut -d' ' -f1)" = "$PM" ] || fail "payload md5 mismatch"
+R=$(upper_bank_ok) || fail "$R"
+E=$(mtdnum qspi-uboot-env); L=$(mtdnum qspi-linux)
+before="$(blkmd5 $E 0 2) $(md5sum < /dev/mtd$L | cut -d' ' -f1)"
+say "writing $((4096 + PS)) bytes to qspi-apps (mtd$A)"
+flash_unlock /dev/mtd$A > /dev/null 2>&1
+flashcp "$T/slot" /dev/mtd$A || fail "flashcp qspi-apps"
+[ "$(dd if=/dev/mtd$A bs=4096 count=$(( (4096 + PS + 4095) / 4096 )) 2>/dev/null | head -c $((4096 + PS)) | md5sum | cut -d' ' -f1)" = \
+  "$(md5sum < "$T/slot" | cut -d' ' -f1)" ] || fail "qspi-apps readback mismatch"
+after="$(blkmd5 $E 0 2) $(md5sum < /dev/mtd$L | cut -d' ' -f1)"
+[ "$before" = "$after" ] || fail "CRITICAL: the lower flash bank changed while writing the upper bank (aliasing); do not reboot, restore the U-Boot environment / pluto.frm first"
+say "application slot installed ($(hdrval "$T/hdr" version))"
+if [ "$BS" -gt 0 ]; then
+	tail -c $((BS + 33)) "$F" | head -c "$BS" > "$T/boot.bin"
+	[ "$(md5sum < "$T/boot.bin" | cut -d' ' -f1)" = "$BM" ] || fail "boot.bin md5 mismatch"
+	# Zynq boot header: width detection word and "XNLX"; must stay below the extra env at 0xFF000
+	[ "$(dd if="$T/boot.bin" bs=1 skip=32 count=8 2>/dev/null | hexdump -v -e '8/1 "%02x"')" = "665599aa584e4c58" ] || fail "boot.bin has no Zynq boot header"
+	[ "$BS" -le $((0xFF000)) ] || fail "boot.bin larger than 0xFF000"
+	Z=$(mtdnum qspi-fsbl-uboot); C=$(mtdnum qspi-bootcopy)
+	dd if=/dev/mtd$Z of="$T/cur" bs=65536 count=16 2>/dev/null
+	{ cat "$T/boot.bin"; tail -c +$((BS + 1)) "$T/cur"; } > "$T/new"
+	blocks=""; i=15; while [ $i -ge 0 ]; do
+		[ "$(dd if="$T/new" bs=65536 skip=$i count=1 2>/dev/null | md5sum)" = "$(dd if="$T/cur" bs=65536 skip=$i count=1 2>/dev/null | md5sum)" ] || blocks="$blocks $i"
+		i=$((i - 1)); done
+	if [ -z "$blocks" ]; then say "boot.bin already installed"; else
+		say "boot: blocks to rewrite (last first):$blocks"
+		if [ -n "$C" ]; then
+			flash_unlock /dev/mtd$C > /dev/null 2>&1
+			flashcp "$T/new" /dev/mtd$C && [ "$(md5sum < /dev/mtd$C)" = "$(md5sum < "$T/new")" ] || fail "qspi-bootcopy write/verify (qspi-fsbl-uboot untouched)"
+		fi
+		flash_unlock /dev/mtd$Z > /dev/null 2>&1
+		for i in $blocks; do
+			ok=0; for try in 1 2 3; do
+				flash_erase /dev/mtd$Z $((i * 65536)) 1 > /dev/null 2>&1 &&
+				dd if="$T/new" of=/dev/mtd$Z bs=65536 skip=$i seek=$i count=1 2>/dev/null &&
+				[ "$(blkmd5 $Z $i)" = "$(dd if="$T/new" bs=65536 skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1)" ] && { ok=1; break; }
+			done
+			[ $ok = 1 ] || { echo "block $i" > "$MSD/BOOT_UPDATE_FAILED"; fail "CRITICAL: qspi-fsbl-uboot block $i did not verify; do not power off, retry apps.frm or restore boot.dfu over DFU"; }
+		done
+		[ "$(md5sum < /dev/mtd$Z)" = "$(md5sum < "$T/new")" ] || fail "CRITICAL: qspi-fsbl-uboot final readback mismatch"
+		say "boot updated ($(hdrval "$T/hdr" bootbin_desc))"; [ -d "$MSD" ] && touch "$MSD/BOOT_UPDATE_SUCCESS"
+	fi
+fi
+[ -d "$MSD" ] && touch "$MSD/APPS_SUCCESS"
+rm -rf "$T"; sync; exit 0

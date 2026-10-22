@@ -1,0 +1,30 @@
+#!/bin/sh
+# Application slot (qspi-apps, installed from an apps.frm by apps-frm-install): at every boot the header
+# and the payload md5 are checked, the payload (xz tar) is unpacked to /opt/apps (RAM) and
+# /opt/apps/nexus/provision.sh /opt/apps /mnt/data runs (idempotent: it fills only what is missing on
+# /mnt/data). S97app then starts /opt/apps/nexus/start.sh in the master role. A missing or invalid
+# slot leaves the firmware a standalone SDR. The slot is read only; /mnt/data belongs to provision.sh.
+. /usr/sbin/apps-flash-lib.sh
+D=/opt/apps
+say() { echo "apps: $*"; logger -t apps "$*"; }
+start() {
+	A=$(mtdnum qspi-apps); [ -n "$A" ] || return 0
+	H=/tmp/apps.hdr; dd if=/dev/mtd$A bs=4096 count=1 2>/dev/null | tr -d '\000' > $H
+	[ "$(head -1 $H)" = "$APPS_MAGIC" ] || { rm -f $H; say "no application slot installed"; return 0; }
+	upper_bank_ok > /dev/null || { say "upper flash bank not addressable, slot ignored"; return 0; }
+	PS=$(hdrval $H payload_size); PM=$(hdrval $H payload_md5)
+	[ -n "$PS" ] && [ $((4096 + PS)) -le "$(mtdsize qspi-apps)" ] || { say "slot header invalid"; return 0; }
+	slot() { dd if=/dev/mtd$A bs=4096 skip=1 count=$(( (PS + 4095) / 4096 )) 2>/dev/null | head -c "$PS"; }
+	[ "$(slot | md5sum | cut -d' ' -f1)" = "$PM" ] || { say "slot payload md5 mismatch, not used"; return 0; }
+	rm -rf $D && mkdir -p $D
+	slot | xz -dc | tar -x -C $D || { rm -rf $D; say "slot payload does not unpack"; return 0; }
+	cp $H $D/.slot-header
+	say "slot $(hdrval $H version) unpacked to $D"
+	[ -x $D/nexus/provision.sh ] && { $D/nexus/provision.sh $D /mnt/data 2>&1 | logger -t provision; }
+	return 0
+}
+case "$1" in
+start) start ;;
+stop) ;;
+esac
+exit 0

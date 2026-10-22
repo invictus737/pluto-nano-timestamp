@@ -1,0 +1,29 @@
+#!/bin/sh
+# One-off write test of the upper flash bank before the first apps.frm (run by hand, only with an empty
+# slot): writes a random 64 KiB pattern into qspi-apps at +8 MiB, reads it back, and checks that its
+# lower-bank mirror (flash 0x900000, inside the FIT in qspi-linux) is unchanged. If the mirror did
+# change (aliased write), the saved mirror block is written back at once and the test fails.
+# Afterwards the test block is erased again. usage: apps-slot-selftest --yes
+. /usr/sbin/apps-flash-lib.sh
+[ "$1" = --yes ] || { sed -n '2,6p' "$0" | sed 's/^# //'; exit 2; }
+A=$(mtdnum qspi-apps); L=$(mtdnum qspi-linux); T=/tmp/selftest.$$; mkdir -p $T
+H=$(dd if=/dev/mtd$A bs=4096 count=1 2>/dev/null | tr -d '\000' | head -1)
+[ "$H" = "$APPS_MAGIC" ] && { echo "an application slot is installed: test refused"; exit 1; }
+R=$(upper_bank_ok) || { echo "read check failed: $R"; exit 1; }
+SB=128   # qspi-apps block at +8 MiB = flash 0x1900000; mirror 0x900000 = qspi-linux block 112
+MB=112
+dd if=/dev/mtd$L of=$T/mirror bs=65536 skip=$MB count=1 2>/dev/null
+dd if=/dev/urandom of=$T/pat bs=65536 count=1 2>/dev/null
+flash_unlock /dev/mtd$A > /dev/null 2>&1
+flash_erase /dev/mtd$A $((SB * 65536)) 1 > /dev/null && dd if=$T/pat of=/dev/mtd$A bs=65536 seek=$SB count=1 2>/dev/null
+rb=$(blkmd5 $A $SB); pm=$(md5sum < $T/pat | cut -d' ' -f1); mm=$(blkmd5 $L $MB); m0=$(md5sum < $T/mirror | cut -d' ' -f1)
+flash_erase /dev/mtd$A $((SB * 65536)) 1 > /dev/null
+if [ "$mm" != "$m0" ]; then
+	echo "FAILED: the write reached the lower bank (aliasing); restoring the mirror block"
+	flash_erase /dev/mtd$L $((MB * 65536)) 1 > /dev/null && dd if=$T/mirror of=/dev/mtd$L bs=65536 seek=$MB count=1 2>/dev/null
+	[ "$(blkmd5 $L $MB)" = "$m0" ] && echo "mirror restored" || echo "CRITICAL: mirror block not restored, reflash pluto.frm"
+	rm -rf $T; exit 1
+fi
+[ "$rb" = "$pm" ] || { echo "FAILED: upper-bank readback mismatch"; rm -rf $T; exit 1; }
+echo "OK: upper bank written and read back, lower bank unchanged (pattern $pm, mirror $m0)"
+rm -rf $T; exit 0
