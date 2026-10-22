@@ -4,8 +4,9 @@
 # name. Secrets (PSKs) never reach stdout, stderr or the log.
 #   nexus-net status                  JSON: hostname, IPv4 per interface, gateway, DNS, SSID, signal, mode
 #   nexus-net apply [--rollback S]    render + restart only the interfaces whose settings changed; with
-#                                     --rollback the previous state comes back after S seconds unless
-#                                     'nexus-net confirm' runs first
+#                                     --rollback the change is kept by itself once the network works
+#                                     (address + gateway, 3 checks), else the previous state comes back
+#                                     after S seconds; 'nexus-net confirm' keeps it at once
 #   nexus-net confirm                 keep the applied settings (ends a pending rollback; exit 1 when
 #                                     the automatic rollback already restored the previous ones)
 #   nexus-net revert                  return to the settings before the pending apply at once (only
@@ -132,7 +133,20 @@ static_resolv() {
 	[ -n "$s" ] || return 0
 	f=$(readlink -f $P/etc/resolv.conf); { for d in $s; do echo "nameserver $d"; done; } > "$f.$$" && mv "$f.$$" "$f"
 }
-restart_if() { for i in "$@"; do [ -e $P/sys/class/net/$i ] || continue; ifdown -f $i > /dev/null 2>&1; ifup $i > /dev/null 2>&1; log "$i restarted"; done; }
+# wlan0 with wpa_supplicant running: reload its network list in place (adding, removing or reordering
+# networks keeps the current association when that network stays; a per-network IPv4 follows from the
+# CONNECTED event). Only without a running supplicant is the interface taken down and up.
+restart_if() { for i in "$@"; do [ -e $P/sys/class/net/$i ] || continue
+	if [ $i = wlan0 ] && wpa_cli -p /run/wpa_supplicant -i wlan0 ping 2>/dev/null | grep -q PONG; then
+		wpa_cli -p /run/wpa_supplicant -i wlan0 reconfigure > /dev/null 2>&1; log "wlan0 networks reloaded"
+	else ifdown -f $i > /dev/null 2>&1; ifup $i > /dev/null 2>&1; log "$i restarted"; fi; done; }
+# healthy IFACE...: each restarted interface that exists has an IPv4 address (wlan0: associated) and the
+# default gateway answers a ping. The rollback watcher confirms on its own after 3 healthy checks in a row.
+healthy() { for i in "$@"; do [ -e $P/sys/class/net/$i ] || continue
+		ip -4 -o addr show dev $i 2>/dev/null | grep -q inet || return 1
+		[ $i = wlan0 ] && { wpa_cli -p /run/wpa_supplicant -i wlan0 status 2>/dev/null | grep -qx 'wpa_state=COMPLETED' || return 1; }
+	done
+	gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}'); [ -n "$gw" ] && ping -c 1 -W 2 "$gw" > /dev/null 2>&1; }
 snapshot() { rm -rf $R/prev && mkdir -p $R/prev && cp $IFAC $R/prev/interfaces && cp $HN $R/prev/hostname
 	[ -f $WPA ] && cp $WPA $R/prev/wpa_supplicant.conf; [ -d $R/wifi ] && cp -r $R/wifi $R/prev/wifi
 	for f in dns eth0.conf eth0.dns; do [ -f $R/$f ] && cp $R/$f $R/prev/$f; done; return 0; }
@@ -145,7 +159,7 @@ revert() {
 	[ -d $R/prev/wifi ] && cp $R/prev/wifi/* $R/back/wifi/ 2>/dev/null
 	for f in dns eth0.conf eth0.dns; do [ -f $R/prev/$f ] && cp $R/prev/$f $R/back/$f; done
 	: >> $R/back/dns; [ -f $R/back/eth0.conf ] || echo MODE=dhcp > $R/back/eth0.conf
-	ch=$(install_rendered $R/back); rm -rf $R/back $R/pending; date +%s > $R/rolled-back
+	ch=$(install_rendered $R/back); rm -rf $R/back $R/pending $R/pending-ifs; date +%s > $R/rolled-back
 	restart_if $ch; log "rolled back to the previous network settings"
 }
 
@@ -174,9 +188,18 @@ apply)
 		t=$(date +%s); echo $t > $R/pending
 		# the timer must outlive the SSH session that is about to drop: own session, SIGHUP ignored
 		S=; command -v setsid > /dev/null 2>&1 && S=setsid
-		$S sh -c 'trap "" HUP; sleep "$1"; [ "$(cat "$2/pending" 2>/dev/null)" = "$3" ] && "$4" revert' \
+		echo "$ch" > $R/pending-ifs
+		# the watcher must outlive the SSH session that may drop: own session, SIGHUP ignored. It keeps the
+		# change when the network works by itself (3 healthy checks, ~3 s apart), else rolls back at the end.
+		$S sh -c 'trap "" HUP; end=$(( $(date +%s) + $1 )); good=0
+			while [ "$(date +%s)" -lt "$end" ]; do sleep 3
+				[ "$(cat "$2/pending" 2>/dev/null)" = "$3" ] || exit 0
+				if "$4" healthy $(cat "$2/pending-ifs" 2>/dev/null); then good=$((good + 1)); [ $good -ge 3 ] && { "$4" confirm --auto; exit 0; }
+				else good=0; fi
+			done
+			[ "$(cat "$2/pending" 2>/dev/null)" = "$3" ] && "$4" revert' \
 			nexus-net-rollback "$RB" "$R" "$t" "$0" > /dev/null 2>&1 < /dev/null &
-		echo "applied (changed:${ch:- none}); rolls back in $RB s unless 'nexus-net confirm'"
+		echo "applied (changed:${ch:- none}); kept automatically when the network works (address + gateway), else rolled back within $RB s; 'nexus-net confirm' keeps it at once"
 	else cp "$J" "$APPLIED"; rm -f $R/pending; echo "applied (changed:${ch:- none})"; fi
 	log "applied, changed:${ch:- none}${RB:+, rollback in ${RB}s}" ;;
 confirm)
@@ -184,8 +207,11 @@ confirm)
 		[ -f $R/rolled-back ] && die "too late: the previous network settings were already restored (the change was rolled back); apply it again"
 		echo "nothing pending"; exit 0
 	fi
-	rm -f $R/pending; cp "$J" "$APPLIED"; echo confirmed; log confirmed ;;
+	rm -f $R/pending $R/pending-ifs; cp "$J" "$APPLIED"
+	if [ "${2:-}" = --auto ]; then echo "confirmed automatically (network up)"; log "confirmed automatically: address and gateway answer"
+	else echo confirmed; log confirmed; fi ;;
 revert) revert ;;
+healthy) shift; healthy "$@" ;;
 status)
 	ips() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | jq -R . | jq -sc .; }
 	ifs=$(for i in wlan0 eth0 $(ls $P/sys/class/net 2>/dev/null | grep '^usb'); do [ -e $P/sys/class/net/$i ] || continue

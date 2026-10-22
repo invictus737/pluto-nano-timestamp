@@ -140,8 +140,10 @@ net_apply() {
 	if [ "$rb" -gt 0 ] 2>/dev/null; then
 		$SBIN/nexus-net apply --rollback "$rb" 3>&- 4>&- 9>&- > /dev/null || return 1
 		say "applied, restarted:$(printf ' %s' $ch)"
-		say "this session runs over a changed interface: the previous settings return in $rb s unless confirmed"
-		say "(nexus-config nonint do_net_confirm)"; log "network applied, rollback in ${rb}s"; return 3
+		say "this session runs over a changed interface: the Pluto keeps the change by itself once the network"
+		say "works (address + gateway answer), else the previous settings return within $rb s. If this"
+		say "connection drops, reconnect (plutosdr.local or the new address). Keep it now: nexus-config nonint do_net_confirm"
+		log "network applied, automatic check, rollback within ${rb}s"; return 3
 	fi
 	$SBIN/nexus-net apply 3>&- 4>&- 9>&- > /dev/null || return 1
 	say "applied, restarted:$(printf ' %s' $ch)"
@@ -438,7 +440,7 @@ get() {
 wifi_list() {
 	[ -f "$NJ" ] || { s=$(env_get ssid_wlan); [ -n "$s" ] && echo "\"$s\" (config.txt)" || echo "no Wi-Fi network"; return 0; }
 	cur=$(wpa_cli -p /run/wpa_supplicant -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')
-	NC_CUR=$cur jq -r '(.wifi.networks // []) | (map(.priority // 0) | max) as $m | if length == 0 then "no Wi-Fi network" else .[] |
+	NC_CUR=$cur jq -r '(.wifi.networks // []) | (map(.priority // 0) | max) as $m | if length == 0 then "no Wi-Fi network" else sort_by(-(.priority // 0))[] |
 		"\"\(.ssid)\"  priority \(.priority // 0)  ipv4 \(.ipv4.mode // "dhcp")\(if .ipv4.mode == "static" then " " + .ipv4.address else "" end)"
 		+ (if (.psk // "") == "" then "  open" else "" end) + (if (.priority // 0) == $m then "  default" else "" end)
 		+ (if .ssid == env.NC_CUR then "  connected" else "" end) end' "$NJ"
@@ -481,8 +483,14 @@ locked() { ( exec 9> "$LOCK"; lock9 || { echo "another nexus-config is busy"; ex
 act() {
 	t=$1; shift; out=$(locked "$@" 2>&1); rc=$?
 	if [ $rc = 3 ]; then
-		if dlg --title "Keep the new network settings?" --timeout 55 --yesno "$out\n\nYou still see this, so the connection works. Keep the new settings?\n(No, or no answer within 55 s: the previous settings return.)" 18 76
-		then out=$(locked do_net_confirm 2>&1); else out=$(locked do_net_rollback 2>&1); fi
+		# Yes keeps it now, No restores the previous settings now; no answer (or a dropped connection)
+		# leaves it to the Pluto's own check: kept when the network works, else rolled back.
+		dlg --title "Keep the new network settings?" --timeout 55 --yesno "$out\n\nYes: keep them now.  No: restore the previous settings now.\nNo answer: the Pluto keeps them by itself if the network works, else restores." 20 76
+		case $? in
+		0) out=$(locked do_net_confirm 2>&1) ;;
+		1) out=$(locked do_net_rollback 2>&1) ;;
+		*) out="No answer: the Pluto checks the network itself (kept when it works, else restored)." ;;
+		esac
 	fi
 	[ -n "$out" ] && textbox "$t" "$out"; return $rc
 }

@@ -75,7 +75,10 @@ case "$*" in
 esac; exit 0
 F
 fake wpa_cli <<'F'
-case "$*" in *status*) cat "$NEXUS_ROOT/wpa_status" ;; esac; exit 0
+case "$*" in *status*) cat "$NEXUS_ROOT/wpa_status" ;; *" ping") [ -f "$NEXUS_ROOT/wpa_up" ] && echo PONG ;; esac; exit 0
+F
+fake ping <<'F'
+[ -f "$NEXUS_ROOT/gw_up" ]
 F
 fake wpa_passphrase <<'F'
 IFS= read -r p; echo "network={"; echo "	ssid=\"$1\""; echo "	#psk=\"$p\""; echo "	psk=$(printf '%s%s' "$1" "$p" | sha256sum | cut -c1-64)"; echo "}"
@@ -327,6 +330,17 @@ check "refused rollback left wpa_supplicant.conf alone" grep -q 'priority=30' $R
 rc 3 "change, then rollback now" $NC nonint do_wifi_priority NewNet 45
 rc 0 "do_net_rollback" $NC nonint do_net_rollback
 check "rollback now restored priority 30" grep -q 'priority=30' $R/etc/wpa_supplicant.conf
+touch $R/gw_up
+rc 3 "change over this session with the network working (address + gateway)" $NC nonint --rollback 20 do_wifi_priority NewNet 47
+sleep 13
+check "kept automatically once the network works" sh -c "[ ! -f $R/run/nexus-net/pending ] && jq -e '.wifi.networks[] | select(.ssid == \"NewNet\") | .priority == 47' $J.applied > /dev/null && grep -q 'confirmed automatically' $R/syslog"
+rm -f $R/gw_up
+touch $R/wpa_up
+rc 3 "wpa_supplicant running: change waits for the automatic check" $NC nonint --rollback 2 do_wifi_priority NewNet 48
+check "wpa_supplicant running: networks reloaded in place, wlan0 not taken down" sh -c "grep -q 'wlan0 networks reloaded' $R/syslog && grep -q 'reconfigure' $R/argv.log"
+sleep 9
+check "network not working: rolled back after the window" sh -c "[ ! -f $R/run/nexus-net/pending ] && jq -e '.wifi.networks[] | select(.ssid == \"NewNet\") | .priority == 47' $J > /dev/null"
+rm -f $R/wpa_up
 export SSH_CONNECTION="192.168.2.10 50000 192.168.2.1 22"
 rc 0 "session over usb0: Wi-Fi change applies without rollback" $NC nonint do_wifi_priority NewNet 50
 unset SSH_CONNECTION
