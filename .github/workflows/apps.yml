@@ -7,6 +7,8 @@ name: apps.frm (application slot)
 # plus the pinned Tezuka v0.3.24 Nano BOOT_fsbl_CPU1100_DDR750, and publishes apps.frm + SHA256SUMS as an
 # artifact and as release apps-<inputs_tag>.
 on:
+  # push only registers the workflow on this (non-default) branch; the job runs on dispatch
+  push: { branches: [v0.39-std], paths: ['.github/workflows/apps.yml'] }
   workflow_dispatch:
     inputs:
       inputs_tag: { description: 'release tag holding the inputs', required: true, type: string }
@@ -14,6 +16,7 @@ on:
 permissions: { contents: write }
 jobs:
   apps:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}', APPS_INPUTS_TAG: '${{ inputs.inputs_tag }}' }
