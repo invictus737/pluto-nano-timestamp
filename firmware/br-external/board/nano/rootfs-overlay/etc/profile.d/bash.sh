@@ -5,4 +5,4 @@ if [ -n "$BASH_VERSION" ]; then
   alias ll='ls -la'
 fi
 # station role at login
-case "$-" in *i*) echo "Role: $(fw_printenv -n operating_mode 2>/dev/null || echo slave)  (nexus-role slave|master)"; echo ;; esac
+case "$-" in *i*) echo "Role: $(fw_printenv -n operating_mode 2>/dev/null || echo slave)  -  configuration: nexus-config"; echo ;; esac

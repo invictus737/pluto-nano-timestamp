@@ -152,6 +152,117 @@ Standard Linux mechanisms only; nothing is loaded by board scripts.
 - Lockups: soft-lockup detector (reports after 8 s, `kernel.watchdog_thresh=4`) and hung-task
   detector (20 s) log a stack trace; the hardware watchdog resets after 10 s.
 
+## nexus-config (all Pluto settings, raspi-config style)
+
+Every setting of the Pluto itself is made with one tool on the device, over SSH or the serial console
+(any TERM; an unknown one falls back to vt100; laid out for 80x24). The NexusBS dashboard only
+configures NexusBS. The tool writes what the existing mechanisms read, so they all keep working: the
+U-Boot environment (the config.txt keys: `hostname`, `operating_mode`, `usb_mode`, `xo_correction`,
+`cpu_clock`, `cpu_clock_cooling_confirmed`, `country_wlan`, `bluetooth`), `nexus-role`,
+`nexus-clock`, `nexus-net` with `/mnt/data/network/network.json`, and the NexusBS provisioning in
+`/mnt/data/nexus2`.
+
+    nexus-config                                  interactive menu (dialog)
+    nexus-config nonint [OPTIONS] FUNCTION [ARGS] one action, no prompts
+    nexus-config get ITEM                         print a current value
+    nexus-config help                             every function
+
+Exit codes of `nonint`: 0 done, 1 refused or failed (the reason on stderr; nothing was changed),
+2 usage, 3 network settings applied but waiting for `do_net_confirm` (see "Rollback"). Actions are
+serialised by a lock (`/run/nexus-config.lock`). Each action applies at once where it can, persists,
+and reports; nothing is lost on reboot.
+
+**Secrets** (Wi-Fi passphrases, `DASHBOARD_PASSWORD`, `DMR_PASSWORD`, `BM_API_KEY`, `TETRA_PASSWORD`,
+`SVXLINK_AUTH_KEY`) are never command-line arguments (so never in `ps`), never printed or logged: the
+menu uses a hidden input box, `nonint` reads them from stdin and refuses a terminal there (no prompt,
+no echo). Inside the tool they travel through the environment of `jq` only (readable by root alone).
+network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and backups are 0600.
+
+### Menu and functions
+
+| menu | nonint | notes |
+|---|---|---|
+| 1 System: Host name | `do_hostname NAME` | U-Boot `hostname` + `/etc/hostname` now, avahi restarted (`NAME.local`); DHCP leases carry it from their next renewal. network.json no longer holds a host name |
+| Station role | `do_role master\|slave` | `nexus-role` (USB composite rebuilt, NexusBS started/stopped) |
+| USB mode | `do_usb_mode peripheral\|auto\|host` | next boot; `host` = a computer on USB-C no longer sees the Pluto |
+| Crystal correction | `do_xo_correction HZ\|default [--now]` | the measured 40 MHz reference in Hz, 8 digits within 250 ppm (39990000-40010000); shown as Hz and ppm, ppm = (xo - 40e6) / 40e6 x 1e6 (39999331 = -16.725 ppm); next boot, `--now` also writes the AD9361 (restart NexusBS then) |
+| CPU/DDR clock | `do_cpu_clock VARIANT [--cooling-confirmed]` | `standard` (default, recommended), `495_396` and `950_600` (Tezuka files, not tested on the reference board), `1100_750` (tested on the reference board with heatsinks and a fan only; above the -1 speed grade spec; active cooling required: refused without `--cooling-confirmed`, the menu asks explicitly). The boot block is rewritten at the next restart: a power cut during that < 1 s write needs DFU/JTAG recovery. The menu offers the restart |
+| Reboot / Shut down | `do_reboot`, `do_shutdown` | |
+| 2 Network: Status | `get network` (JSON) | IP per interface, gateway, DNS, SSID, signal, pending change |
+| Wi-Fi networks | `get wifi` | SSID, priority, IPv4 mode, open, default (highest priority), connected; never a passphrase |
+| Add / change a Wi-Fi network | `do_wifi_add SSID [--open] [--priority N]` | passphrase on stdin (8-63 printable ASCII or 64 hex); an existing SSID is updated. The first network change imports the config.txt Wi-Fi/Ethernet settings into network.json; from then on those config.txt keys are ignored (config.txt says so) |
+| Remove | `do_wifi_remove SSID` | |
+| Preferred network | `do_wifi_default SSID`, `do_wifi_priority SSID N` | default = highest priority (0-1000) |
+| Wi-Fi network IPv4 | `do_wifi_ipv4 SSID dhcp \| static ADDR/PREFIX [GATEWAY\|-] [DNS[,DNS]]` | per SSID: applied when that network connects |
+| Ethernet IPv4 | `do_eth_ipv4 dhcp \| static ADDR/PREFIX [GATEWAY\|-] [DNS[,DNS]]` | |
+| DNS override | `do_dns default \| DNS[,DNS[,DNS]]` | replaces the DHCP servers; `default` takes effect at the next lease |
+| Regulatory country | `do_wifi_country CC` | U-Boot `country_wlan`, `iw reg set` now, wpa_supplicant country |
+| Confirm / Roll back | `do_net_confirm`, `do_net_rollback`, `do_net_apply` | |
+| 3 Bluetooth: on/off | `do_bluetooth on\|off` | U-Boot `bluetooth` (config.txt `bluetooth`), controller powered now, `AutoEnable` in main.conf, the NexusBS Player switch (`player.json bt_off`) follows; off = powered off from every boot (`S39bluetooth`). The Player's own switch uses the same controller: switching it on there works until the next boot |
+| Controller and paired devices | `get bt` | |
+| 4 NexusBS: Status | `get station` | role, application slot version, running, callsign, dashboard URL, last setup result |
+| Station identity | `do_station_set KEY [VALUE]`, `do_station_setup` (KEY=value lines on stdin) | keys `CALLSIGN TRANSMIT DASHBOARD_USER DASHBOARD_PASSWORD DMR_ID DMR_NETWORK_ID DMR_PASSWORD BM_MASTER BM_API_KEY TETRA_ISSI TETRA_PASSWORD TETRA_HOST P25_TALKGROUP SVXLINK_CALLSIGN SVXLINK_AUTH_KEY SVXLINK_HOSTS XO_CORRECTION` (secret ones on stdin only). Written to `/mnt/data/nexus2/setup.txt` (0600), then `/opt/apps/nexus/bin/nexus2 provision --data /mnt/data/nexus2 --defaults /opt/apps/nexus/defaults`; setup.txt is removed afterwards whatever the outcome, `setup.result` is shown, an `XO_CORRECTION` goes to the U-Boot env. Restart NexusBS to use it |
+| Restart NexusBS | `do_station_restart` | `/etc/init.d/S97app restart` (master role only) |
+| Dashboard login | `get station_login` | location of `/mnt/data/nexus2/dashboard-login.txt` (generated password; not displayed) |
+| NexusBS log | `do_station_log [LINES]` | tail of `/var/log/nexus.log` |
+| 5 Update: Versions | `get versions` | firmware, application slot, U-Boot, FSBL clock variant, kernel |
+| How to update | | the USB drive `.frm` procedure (pluto.frm, boot.frm, apps*.frm, nexus-setup.txt) |
+| Backup /mnt/data | `do_backup PATH\|-` | tar.gz (0600; holds passwords and keys) to a file or directory (a stick under /media, or /tmp = RAM), or to stdout: `ssh root@pluto.local nexus-config nonint do_backup - > pluto-data.tar.gz`. Restore: `tar -xzf FILE -C /mnt/data` and reboot |
+| Factory reset | `do_factory_reset ERASE-ALL-DATA` | erases /mnt/data (network, NexusBS station, pairings, SSH host keys; the U-Boot env stays); the menu asks twice. Reboot afterwards |
+| 6 About / help | `help` | |
+
+`get` items: `hostname role usb_mode xo_correction xo_ppm cpu_clock clock bluetooth bt country wifi
+network dns ethernet net_pending station station_login station_result versions all`.
+
+### Rollback of network changes
+
+When the SSH session runs over an interface the change restarts (its local address belongs to eth0 or
+wlan0 and that interface changes), the change is applied with a 60 s automatic rollback: the menu asks
+"Keep the new settings?" (a Yes within 55 s keeps them; No or no answer restores the previous ones at
+once); `nonint` exits 3 and prints the rollback time, `nexus-config nonint do_net_confirm` keeps the
+change. The timer survives the SSH connection dropping. Over the serial console or the USB network no
+rollback is needed. `--rollback S` forces one, `--no-rollback` skips it, `--no-apply` only saves
+network.json (apply later with `do_net_apply`). While a change waits for confirmation every further
+network change is refused.
+
+### Examples
+
+    nexus-config nonint do_hostname nexus-yo3tco
+    read -rs P; printf '%s\n' "$P" | nexus-config nonint do_wifi_add "Home WiFi"; unset P
+    nexus-config nonint do_wifi_ipv4 "Home WiFi" static 192.168.1.119/24 192.168.1.1 192.168.1.1
+    nexus-config nonint do_wifi_default "Home WiFi"
+    nexus-config nonint do_xo_correction 39999331
+    nexus-config nonint do_cpu_clock 1100_750 --cooling-confirmed    # heatsinks + fan only
+    nexus-config nonint do_station_set CALLSIGN YO3TCO
+    printf '%s\n' "$DMR_PW" | nexus-config nonint do_station_set DMR_PASSWORD
+    nexus-config nonint do_station_setup < nexus-setup.txt && nexus-config nonint do_station_restart
+    ssh root@pluto.local nexus-config nonint do_backup - > pluto-data.tar.gz
+
+### config.txt on the USB drive
+
+config.txt is regenerated from the U-Boot environment at every boot, so the drive shows values set
+with nexus-config after the next boot. Until then a config.txt edited on the drive still works without
+reverting nexus-config: update.sh compares the saved file with the copy S45msd put on the drive
+(`/opt/config.drive`), and every one of the keys above that the operator did not change keeps its
+current environment value. An invalid or empty `operating_mode`, `usb_mode`, `cpu_clock`,
+`cpu_clock_cooling_confirmed` or `bluetooth` also keeps the current value (an old config.txt without
+those lines changes nothing).
+
+### Tests
+
+`firmware/tests/nexus-config-test.sh` runs every nonint function in a sandbox (`NEXUS_ROOT` prefixes
+the file paths of nexus-config, nexus-net, nexus-net-wifi-event, nexus-clock, nexus-role,
+apps-flash-lib and S39bluetooth; fake fw_printenv/fw_setenv, mtd files, ip, wpa_cli, ifup,
+bluetoothctl, nexus2 provision and init scripts on PATH), including the refusals (1100_750 without
+cooling, invalid host name/IP/prefix/SSID/passphrase/priority/country, aliased or unreadable upper
+flash bank, foreign boot image, a change while another waits, rollback without confirmation) and a
+check that no secret reaches any command line (every fake and jq record their argv), the log or the
+output. `--docker` runs it in a throwaway alpine:3.20 container (busybox 1.36.1 as in the image, jq
+installed in the container); `STOCK_BOARD_DIR=<ADI buildroot board/pluto>` adds update.sh's
+config.txt handling after the post-build.sh patches.
+
+    firmware/tests/nexus-config-test.sh --docker
+
 ## Station role: slave (default) or master
 
 `config.txt` [SYSTEM] `operating_mode = slave|master` (U-Boot environment `operating_mode`), or
@@ -161,9 +272,11 @@ Standard Linux mechanisms only; nothing is loaded by board scripts.
   Both timestamp SDR gadgets run: USB FunctionFS (`sdr_usb_gadget`, `uri=usb:...,direct=1`) and
   UDP (`sdr_ip_gadget` 30432/30433, `uri=ip:<pluto>,direct=1,timestamp_every=...`), plus iiod.
   No application is started.
-- **master**: NexusBS runs on the Pluto (S97app, `/mnt/data/<name>/app.conf`) and uses the radio
+- **master**: NexusBS runs on the Pluto (S97app: the application slot, or `/mnt/data/<name>/app.conf`) and uses the radio
   directly; both SDR gadgets are stopped and the USB SDR function is left out of the composite.
   Switching rebuilds the USB composite, so a USB link drops for a few seconds.
+- `S97app start` is idempotent (a running station is not started twice when `nexus-role master` or
+  update.sh calls it again); `S97app restart` stops and starts it.
 
 In the master role the application opens the radio with `driver=plutosdr,uri=local:` plus
 `local_timestamp=1` (NexusBS) or `direct=1`, and `timestamp_every=N` (soapyplutosdr-ts patch 0003,
@@ -214,20 +327,22 @@ when unset or invalid:
 | `standard` | Tezuka default clocks |
 | `495_396` | CPU 495 MHz / DDR 396 MT/s: Tezuka file, not tested on the reference board |
 | `950_600` | CPU 950 MHz / DDR 600 MT/s: Tezuka file, not tested on the reference board |
-| `1100_750` | CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed, ran for days; above the -1 speed grade spec, active cooling required. Needs `cpu_clock_cooling_confirmed = yes`, otherwise refused and logged |
+| `1100_750` | CPU 1100 MHz / DDR 750 MT/s: tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed, ran for days; above the -1 speed grade spec, active cooling required. Needs `cpu_clock_cooling_confirmed = yes`, otherwise refused, logged, and `standard` is installed instead |
 
 `S22clock` (`nexus-clock apply`, at boot, after the upper-bank checks of S21data) compares block 0
 with the configured variant; identical = no flash write. Otherwise, provided the rest of the installed
 boot image is Tezuka's: the new 1 MiB boot image goes to qspi-bootcopy first (read back), block 0 of
 qspi-fsbl-uboot is erased and written (read back; on a mismatch the saved block is written back at once
 and CRITICAL is logged), and the Pluto reboots once. A power cut during that < 1 s write needs DFU/JTAG
-recovery. `nexus-clock status` (JSON: configured, installed, cooling_confirmed, ARM/DDR PLL and the
-resulting CPU MHz / DDR MT/s from the SLCR registers), `nexus-clock set VARIANT [--cooling-confirmed]`
-(environment only). Changing cpu_clock in config.txt reboots once to apply it.
+recovery. `nexus-clock status` (JSON: configured, effective (what apply installs), installed,
+cooling_confirmed, ARM/DDR PLL and the resulting CPU MHz / DDR MT/s from the SLCR registers),
+`nexus-clock set VARIANT [--cooling-confirmed]` (environment only). Changing cpu_clock in config.txt
+reboots once to apply it. apply also refuses while update.sh has the USB drive image mounted
+(`/mnt/msd`), and erases by the partition's real erase block size.
 
 ## Network settings: network.json (nexus-net)
 
-`/mnt/data/network/network.json` (0600, written by the NexusBS dashboard) overrides the config.txt /
+`/mnt/data/network/network.json` (0600, written by `nexus-config`) overrides the config.txt /
 U-Boot Wi-Fi and Ethernet settings when it exists (S40network runs `nexus-net render-boot` before
 `ifup -a`; an invalid file is ignored and logged). Without it the stock config.txt behaviour stays.
 
@@ -251,7 +366,12 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
     nexus-net validate FILE          exit 1 with "field.path: reason" (values are never printed)
     nexus-net apply [--rollback S]   render, restart only eth0/wlan0 if their settings changed; with
                                      --rollback the previous files (and network.json) return after S s
+                                     (the timer runs in its own session with SIGHUP ignored, so it
+                                     survives the SSH connection it is meant to rescue); refused while
+                                     an earlier apply waits for confirmation
     nexus-net confirm                keep the applied settings
+    nexus-net revert                 return to the settings before the pending apply now
+    nexus-net plan                   print the interfaces an apply would restart (nothing changes)
 
 ## USB-C role, SSH host keys, Bluetooth
 
@@ -263,7 +383,10 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
   (`-R`) and they survive reboots and firmware updates (stock keys saved with device_persistent_keys
   in /mnt/jffs2 are still restored by S21misc).
 - `/etc/bluetooth/main.conf`: `[Policy] AutoEnable=true`, so an adapter that enumerates late (after
-  the USB role switch) is powered at once.
+  the USB role switch) is powered at once. config.txt `[SYSTEM] bluetooth = on|off` (U-Boot env
+  `bluetooth`, default on; `nexus-config`): with off, `S39bluetooth` (before bluetoothd) sets
+  `AutoEnable=false` in the RAM copy of main.conf and `bt_off` in the NexusBS Player's
+  `/mnt/data/nexus2/player.json`, so the controller stays powered off from boot on.
 
 ## SSH, SCP, SFTP
 

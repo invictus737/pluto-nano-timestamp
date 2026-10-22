@@ -25,9 +25,9 @@ install -m 0644 "$HERE/motd" "$T/etc/motd"
 grep -qx /bin/bash "$T/etc/shells" 2>/dev/null || echo /bin/bash >> "$T/etc/shells"
 # config.txt [SYSTEM] operating_mode = slave|master (station role, nexus-role): written by S40network,
 # read back by update.sh like the stock keys and applied at once
-python3 - "$T/etc/init.d/S40network" "$T/sbin/update.sh" <<'PY'
+python3 - "$T/etc/init.d/S40network" "$T/sbin/update.sh" "$T/etc/init.d/S45msd" <<'PY'
 import sys
-net, upd = sys.argv[1], sys.argv[2]
+net, upd, msd = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(net).read()
 def rep(old, new):
     global s
@@ -88,7 +88,17 @@ rep("\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n",
     "\techo \"# set cpu_clock_cooling_confirmed = yes or it is refused. 495_396 / 950_600: Tezuka files, not tested\"$'\\r' >> $CONF\n"
     "\techo \"# on the reference board.\"$'\\r' >> $CONF\n"
     "\techo \"cpu_clock = $CPU_CLOCK\"$'\\r' >> $CONF\n"
-    "\techo \"cpu_clock_cooling_confirmed = $CPU_COOL\"$'\\r' >> $CONF\n")
+    "\techo \"cpu_clock_cooling_confirmed = $CPU_COOL\"$'\\r' >> $CONF\n"
+    "\techo \"# Bluetooth controller at boot [on|off] (S39bluetooth; off also starts the NexusBS Player switch off)\"$'\\r' >> $CONF\n"
+    "\techo \"bluetooth = $BT_STATE\"$'\\r' >> $CONF\n")
+# config.txt [SYSTEM] bluetooth (S39bluetooth, nexus-config): on (default) | off
+rep("\tCPU_COOL=`fw_printenv -n cpu_clock_cooling_confirmed 2> /dev/null`; [ \"$CPU_COOL\" = yes ] || CPU_COOL=no\n",
+    "\tCPU_COOL=`fw_printenv -n cpu_clock_cooling_confirmed 2> /dev/null`; [ \"$CPU_COOL\" = yes ] || CPU_COOL=no\n"
+    "\tBT_STATE=`fw_printenv -n bluetooth 2> /dev/null`; [ \"$BT_STATE\" = off ] || BT_STATE=on\n")
+# network.json (nexus-config) replaces the Wi-Fi/Ethernet keys of config.txt: say so in the file itself
+rep("\techo \"[WLAN]\"$'\\r' >> $CONF\n",
+    "\techo \"[WLAN]\"$'\\r' >> $CONF\n"
+    "\t[ -f /mnt/data/network/network.json ] && echo \"# network.json is in use (nexus-config): ssid_wlan, pwd_wlan, ipaddr_wlan and the [USB_ETHERNET] address are ignored\"$'\\r' >> $CONF\n")
 open(net, "w").write(s)
 u = open(upd).read()
 w = "\t\techo \"pwd_wlan $pwd_wlan\" >> /opt/fw_set.tmp\n"
@@ -96,20 +106,24 @@ assert u.count(w) == 1, "update.sh: pwd_wlan line not found"
 u = u.replace(w, w + "\t\techo \"country_wlan $country_wlan\" >> /opt/fw_set.tmp\n")
 c = "\t\techo \"netmask_eth $netmask_eth\" >> /opt/fw_set.tmp\n"
 assert u.count(c) == 1, "update.sh: netmask_eth line not found"
-u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master) ;; *) operating_mode=slave ;; esac\n"
+u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master|slave) ;; *) operating_mode=`fw_printenv -n operating_mode 2> /dev/null || echo slave` ;; esac\n"
                      "\t\techo \"operating_mode $operating_mode\" >> /opt/fw_set.tmp\n"
-                     "\t\tcase \"$usb_mode\" in auto|host) ;; *) usb_mode=peripheral ;; esac\n"
+                     "\t\tcase \"$usb_mode\" in peripheral|auto|host) ;; *) usb_mode=`fw_printenv -n usb_mode 2> /dev/null || echo peripheral` ;; esac\n"
                      "\t\techo \"usb_mode $usb_mode\" >> /opt/fw_set.tmp\n"
+                     "\t\told_bt=`fw_printenv -n bluetooth 2> /dev/null`; [ \"$old_bt\" = off ] || old_bt=on\n"
+                     "\t\tcase \"$bluetooth\" in on|off) ;; *) bluetooth=$old_bt ;; esac\n"
+                     "\t\techo \"bluetooth $bluetooth\" >> /opt/fw_set.tmp\n"
                      "\t\told_clock=`fw_printenv -n cpu_clock 2> /dev/null || echo standard`\n"
-                     "\t\tcase \"$cpu_clock\" in standard|495_396|950_600|1100_750) ;; *) cpu_clock=standard ;; esac\n"
-                     "\t\t[ \"$cpu_clock_cooling_confirmed\" = yes ] || cpu_clock_cooling_confirmed=no\n"
+                     "\t\tcase \"$cpu_clock\" in standard|495_396|950_600|1100_750) ;; *) cpu_clock=$old_clock ;; esac\n"
+                     "\t\tcase \"$cpu_clock_cooling_confirmed\" in yes|no) ;; *) cpu_clock_cooling_confirmed=`fw_printenv -n cpu_clock_cooling_confirmed 2> /dev/null || echo no` ;; esac\n"
                      "\t\tif [ \"$cpu_clock\" = 1100_750 ] && [ \"$cpu_clock_cooling_confirmed\" != yes ]; then logger -t nexus-clock \"cpu_clock 1100_750 refused: cpu_clock_cooling_confirmed is not yes\"; cpu_clock=$old_clock; fi\n"
                      "\t\techo \"cpu_clock $cpu_clock\" >> /opt/fw_set.tmp\n"
                      "\t\techo \"cpu_clock_cooling_confirmed $cpu_clock_cooling_confirmed\" >> /opt/fw_set.tmp\n"
                      "\t\t[ \"$cpu_clock\" != \"$old_clock\" ] && do_reset=1\n")
 d = "\t\ttouch /mnt/msd/SUCCESS_ENV_UPDATE\n"
 assert u.count(d) == 1, "update.sh: SUCCESS_ENV_UPDATE not found"
-u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n")
+u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n"
+                     "\t\t[ \"$bluetooth\" != \"$old_bt\" ] && [ -x /usr/sbin/nexus-config ] && /usr/sbin/nexus-config nonint do_bluetooth \"$bluetooth\" > /dev/null 2>&1\n")
 # boot*.frm / apps*.frm variants (same U-Boot/env or payload, different FSBL clock): exactly one of each
 # is accepted; several on the drive refuse the whole update (nothing is written) and are removed
 f = "\tif [[ -s ${FIRMWARE} ]]\n\tthen\n\t\thandle_frimware_frm \"${FIRMWARE}\" \"${FRM_MAGIC}\"\n\tfi\n"
@@ -135,7 +149,27 @@ u = u.replace(e, e +
     "\t\t\tmkdir -p -m 0700 /mnt/data/nexus2 && cp /mnt/msd/nexus-setup.txt /mnt/data/nexus2/setup.txt && chmod 0600 /mnt/data/nexus2/setup.txt && sync && touch /mnt/msd/SETUP_SUCCESS && do_reset=1 || touch /mnt/msd/SETUP_FAILED\n"
     "\t\telse\n\t\t\techo 'no persistent data partition' > /mnt/msd/SETUP_FAILED\n\t\tfi\n"
     "\t\trm -f /mnt/msd/nexus-setup.txt /mnt/msd/._nexus-setup.txt\n\tfi\n")
+# nexus-config writes the U-Boot environment directly; the drive keeps the config.txt of the last boot
+# until the next one. A key the operator did not edit on the drive (same value as the copy S45msd put
+# there, /opt/config.drive) keeps the current environment value, so an unrelated config.txt edit never
+# reverts a nexus-config setting.
+g = "\tini_parser $FILE \"USB_ETHERNET\"\n"
+assert u.count(g) == 1, "update.sh: USB_ETHERNET parser line not found"
+u = u.replace(g, g +
+    "\tif [ -f /opt/config.drive ]; then\n"
+    "\t\tfor k in hostname xo_correction country_wlan operating_mode usb_mode cpu_clock cpu_clock_cooling_confirmed bluetooth; do\n"
+    "\t\t\td=`sed -n \"s/^$k[[:space:]]*=[[:space:]]*//p\" /opt/config.drive | tr -d '\\r' | sed 's/[[:space:]]*$//' | head -1`\n"
+    "\t\t\teval \"n=\\${$k}\"\n"
+    "\t\t\t[ \"$n\" = \"$d\" ] && eval \"$k=\\`fw_printenv -n $k 2> /dev/null\\`\"\n"
+    "\t\tdone\n\tfi\n")
+h = "\tmd5sum $FILE > /opt/config.md5\n"
+assert u.count(h) == 1, "update.sh: config.md5 line not found"
+u = u.replace(h, h + "\tcp $FILE /opt/config.drive\n")
 open(upd, "w").write(u)
+m = open(msd).read()
+i = "\t\tcp $CONF /mnt/msd\n"
+assert m.count(i) == 1, "S45msd: config.txt copy not found"
+open(msd, "w").write(m.replace(i, i + "\t\tcp $CONF /opt/config.drive\n"))
 PY
 # master role: no SDR gadgets (NexusBS on the Pluto uses the radio directly). The USB SDR function must
 # not even be in the composite then: a FunctionFS function without its daemon blocks the UDC bind.

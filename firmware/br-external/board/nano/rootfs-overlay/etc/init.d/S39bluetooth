@@ -1,0 +1,21 @@
+#!/bin/sh
+# Bluetooth on/off (config.txt [SYSTEM] bluetooth = on|off, U-Boot env bluetooth, default on; set with
+# nexus-config): runs before bluetoothd (S40bluetoothd). off = BlueZ does not power any controller
+# (AutoEnable=false in /etc/bluetooth/main.conf, in RAM) and the NexusBS Player's own switch starts
+# off (player.json bt_off), so the controller stays powered off from boot until switched on again.
+P=${NEXUS_ROOT:-}   # tests only: prefix of every file path
+MC=$P/etc/bluetooth/main.conf; PJ=$P/mnt/data/nexus2/player.json
+case "$1" in
+start)
+	B=$(fw_printenv -n bluetooth 2>/dev/null); [ "$B" = off ] || B=on
+	if [ "$B" = off ]; then A=false; else A=true; fi
+	[ -f $MC ] && sed -i "s/^AutoEnable=.*/AutoEnable=$A/" $MC
+	if [ "$B" = off ] && [ -d $P/mnt/data/nexus2 ]; then
+		if [ -s $PJ ] && jq -e 'type == "object"' $PJ > /dev/null 2>&1; then
+			jq '.bt_off = true' $PJ > $PJ.tmp && mv $PJ.tmp $PJ
+		else echo '{"bt_off": true}' > $PJ.tmp && mv $PJ.tmp $PJ; fi
+		chmod 600 $PJ
+	fi
+	echo "Bluetooth: $B"; logger -t bluetooth "bluetooth $B (AutoEnable=$A)" ;;
+esac
+exit 0

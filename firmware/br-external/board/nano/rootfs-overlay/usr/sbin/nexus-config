@@ -1,0 +1,646 @@
+#!/bin/sh
+# nexus-config: configuration of a NexusBS Pluto Nano (raspi-config style).
+#   nexus-config                         interactive menu (dialog; SSH or serial console, 80x24)
+#   nexus-config nonint [OPTIONS] FUNCTION [ARGS]   one action, no prompts; exit 0 done, 1 refused or
+#                                        failed, 2 usage, 3 network applied and waiting for
+#                                        'nexus-config nonint do_net_confirm' (automatic rollback)
+#      OPTIONS (network functions): --no-apply (save only), --rollback S, --no-rollback
+#   nexus-config get ITEM                print a current value ('nexus-config get' lists the items)
+#   nexus-config help                    the list of functions
+# Every setting is applied at once where possible and kept across reboots: the U-Boot environment
+# (the config.txt keys), /mnt/data/network/network.json (nexus-net) and /mnt/data/nexus2 (NexusBS).
+# Secrets (Wi-Fi passphrases, station passwords and keys) are read from stdin or a hidden input box,
+# never taken as arguments, never printed or logged; the files that hold them are 0600.
+umask 077
+P=${NEXUS_ROOT:-}                    # tests only: prefix of every file path (commands come from PATH)
+SBIN=$P/usr/sbin; INITD=$P/etc/init.d
+DATA=$P/mnt/data; NJ=$DATA/network/network.json; STATION=$DATA/nexus2
+APPS=$P/opt/apps; NEXUS2=$APPS/nexus/bin/nexus2; NLOG=$P/var/log/nexus.log
+LOCK=$P/run/nexus-config.lock; BTMAIN=$P/etc/bluetooth/main.conf
+VARIANTS="standard 495_396 950_600 1100_750"
+STATION_KEYS="CALLSIGN TRANSMIT DASHBOARD_USER DASHBOARD_PASSWORD DMR_ID DMR_NETWORK_ID DMR_PASSWORD BM_MASTER BM_API_KEY TETRA_ISSI TETRA_PASSWORD TETRA_HOST P25_TALKGROUP SVXLINK_CALLSIGN SVXLINK_AUTH_KEY SVXLINK_HOSTS XO_CORRECTION"
+SECRET_KEYS="DASHBOARD_PASSWORD DMR_PASSWORD BM_API_KEY TETRA_PASSWORD SVXLINK_AUTH_KEY"
+NOAPPLY=0; ROLLBACK=
+
+say() { printf '%s\n' "$*"; }
+err() { printf 'nexus-config: %s\n' "$*" >&2; }
+log() { logger -t nexus-config "$*" 2>/dev/null; }
+env_get() { fw_printenv -n "$1" 2>/dev/null; }
+env_set() { if [ -n "$2" ]; then fw_setenv "$1" "$2"; else fw_setenv "$1"; fi || { err "the U-Boot environment could not be written ($1)"; return 1; }; }
+inlist() { x=$1; shift; for i in "$@"; do [ "$i" = "$x" ] && return 0; done; return 1; }
+is_secret() { inlist "$1" $SECRET_KEYS; }
+ip4() { printf '%s' "$1" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'; }
+upper() { printf '%s' "$1" | tr a-z A-Z; }
+role() { r=$(env_get operating_mode); [ "$r" = master ] || r=slave; echo $r; }
+ppm() { awk -v x="$1" 'BEGIN { printf "%+.3f", (x - 40000000) / 40 }'; }
+bytes() { printf '%s' "$1" | wc -c | tr -d ' '; }
+lock9() { n=0; while ! flock -n 9; do n=$((n + 1)); [ $n -ge 30 ] && return 1; sleep 1; done; }   # busybox flock has no -w
+
+# ---------------------------------------------------------------- system
+do_hostname() {
+	h=${1:-}
+	printf '%s' "$h" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$' || { err "host name: letters, digits and -, 1-63 characters, not starting or ending with -"; return 1; }
+	env_set hostname "$h" || return 1
+	echo "$h" > $P/etc/hostname && hostname -F $P/etc/hostname
+	# the host name lives in the U-Boot environment only (config.txt hostname); network.json must not override it
+	for f in "$NJ" "$NJ.applied"; do
+		[ -f "$f" ] && jq -e 'has("hostname")' "$f" > /dev/null 2>&1 && jq 'del(.hostname)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+	done
+	$INITD/S50avahi-daemon stop > /dev/null 2>&1; $INITD/S50avahi-daemon start > /dev/null 2>&1
+	log "hostname $h"; say "host name: $h (mDNS $h.local; DHCP leases carry it from their next renewal)"
+}
+do_role() {
+	case "${1:-}" in master|slave) ;; *) err "role: master or slave"; return 2 ;; esac
+	$SBIN/nexus-role "$1" || return 1
+	[ "$1" = master ] && say "NexusBS runs on this Pluto; the SDR gadgets are stopped" || say "SDR for NexusBS on another computer; NexusBS here is stopped"
+}
+do_usb_mode() {
+	case "${1:-}" in peripheral|auto|host) ;; *) err "USB mode: peripheral, auto or host"; return 2 ;; esac
+	env_set usb_mode "$1" || return 1
+	log "usb_mode $1"; say "USB mode: $1 (applied at the next boot)"
+	[ "$1" = host ] && say "WARNING: in host mode a computer on the USB-C port no longer sees the Pluto (no USB network, no drive); reach it over Wi-Fi/Ethernet or the serial console"
+	return 0
+}
+do_xo_correction() {
+	v=${1:-}; now=${2:-}
+	if [ "$v" = default ]; then env_set xo_correction "" || return 1; log "xo_correction unset"; say "crystal correction removed (40000000 Hz nominal, at the next boot)"; return 0; fi
+	printf '%s' "$v" | grep -Eq '^[0-9]{8}$' && [ "$v" -ge 39990000 ] && [ "$v" -le 40010000 ] || \
+		{ err "crystal correction: the measured reference in Hz, 8 digits within 250 ppm of 40000000 (39990000-40010000)"; return 1; }
+	env_set xo_correction "$v" || return 1
+	log "xo_correction $v"; say "crystal: $v Hz = $(ppm $v) ppm"
+	if [ "$now" = --now ]; then
+		d=; for n in $P/sys/bus/iio/devices/*/name; do [ "$(cat "$n" 2>/dev/null)" = ad9361-phy ] && d=$(dirname "$n"); done
+		if [ -n "$d" ] && echo "$v" > "$d/xo_correction" 2>/dev/null; then say "applied to the AD9361 now (restart NexusBS if it runs)"
+		else say "could not apply it now (no ad9361-phy); active at the next boot"; fi
+	else say "active at the next boot (or now with --now)"; fi
+}
+clock_warning() {
+	say "The CPU/DDR clock lives in the first 64 KiB block of the boot flash (FSBL)."
+	say "It is rewritten at the next restart (S22clock), only if it differs: the write takes < 1 s,"
+	say "a power cut during it leaves a board that needs DFU/JTAG recovery. Restart when ready."
+}
+do_cpu_clock() {
+	inlist "${1:-}" $VARIANTS || { err "CPU clock: one of $VARIANTS"; return 2; }
+	if [ "$1" = 1100_750 ] && [ "${2:-}" != --cooling-confirmed ]; then
+		err "1100_750 refused: tested on the reference board with heatsinks and a fan only, above the -1 speed grade spec; active cooling is required (add --cooling-confirmed)"; return 1
+	fi
+	$SBIN/nexus-clock set "$@" > /dev/null || return 1
+	say "CPU/DDR clock: $1 (applied at the next restart)"; clock_warning
+}
+do_reboot() { log reboot; say "rebooting"; sync; reboot; }
+do_shutdown() { log shutdown; say "shutting down (remove power once the LED stops)"; sync; poweroff; }
+
+# ---------------------------------------------------------------- network
+prefix_of() { echo "$1" | awk -F. '{ n = 0; for (i = 1; i <= 4; i++) { o = $i + 0; while (o > 0) { n += o % 2; o = int(o / 2) } } print n }'; }
+# network.json as it is, or (first use) imported from the config.txt Wi-Fi/Ethernet settings
+nj_source() {
+	if [ -f "$NJ" ]; then cat "$NJ"; return; fi
+	ipe=$(env_get ipaddr_eth); pfx=$(prefix_of "$(env_get netmask_eth || echo 255.255.255.0)")
+	NC_SSID=$(env_get ssid_wlan) NC_PSK=$(env_get pwd_wlan) NC_IPW=$(env_get ipaddr_wlan) NC_IPE=$ipe NC_PFX=$pfx jq -n '
+		{schema: 1, wifi: {networks: (if env.NC_SSID != "" then [{ssid: env.NC_SSID, priority: 10,
+			ipv4: (if env.NC_IPW != "" then {mode: "static", address: (env.NC_IPW + "/24")} else {mode: "dhcp"} end)}
+			+ (if env.NC_PSK != "" then {psk: env.NC_PSK} else {} end)] else [] end)},
+		 ethernet: {ipv4: (if env.NC_IPE != "" then {mode: "static", address: (env.NC_IPE + "/" + env.NC_PFX)} else {mode: "dhcp"} end)}}'
+}
+# nj_update FILTER: apply a jq filter (values through NC_* environment variables), validate, save (0600)
+nj_update() {
+	# a second change would be confirmed or rolled back together with the pending one: refuse it
+	[ -f $P/run/nexus-net/pending ] && { err "a network change waits for confirmation: do_net_confirm or do_net_rollback first"; return 1; }
+	mkdir -p "$(dirname "$NJ")" || return 1
+	src=$(nj_source) || { err "network.json is not readable"; return 1; }
+	printf '%s\n' "$src" | jq "$1 | del(.hostname) | .schema = 1" > "$NJ.new" 2>/dev/null || { rm -f "$NJ.new"; err "network.json could not be updated"; return 1; }
+	m=$($SBIN/nexus-net validate "$NJ.new") || { rm -f "$NJ.new"; err "refused: $m"; return 1; }
+	[ -f "$NJ" ] || say "network.json created (config.txt Wi-Fi/Ethernet settings imported; from now on they are ignored)"
+	chmod 600 "$NJ.new" && mv "$NJ.new" "$NJ"
+}
+session_iface() {
+	set -- ${SSH_CONNECTION:-}; [ -n "${3:-}" ] || return 0
+	ip -4 -o addr show 2>/dev/null | awk -v a="$3" '{ split($4, x, "/"); if (x[1] == a) { print $2; exit } }'
+}
+# apply network.json; returns 3 when the change waits for do_net_confirm (automatic rollback)
+net_apply() {
+	[ "$NOAPPLY" = 1 ] && { say "saved, not applied (nexus-config nonint do_net_apply)"; return 0; }
+	[ -f "$NJ" ] || { err "no network.json yet"; return 1; }
+	ch=$($SBIN/nexus-net plan 3>&- 4>&- 9>&-) || return 1
+	[ -n "$ch" ] || { $SBIN/nexus-net apply 3>&- 4>&- 9>&- > /dev/null || return 1; say "applied (no interface needed a restart)"; return 0; }
+	rb=$ROLLBACK
+	if [ -z "$rb" ]; then rb=0; via=$(session_iface); for i in $ch; do [ "$i" = "$via" ] && rb=60; done; fi
+	if [ "$rb" -gt 0 ] 2>/dev/null; then
+		$SBIN/nexus-net apply --rollback "$rb" 3>&- 4>&- 9>&- > /dev/null || return 1
+		say "applied, restarted:$(printf ' %s' $ch)"
+		say "this session runs over a changed interface: the previous settings return in $rb s unless confirmed"
+		say "(nexus-config nonint do_net_confirm)"; log "network applied, rollback in ${rb}s"; return 3
+	fi
+	$SBIN/nexus-net apply 3>&- 4>&- 9>&- > /dev/null || return 1
+	say "applied, restarted:$(printf ' %s' $ch)"
+}
+net_change() { nj_update "$1" && net_apply; }
+wifi_exists() { [ -f "$NJ" ] && NC_SSID=$1 jq -e 'any((.wifi.networks // [])[]; .ssid == env.NC_SSID)' "$NJ" > /dev/null 2>&1; }
+check_ssid() { n=$(bytes "$1"); [ "$n" -ge 1 ] && [ "$n" -le 32 ] || { err "SSID: 1-32 bytes"; return 1; }; }
+check_psk() {   # the value itself is never printed
+	if printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f]{64}$'; then return 0; fi
+	n=$(bytes "$1"); if [ "$n" -ge 8 ] && [ "$n" -le 63 ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'; then return 0; fi
+	err "passphrase: 8-63 printable ASCII characters, or 64 hex digits"; return 1
+}
+# wifi_add SSID OPEN PRIORITY, passphrase in $NC_PSK
+wifi_add() {
+	check_ssid "$1" || return 1
+	[ "$2" = 1 ] || check_psk "$NC_PSK" || return 1
+	case "$3" in ''|*[!0-9]*) [ -z "$3" ] || { err "priority: 0-1000"; return 1; } ;; esac
+	ex=no; wifi_exists "$1" && ex=yes
+	NC_SSID=$1 NC_OPEN=$2 NC_PRI=$3 NC_PSK=$NC_PSK nj_update '
+		.wifi = (.wifi // {}) | .wifi.networks = (.wifi.networks // [])
+		| if any(.wifi.networks[]; .ssid == env.NC_SSID) then
+			.wifi.networks |= map(if .ssid == env.NC_SSID then
+				(if env.NC_OPEN == "1" then del(.psk) else .psk = env.NC_PSK end)
+				| (if env.NC_PRI != "" then .priority = (env.NC_PRI | tonumber) else . end) else . end)
+		  else .wifi.networks += [{ssid: env.NC_SSID, priority: (if env.NC_PRI != "" then (env.NC_PRI | tonumber)
+				else ([.wifi.networks[] | .priority // 0] | if length == 0 then 10 else 0 end) end), ipv4: {mode: "dhcp"}}
+				+ (if env.NC_OPEN == "1" then {} else {psk: env.NC_PSK} end)] end' || return 1
+	if [ $ex = yes ]; then log "wifi network updated: $1"; say "Wi-Fi network \"$1\" updated"; else log "wifi network added: $1"; say "Wi-Fi network \"$1\" added"; fi
+	net_apply
+}
+read_secret() {   # one line from stdin into NC_SECRET; never from a terminal (no prompts, no echo)
+	[ -t 0 ] && { err "$1 is read from stdin, not from a terminal or the command line (e.g. printf '%s\\n' \"\$P\" | nexus-config nonint ...)"; return 1; }
+	IFS= read -r NC_SECRET || [ -n "$NC_SECRET" ] || { err "$1: nothing on stdin"; return 1; }
+	NC_SECRET=$(printf '%s' "$NC_SECRET" | tr -d '\r')
+}
+do_wifi_add() {
+	ssid=${1:-}; shift; open=0; pri=
+	while [ $# -gt 0 ]; do case "$1" in --open) open=1 ;; --priority) pri=${2:-}; shift ;; *) err "do_wifi_add SSID [--open] [--priority N] (passphrase on stdin)"; return 2 ;; esac; shift; done
+	[ -n "$ssid" ] || { err "do_wifi_add SSID [--open] [--priority N] (passphrase on stdin)"; return 2; }
+	NC_PSK=; if [ $open = 0 ]; then read_secret "the Wi-Fi passphrase" || return 1; NC_PSK=$NC_SECRET; fi
+	wifi_add "$ssid" $open "$pri"
+}
+do_wifi_remove() {
+	wifi_exists "${1:-}" || { err "no Wi-Fi network \"${1:-}\""; return 1; }
+	NC_SSID=$1 nj_update '.wifi.networks |= map(select(.ssid != env.NC_SSID))' || return 1
+	log "wifi network removed: $1"; say "Wi-Fi network \"$1\" removed"; net_apply
+}
+do_wifi_default() {
+	wifi_exists "${1:-}" || { err "no Wi-Fi network \"${1:-}\""; return 1; }
+	NC_SSID=$1 nj_update '([.wifi.networks[] | select(.ssid != env.NC_SSID) | .priority // 0] | max // 0) as $m
+		| .wifi.networks |= map(if .ssid == env.NC_SSID then .priority = ([$m + 1, 1000] | min) else . end)' || return 1
+	say "\"$1\" is the preferred Wi-Fi network"; net_apply
+}
+do_wifi_priority() {
+	wifi_exists "${1:-}" || { err "no Wi-Fi network \"${1:-}\""; return 1; }
+	case "${2:-}" in ''|*[!0-9]*) err "priority: 0-1000 (highest = preferred)"; return 1 ;; esac
+	NC_SSID=$1 NC_PRI=$2 nj_update '.wifi.networks |= map(if .ssid == env.NC_SSID then .priority = (env.NC_PRI | tonumber) else . end)' || return 1
+	say "\"$1\" priority $2"; net_apply
+}
+# ipv4_filter MODE [ADDRESS/PREFIX] [GATEWAY|-] [DNS,DNS]: a jq expression for the ipv4 object in NC_V4
+ipv4_args() {
+	case "${1:-}" in
+	dhcp) NC_V4='{"mode":"dhcp"}' ;;
+	static)
+		a=${2:-}; g=${3:-}; d=$(printf '%s' "${4:-}" | tr ' ' ',')
+		[ "$g" = - ] && g=
+		ip4 "${a%/*}" && [ "${a#*/}" != "$a" ] || { err "address: IPv4/prefix, e.g. 192.168.1.119/24"; return 1; }
+		[ -z "$g" ] || ip4 "$g" || { err "gateway: an IPv4 address"; return 1; }
+		NC_V4=$(NC_A=$a NC_G=$g NC_D=$d jq -nc '{mode: "static", address: env.NC_A}
+			+ (if env.NC_G != "" then {gateway: env.NC_G} else {} end)
+			+ (if env.NC_D != "" then {dns: (env.NC_D | split(",") | map(select(. != "")))} else {} end)') ;;
+	*) err "IPv4: dhcp | static ADDRESS/PREFIX [GATEWAY|-] [DNS[,DNS]]"; return 2 ;;
+	esac
+}
+do_wifi_ipv4() {
+	ssid=${1:-}; shift
+	wifi_exists "$ssid" || { err "no Wi-Fi network \"$ssid\""; return 1; }
+	ipv4_args "$@" || return $?
+	NC_SSID=$ssid NC_V4=$NC_V4 nj_update '.wifi.networks |= map(if .ssid == env.NC_SSID then .ipv4 = (env.NC_V4 | fromjson) else . end)' || return 1
+	say "\"$ssid\": IPv4 $1"; net_apply
+}
+do_eth_ipv4() {
+	ipv4_args "$@" || return $?
+	NC_V4=$NC_V4 nj_update '.ethernet = ((.ethernet // {}) | .ipv4 = (env.NC_V4 | fromjson))' || return 1
+	say "Ethernet: IPv4 $1"; net_apply
+}
+do_dns() {
+	case "${1:-}" in
+	'') err "do_dns default | DNS[,DNS[,DNS]]"; return 2 ;;
+	default) nj_update 'del(.dns)' || return 1; say "DNS: from DHCP / the static settings" ;;
+	*) d=$(printf '%s' "$*" | tr ' ' ','); for x in $(printf '%s' "$d" | tr ',' ' '); do ip4 "$x" || { err "DNS: IPv4 addresses"; return 1; }; done
+	   NC_D=$d nj_update '.dns = (env.NC_D | split(",") | map(select(. != "")))' || return 1; say "DNS: $d (replaces the DHCP servers)" ;;
+	esac
+	net_apply
+}
+do_wifi_country() {
+	c=$(upper "${1:-}"); printf '%s' "$c" | grep -Eq '^[A-Z]{2}$' || { err "country: ISO 3166 alpha-2 code, e.g. RO, DE, US"; return 1; }
+	env_set country_wlan "$c" || return 1
+	iw reg set "$c" > /dev/null 2>&1
+	log "country_wlan $c"; say "Wi-Fi regulatory country: $c"
+	if [ -f "$NJ" ]; then net_apply; return $?; fi
+}
+do_net_apply() { net_apply; }
+do_net_confirm() { $SBIN/nexus-net confirm; }
+do_net_rollback() { $SBIN/nexus-net revert && say "previous network settings restored"; }
+
+# ---------------------------------------------------------------- Bluetooth
+# bluetoothctl waits forever for a bluetoothd that does not run: only with the daemon, and bounded
+bt_running() { [ -f $P/var/run/bluetoothd.pid ] && kill -0 "$(cat $P/var/run/bluetoothd.pid)" 2>/dev/null; }
+btctl() { bt_running && bluetoothctl --timeout 5 "$@" 2>/dev/null; }
+player_bt_off() {   # keep the NexusBS Player's switch (player.json bt_off) in step
+	f=$STATION/player.json; [ -d "$STATION" ] || return 0
+	if [ -s "$f" ] && jq -e 'type == "object"' "$f" > /dev/null 2>&1; then jq ".bt_off = $1" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+	elif [ "$1" = true ]; then echo '{"bt_off": true}' > "$f"; fi
+	chmod 600 "$f" 2>/dev/null; return 0
+}
+do_bluetooth() {
+	case "${1:-}" in on|off) ;; *) err "bluetooth: on or off"; return 2 ;; esac
+	env_set bluetooth "$1" || return 1
+	if [ "$1" = on ]; then a=true; b=false; else a=false; b=true; fi
+	[ -f "$BTMAIN" ] && sed -i "s/^AutoEnable=.*/AutoEnable=$a/" "$BTMAIN"
+	player_bt_off $b
+	if bt_running; then btctl power "$1" > /dev/null; else say "bluetoothd is not running: applied at the next boot"; fi
+	log "bluetooth $1"; say "Bluetooth: $1 (now and at every boot; the NexusBS Player switch follows)"
+}
+bt_status() {
+	s=$(btctl show)
+	echo "setting: $(env_get bluetooth | grep -x off || echo on)"
+	bt_running || { echo "bluetoothd: not running"; return 0; }
+	if [ -z "$s" ] || printf '%s' "$s" | grep -q 'No default controller'; then echo "controller: none (plug in the Wi-Fi/BT adapter; USB mode auto or host)"
+	else printf '%s\n' "$s" | sed -n 's/^Controller \([0-9A-Fa-f:]*\).*/controller: \1/p'
+		printf '%s\n' "$s" | grep -E '^[[:space:]]*(Name|Powered|Discoverable|Pairable): ' | sed 's/^[[:space:]]*/  /'
+		d=$(btctl paired-devices); printf '%s' "$d" | grep -q '^Device' || d=$(btctl devices Paired)
+		echo "paired devices:"; printf '%s\n' "$d" | sed -n 's/^Device /  /p'; fi
+}
+
+# ---------------------------------------------------------------- NexusBS station
+station_apply() {   # station_apply FILE: FILE holds KEY=value lines (0600); runs the provisioning
+	[ -x "$NEXUS2" ] || { rm -f "$1"; err "no application slot (install apps.frm): $NEXUS2 is missing"; return 1; }
+	mkdir -p "$STATION" && chmod 700 "$STATION" && chmod 600 "$1" && mv "$1" "$STATION/setup.txt" || { rm -f "$1"; return 1; }
+	"$NEXUS2" provision --data "$STATION" --defaults "$APPS/nexus/defaults"; rc=$?
+	rm -f "$STATION/setup.txt"   # applied or refused: never leave secrets behind
+	if [ -f "$STATION/xo_correction.pending" ]; then do_xo_correction "$(cat "$STATION/xo_correction.pending")"; rm -f "$STATION/xo_correction.pending"; fi
+	echo "--- $STATION/setup.result:"; cat "$STATION/setup.result" 2>/dev/null
+	grep -q '^applied' "$STATION/setup.result" 2>/dev/null && [ $rc = 0 ] && { log "station setup applied"; say "restart NexusBS to use it (nexus-config nonint do_station_restart)"; return 0; }
+	log "station setup refused"; return 1
+}
+station_line() {   # station_line KEY VALUE >> file, checked
+	k=$(upper "$1"); inlist "$k" $STATION_KEYS || { err "unknown key $1 (keys: $STATION_KEYS)"; return 1; }
+	printf '%s' "$2" | LC_ALL=C grep -q '[[:cntrl:]]' && { err "$k: control characters are not allowed"; return 1; }
+	printf '%s=%s\n' "$k" "$2"
+}
+do_station_set() {
+	k=$(upper "${1:-}"); [ -n "$k" ] || { err "do_station_set KEY [VALUE] (secret keys: value on stdin)"; return 2; }
+	inlist "$k" $STATION_KEYS || { err "unknown key $1 (keys: $STATION_KEYS)"; return 1; }
+	if [ $# -ge 2 ]; then is_secret "$k" && { err "$k is a secret: give it on stdin, not on the command line"; return 1; }; v=$2
+	else read_secret "$k" || return 1; v=$NC_SECRET; fi
+	[ -n "$v" ] || { err "$k: empty value, nothing to set"; return 1; }
+	mkdir -p "$STATION" || return 1; t=$STATION/.setup.$$
+	station_line "$k" "$v" > "$t" || { rm -f "$t"; return 1; }
+	station_apply "$t"
+}
+do_station_setup() {   # KEY=value lines on stdin (the nexus-setup.txt format)
+	[ -t 0 ] && { err "the setup lines are read from stdin (nexus-config nonint do_station_setup < nexus-setup.txt)"; return 1; }
+	mkdir -p "$STATION" || return 1; t=$STATION/.setup.$$; : > "$t"
+	while IFS= read -r l || [ -n "$l" ]; do
+		l=$(printf '%s' "$l" | tr -d '\r'); case "$l" in ''|'#'*) continue ;; *=*) ;; *) rm -f "$t"; err "expected KEY=value lines"; return 1 ;; esac
+		station_line "$(printf '%s' "${l%%=*}" | tr -d ' ')" "${l#*=}" >> "$t" || { rm -f "$t"; return 1; }
+	done
+	[ -s "$t" ] || { rm -f "$t"; err "nothing on stdin"; return 1; }
+	station_apply "$t"
+}
+do_station_restart() {
+	[ "$(role)" = master ] || { err "role slave: NexusBS does not run on this Pluto (nexus-config nonint do_role master)"; return 1; }
+	$INITD/S97app restart
+}
+station_status() {
+	echo "role: $(role)"
+	if [ -f "$APPS/.slot-header" ]; then
+		echo "application slot: $(sed -n 's/^version=//p' "$APPS/.slot-header" | head -1) (created $(sed -n 's/^created=//p' "$APPS/.slot-header" | head -1))"
+	else echo "application slot: none unpacked (install apps.frm through the USB drive)"; fi
+	p=$(pidof nexus2 2>/dev/null); [ -n "$p" ] && echo "NexusBS: running (pid $p)" || echo "NexusBS: not running"
+	c=$(awk '/^\[/ { s = ($0 == "[station]") } s && /^callsign[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); print; exit }' "$STATION/nexus2.toml" 2>/dev/null)
+	[ -n "$c" ] && echo "callsign: $c"
+	echo "dashboard: http://$(hostname 2>/dev/null).local:8080"
+	[ -f "$STATION/setup.result" ] && echo "last setup: $(head -1 "$STATION/setup.result")"
+	return 0
+}
+station_login() {
+	f=$STATION/dashboard-login.txt
+	if [ -f "$f" ]; then echo "generated dashboard login: $f (0600; cat it on the Pluto, it holds the password)"
+	else echo "no generated login file ($f): the password was set with DASHBOARD_PASSWORD or in the dashboard"; fi
+}
+do_station_log() { n=${1:-50}; case "$n" in *[!0-9]*) n=50 ;; esac; [ -f "$NLOG" ] && tail -n "$n" "$NLOG" || echo "no $NLOG (NexusBS has not run since boot)"; }
+
+# ---------------------------------------------------------------- update / maintenance
+. $SBIN/apps-flash-lib.sh 2>/dev/null
+versions() {
+	echo "firmware: $(sed -n 's/^device-fw //p' $P/opt/VERSIONS 2>/dev/null | head -1)"
+	if [ -f "$APPS/.slot-header" ]; then echo "application slot: $(hdrval "$APPS/.slot-header" version)"
+	else echo "application slot: none"; fi
+	Z=$(mtdnum qspi-fsbl-uboot 2>/dev/null)
+	[ -n "$Z" ] && echo "U-Boot: $(dd if=$(mtddev $Z) bs=65536 count=16 2>/dev/null | tr -c ' -~' '\n' | grep -m1 '^U-Boot 20')"
+	echo "FSBL (CPU/DDR clock): $($SBIN/nexus-clock status 2>/dev/null | jq -r '"\(.installed) installed, \(.effective) configured, CPU \(.cpu_mhz) MHz / DDR \(.ddr_mts) MT/s"' 2>/dev/null)"
+	echo "kernel: $(uname -r)"
+}
+update_help() { cat <<'EOF'
+Firmware updates go through the Pluto's USB drive (USB-C to a computer, usb_mode peripheral or auto):
+  pluto.frm   the firmware (kernel + root file system), with boot.frm on a first install from stock
+  boot.frm    FSBL + U-Boot + U-Boot environment (no fallback: never cut power while it is written)
+  apps.frm    the NexusBS application slot (apps-stock-clock.frm also resets the CPU clock to standard)
+  nexus-setup.txt  station identity, applied once (or: nexus-config, NexusBS station)
+Copy the files (at most one boot*.frm and one apps*.frm), eject the drive, wait: the LED blinks fast
+while flashing and the Pluto reboots. /mnt/data (settings, NexusBS data, pairings, SSH keys) is kept.
+Back up /mnt/data first anyway (Update / maintenance -> Backup).
+EOF
+}
+do_backup() {
+	d=${1:-}; [ -n "$d" ] || { err "do_backup PATH | - (stdout)"; return 2; }
+	grep -q " /mnt/data " $P/proc/mounts 2>/dev/null || { err "/mnt/data is not mounted, nothing to back up"; return 1; }
+	if [ "$d" = - ]; then [ -t 1 ] && { err "the archive goes to stdout: redirect it (ssh root@pluto nexus-config nonint do_backup - > backup.tar.gz)"; return 1; }
+		tar -c -C "$DATA" . | gzip; return $?; fi
+	case "$d" in /mnt/data|/mnt/data/*) err "the backup cannot be written inside /mnt/data"; return 1 ;; esac
+	[ -d "$P$d" ] && d=$d/nexus-data-$(date +%Y%m%d-%H%M%S).tar.gz
+	tar -c -C "$DATA" . | gzip > "$P$d" && chmod 600 "$P$d" || { rm -f "$P$d"; err "backup failed"; return 1; }
+	log "backup written to $d"; say "backup: $d ($(wc -c < "$P$d") bytes, 0600; it contains passwords and keys; restore: tar -xzf FILE -C /mnt/data)"
+}
+do_factory_reset() {
+	[ "${1:-}" = ERASE-ALL-DATA ] || { err "do_factory_reset ERASE-ALL-DATA: erases /mnt/data (network, NexusBS station, pairings, SSH host keys)"; return 2; }
+	grep -q " /mnt/data ubifs " $P/proc/mounts 2>/dev/null || { err "/mnt/data is not the persistent partition here, nothing done"; return 1; }
+	$INITD/S97app stop > /dev/null 2>&1
+	rm -rf "$DATA"/* "$DATA"/.[!.]* 2>/dev/null
+	mkdir -p "$DATA/bt/lib" "$DATA/dropbear" "$DATA/network" && chmod 700 "$DATA/bt" "$DATA/bt/lib" "$DATA/dropbear" "$DATA/network"
+	sync; log "factory reset of /mnt/data"
+	say "/mnt/data erased. Reboot now: the station gets its defaults again, new SSH host keys (clients warn once)."
+	say "The U-Boot environment (config.txt keys) is unchanged."
+}
+
+# ---------------------------------------------------------------- get
+get() {
+	case "${1:-}" in
+	hostname) hostname ;;
+	role) role ;;
+	usb_mode) v=$(env_get usb_mode); inlist "$v" peripheral auto host || v=peripheral; echo $v ;;
+	xo_correction) v=$(env_get xo_correction); [ -n "$v" ] && echo "$v" || echo unset ;;
+	xo_ppm) v=$(env_get xo_correction); [ -n "$v" ] && ppm "$v" && echo || echo unset ;;
+	cpu_clock) v=$(env_get cpu_clock); inlist "$v" $VARIANTS || v=standard; echo $v ;;
+	clock) $SBIN/nexus-clock status ;;
+	bluetooth) env_get bluetooth | grep -x off || echo on ;;
+	bt) bt_status ;;
+	country) v=$(env_get country_wlan); printf '%s' "$v" | grep -Eq '^[A-Z]{2}$' || v=RO; echo $v ;;
+	wifi) wifi_list ;;
+	network) $SBIN/nexus-net status ;;
+	dns) [ -f "$NJ" ] && jq -r '(.dns // []) | if length == 0 then "default" else join(",") end' "$NJ" || echo default ;;
+	ethernet) [ -f "$NJ" ] && jq -c '.ethernet.ipv4 // {mode: "dhcp"}' "$NJ" || echo '{"mode":"dhcp"}' ;;
+	net_pending) [ -f $P/run/nexus-net/pending ] && echo yes || echo no ;;
+	station) station_status ;;
+	station_login) station_login ;;
+	station_result) cat "$STATION/setup.result" 2>/dev/null ;;
+	versions) versions ;;
+	all) for i in hostname role usb_mode xo_correction xo_ppm cpu_clock bluetooth country dns net_pending; do printf '%-14s %s\n' "$i" "$(get $i)"; done ;;
+	*) echo "items: hostname role usb_mode xo_correction xo_ppm cpu_clock clock bluetooth bt country wifi network dns ethernet net_pending station station_login station_result versions all"; return 2 ;;
+	esac
+}
+wifi_list() {
+	[ -f "$NJ" ] || { s=$(env_get ssid_wlan); [ -n "$s" ] && echo "\"$s\" (config.txt)" || echo "no Wi-Fi network"; return 0; }
+	cur=$(wpa_cli -p /run/wpa_supplicant -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')
+	NC_CUR=$cur jq -r '(.wifi.networks // []) | (map(.priority // 0) | max) as $m | if length == 0 then "no Wi-Fi network" else .[] |
+		"\"\(.ssid)\"  priority \(.priority // 0)  ipv4 \(.ipv4.mode // "dhcp")\(if .ipv4.mode == "static" then " " + .ipv4.address else "" end)"
+		+ (if (.psk // "") == "" then "  open" else "" end) + (if (.priority // 0) == $m then "  default" else "" end)
+		+ (if .ssid == env.NC_CUR then "  connected" else "" end) end' "$NJ"
+}
+net_status_text() {
+	$SBIN/nexus-net status 2>/dev/null | jq -r '"host name: \(.hostname)",
+		(.interfaces | to_entries[] | "\(.key): \(if (.value.ipv4 | length) == 0 then "no address" else (.value.ipv4 | join(" ")) end) (\(.value.mode))"),
+		"gateway: \(.gateway // "none")", "DNS: \(.dns | join(" "))",
+		"Wi-Fi: \(.wifi.ssid // "not connected")\(if .wifi.signal_dbm then ", signal \(.wifi.signal_dbm) dBm" else "" end)",
+		"settings from: \(.source)\(if .rollback_pending then " (change waiting for confirmation)" else "" end)"' 2>/dev/null || echo "network status unavailable"
+}
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+
+nonint functions:
+  do_hostname NAME                     do_role master|slave            do_usb_mode peripheral|auto|host
+  do_xo_correction HZ|default [--now]  do_cpu_clock VARIANT [--cooling-confirmed]
+  do_reboot  do_shutdown
+  do_wifi_add SSID [--open] [--priority N]   (passphrase on stdin)
+  do_wifi_remove SSID  do_wifi_default SSID  do_wifi_priority SSID N
+  do_wifi_ipv4 SSID dhcp | static ADDRESS/PREFIX [GATEWAY|-] [DNS[,DNS]]
+  do_eth_ipv4 dhcp | static ADDRESS/PREFIX [GATEWAY|-] [DNS[,DNS]]
+  do_dns default | DNS[,DNS[,DNS]]     do_wifi_country CC
+  do_net_apply  do_net_confirm  do_net_rollback
+  do_bluetooth on|off
+  do_station_set KEY [VALUE]           (secret keys: value on stdin)
+  do_station_setup                     (KEY=value lines on stdin)
+  do_station_restart  do_station_log [LINES]
+  do_backup PATH|-                     do_factory_reset ERASE-ALL-DATA
+EOF
+}
+NONINT="do_hostname do_role do_usb_mode do_xo_correction do_cpu_clock do_reboot do_shutdown do_wifi_add do_wifi_remove do_wifi_default do_wifi_priority do_wifi_ipv4 do_eth_ipv4 do_dns do_wifi_country do_net_apply do_net_confirm do_net_rollback do_bluetooth do_station_set do_station_setup do_station_restart do_station_log do_backup do_factory_reset"
+
+# ---------------------------------------------------------------- interactive menu
+BACKTITLE="NexusBS Pluto configuration (nexus-config)"
+dlg() { dialog --backtitle "$BACKTITLE" --cr-wrap --output-fd 3 "$@" 3>&1 1>&4 2>&4; }
+textbox() { t=$(mktemp); printf '%s\n' "$2" > "$t"; dlg --title "$1" --exit-label OK --textbox "$t" 22 78; rm -f "$t"; }
+locked() { ( exec 9> "$LOCK"; lock9 || { echo "another nexus-config is busy"; exit 1; }; "$@" ); }
+# act TITLE FUNCTION ARGS: run locked, show what it said; returns its status (3 = network confirmation)
+act() {
+	t=$1; shift; out=$(locked "$@" 2>&1); rc=$?
+	if [ $rc = 3 ]; then
+		if dlg --title "Keep the new network settings?" --timeout 55 --yesno "$out\n\nYou still see this, so the connection works. Keep the new settings?\n(No, or no answer within 55 s: the previous settings return.)" 18 76
+		then out=$(locked do_net_confirm 2>&1); else out=$(locked do_net_rollback 2>&1); fi
+	fi
+	[ -n "$out" ] && textbox "$t" "$out"; return $rc
+}
+ask() { dlg --title "$1" --inputbox "$2" 12 76 "${3:-}"; }
+secret() { dlg --title "$1" --insecure --passwordbox "$2" 11 76; }
+confirm() { dlg --title "$1" --defaultno --yesno "$2" 16 76; }
+
+menu_system() {
+	while :; do
+		x=$(env_get xo_correction)
+		c=$(dlg --title System --cancel-label Back --menu "" 17 76 8 \
+			1 "Host name            $(hostname)" \
+			2 "Station role         $(role)" \
+			3 "USB mode             $(get usb_mode)" \
+			4 "Crystal correction   ${x:-unset}${x:+ Hz ($(ppm $x) ppm)}" \
+			5 "CPU/DDR clock        $(get cpu_clock)" \
+			6 "Reboot" \
+			7 "Shut down") || return
+		case $c in
+		1) v=$(ask "Host name" "Host name (letters, digits, -). DHCP requests carry it, mDNS answers <name>.local." "$(hostname)") && act "Host name" do_hostname "$v" ;;
+		2) v=$(dlg --title "Station role" --default-item "$(role)" --menu "slave: SDR for NexusBS on another computer (USB/IP gadgets, iiod).\nmaster: NexusBS runs on this Pluto and uses the radio directly.\nSwitching rebuilds the USB composite (a USB link drops for a few seconds)." 15 76 2 \
+				slave "SDR for an external NexusBS" master "NexusBS on this Pluto") && act "Station role" do_role "$v" ;;
+		3) v=$(dlg --title "USB mode" --default-item "$(get usb_mode)" --menu "USB-C port role, applied at the next boot.\nperipheral: a computer is the USB host (USB network, drive, SDR over USB).\nauto: peripheral; host when no computer configures the port within 20 s.\nhost: always host (hub with Wi-Fi/Ethernet adapters); a computer no longer sees the Pluto." 16 76 3 \
+				peripheral "a computer is the host (default)" auto "host when no computer is found" host "always host") && act "USB mode" do_usb_mode "$v" ;;
+		4) v=$(ask "Crystal correction" "The AD9361 reference: the measured frequency of this board's 40 MHz crystal in Hz,\ne.g. 39999331. ppm = (xo - 40000000) / 40000000 x 1e6, so 39999331 = -16.725 ppm\n(the crystal runs 16.725 ppm low). Type 'default' to remove it. Active at the next boot." "$x") || continue
+		   [ "$v" = default ] && { act "Crystal correction" do_xo_correction default; continue; }
+		   now=; dlg --title "Crystal correction" --defaultno --yesno "Apply $v Hz ($(ppm "$v" 2>/dev/null) ppm) to the AD9361 now as well?\nThe radio retunes; a running NexusBS should be restarted afterwards." 9 76 && now=--now
+		   act "Crystal correction" do_xo_correction "$v" $now ;;
+		5) menu_clock ;;
+		6) confirm Reboot "Reboot the Pluto now?" && { clear; do_reboot; exit 0; } ;;
+		7) confirm "Shut down" "Shut the Pluto down now? It stays off until power is cycled." && { clear; do_shutdown; exit 0; } ;;
+		esac
+	done
+}
+menu_clock() {
+	st=$($SBIN/nexus-clock status 2>/dev/null | jq -r '"configured \(.configured), installed \(.installed), running CPU \(.cpu_mhz) MHz / DDR \(.ddr_mts) MT/s"' 2>/dev/null)
+	v=$(dlg --title "CPU/DDR clock" --default-item "$(get cpu_clock)" --menu "$st\n\nThe boot block is rewritten at the next restart; a power cut during that < 1 s write needs DFU/JTAG recovery." 17 76 4 \
+		standard "Tezuka default clocks (recommended)" \
+		495_396 "CPU 495/DDR 396: Tezuka file, not tested on the reference board" \
+		950_600 "CPU 950/DDR 600: Tezuka file, not tested on the reference board" \
+		1100_750 "CPU 1100/DDR 750: heatsinks + fan only, above spec") || return
+	f=
+	if [ "$v" = 1100_750 ]; then
+		confirm "1100 MHz: active cooling required" "CPU 1100 MHz / DDR 750 MT/s was tested on the reference board (HamGeek Pluto Nano Rev.B) with heatsinks and a fan installed only. It is above the -1 speed grade specification of the Zynq; without active cooling it is not safe.\n\nAre heatsinks AND a running fan installed on this board?" || return
+		f=--cooling-confirmed
+	fi
+	act "CPU/DDR clock" do_cpu_clock "$v" $f || return
+	confirm "Restart now?" "The new clock is written at the next restart (< 1 s flash write: do not cut power while the Pluto restarts).\n\nRestart now?" && { clear; do_reboot; exit 0; }
+}
+menu_network() {
+	while :; do
+		pend=; [ "$(get net_pending)" = yes ] && pend="  (CHANGE WAITING FOR CONFIRMATION)"
+		c=$(dlg --title "Network$pend" --cancel-label Back --menu "Settings in /mnt/data/network/network.json (nexus-net). Changes over the\ninterface this session uses roll back after 60 s unless confirmed." 20 76 11 \
+			1 "Status" 2 "Wi-Fi networks" 3 "Add / change a Wi-Fi network" 4 "Remove a Wi-Fi network" \
+			5 "Preferred (default) Wi-Fi network" 6 "Wi-Fi network IPv4 (DHCP / static)" 7 "Ethernet IPv4 (DHCP / static)" \
+			8 "DNS override         $(get dns)" 9 "Regulatory country   $(get country)" \
+			C "Confirm a pending change" R "Roll back a pending change now") || return
+		case $c in
+		1) textbox "Network status" "$(net_status_text)" ;;
+		2) textbox "Wi-Fi networks" "$(wifi_list)" ;;
+		3) s=$(ask "Wi-Fi network" "SSID (network name, 1-32 bytes); an existing one is updated:") || continue
+		   o=0; NC_PSK=
+		   if dlg --title "Wi-Fi network" --yes-label "WPA/WPA2" --no-label "Open" --yesno "Security of \"$s\"?" 7 60; then
+			NC_PSK=$(secret "Wi-Fi passphrase" "Passphrase of \"$s\" (8-63 characters or 64 hex digits; not shown):") || continue
+		   else o=1; fi
+		   act "Wi-Fi network" wifi_add "$s" $o ""; r=$?; NC_PSK=
+		   [ $r = 0 ] || [ $r = 3 ] || continue
+		   wifi_exists "$s" && dlg --title "Wi-Fi network" --yesno "Make \"$s\" the preferred network?" 7 60 && act "Wi-Fi network" do_wifi_default "$s" ;;
+		4|5|6) s=$(pick_wifi) || continue
+		   case $c in
+		   4) confirm "Remove" "Remove the Wi-Fi network \"$s\"?" && act "Wi-Fi network" do_wifi_remove "$s" ;;
+		   5) act "Wi-Fi network" do_wifi_default "$s" ;;
+		   6) ipv4_dialog "Wi-Fi \"$s\" IPv4" && act "Wi-Fi IPv4" do_wifi_ipv4 "$s" $V4 ;;
+		   esac ;;
+		7) ipv4_dialog "Ethernet IPv4" && act "Ethernet IPv4" do_eth_ipv4 $V4 ;;
+		8) v=$(ask "DNS override" "Up to 3 DNS servers (comma separated) replacing the DHCP ones,\nor 'default' to use the DHCP / static settings:" "$(get dns)") && act DNS do_dns "$v" ;;
+		9) v=$(ask "Regulatory country" "Wi-Fi regulatory country (ISO 3166 alpha-2: RO, DE, US, ...):" "$(get country)") && act "Country" do_wifi_country "$v" ;;
+		C) act "Confirm" do_net_confirm ;;
+		R) act "Roll back" do_net_rollback ;;
+		esac
+	done
+}
+pick_wifi() {   # prints the chosen SSID
+	[ -f "$NJ" ] || { textbox "Wi-Fi" "No network.json yet: add a network first."; return 1; }
+	f=$(mktemp); jq -r '(.wifi.networks // [])[] | .ssid' "$NJ" > "$f"
+	set --; i=0; while IFS= read -r s; do i=$((i + 1)); set -- "$@" "$i" "$s"; done < "$f"
+	[ $i -gt 0 ] || { rm -f "$f"; textbox "Wi-Fi" "No Wi-Fi network configured."; return 1; }
+	c=$(dlg --title Wi-Fi --cancel-label Back --menu "Select a network" 16 70 8 "$@"); rc=$?
+	[ $rc = 0 ] && sed -n "${c}p" "$f"; rm -f "$f"; return $rc
+}
+ipv4_dialog() {   # sets V4 (word list for do_*_ipv4)
+	m=$(dlg --title "$1" --menu "" 10 60 2 dhcp "DHCP (automatic)" static "Static address") || return 1
+	[ "$m" = dhcp ] && { V4=dhcp; return 0; }
+	a=$(ask "$1" "Address/prefix, e.g. 192.168.1.119/24:") || return 1
+	g=$(ask "$1" "Gateway (empty: none):") || return 1
+	d=$(ask "$1" "DNS servers, comma separated (empty: none):") || return 1
+	V4="static $a ${g:--} $(printf '%s' "$d" | tr -d ' ')"
+}
+menu_bluetooth() {
+	while :; do
+		c=$(dlg --title Bluetooth --cancel-label Back --menu "The USB Wi-Fi/BT adapter's controller. The NexusBS Player has its own Bluetooth switch\nfor the same controller; off here = powered off at every boot, Player switch off." 13 76 3 \
+			1 "Bluetooth            $(get bluetooth)" 2 "Controller and paired devices") || return
+		case $c in
+		1) v=$(dlg --title Bluetooth --default-item "$(get bluetooth)" --menu "" 9 50 2 on "enabled" off "disabled (powered off)") && act Bluetooth do_bluetooth "$v" ;;
+		2) textbox "Bluetooth" "$(bt_status)" ;;
+		esac
+	done
+}
+station_key_menu() {   # collect values in NCV_<KEY>; apply writes setup.txt and runs the provisioning
+	for k in $STATION_KEYS; do eval "NCV_$k="; done
+	while :; do
+		set --; for k in $STATION_KEYS; do eval "v=\$NCV_$k"; s=
+			if [ -n "$v" ]; then if is_secret $k; then s="(new value set)"; else s="= $v"; fi; fi; set -- "$@" "$k" "$s"; done
+		c=$(dlg --title "Station identity" --cancel-label Back --extra-button --extra-label Apply --menu "Set the values to change, then Apply (nexus2 provision; the result is shown).\nEmpty = unchanged. Secrets are entered hidden and never shown." 22 76 14 "$@"); rc=$?
+		case $rc in
+		3) t=$STATION/.setup.$$; mkdir -p "$STATION"; : > "$t"; any=0
+		   for k in $STATION_KEYS; do eval "v=\$NCV_$k"; [ -n "$v" ] && { station_line "$k" "$v" >> "$t" || { rm -f "$t"; continue 2; }; any=1; }; done
+		   [ $any = 1 ] || { rm -f "$t"; textbox "Station identity" "Nothing to apply."; continue; }
+		   act "Station identity" station_apply "$t" && confirm "Restart NexusBS?" "Restart NexusBS now to use the new settings?" && act "NexusBS" do_station_restart
+		   for k in $STATION_KEYS; do eval "NCV_$k="; done; return ;;
+		0) if is_secret "$c"; then v=$(secret "$c" "New value of $c (hidden):") || continue
+		   elif [ "$c" = TRANSMIT ]; then v=$(dlg --title TRANSMIT --menu "" 9 40 2 yes "transmit on" no "transmit off") || continue
+		   else v=$(ask "$c" "New value of $c:") || continue; fi
+		   eval "NCV_$c=\$v" ;;
+		*) for k in $STATION_KEYS; do eval "NCV_$k="; done; return ;;
+		esac
+	done
+}
+menu_station() {
+	while :; do
+		c=$(dlg --title "NexusBS station" --cancel-label Back --menu "" 14 76 5 \
+			1 "Status" 2 "Station identity (callsign, IDs, passwords)" 3 "Restart NexusBS" \
+			4 "Dashboard login" 5 "NexusBS log") || return
+		case $c in
+		1) textbox "NexusBS station" "$(station_status)" ;;
+		2) station_key_menu ;;
+		3) act "NexusBS" do_station_restart ;;
+		4) textbox "Dashboard login" "$(station_login)" ;;
+		5) textbox "NexusBS log (last 200 lines)" "$(do_station_log 200)" ;;
+		esac
+	done
+}
+menu_update() {
+	while :; do
+		c=$(dlg --title "Update / maintenance" --cancel-label Back --menu "" 13 76 4 \
+			1 "Versions" 2 "How to update (USB drive)" 3 "Backup /mnt/data" 4 "Factory reset of /mnt/data") || return
+		case $c in
+		1) textbox Versions "$(versions)" ;;
+		2) textbox "Firmware update" "$(update_help)" ;;
+		3) v=$(ask Backup "Write a tar.gz of /mnt/data to this file or directory (a USB stick is under /media;\n/tmp is RAM and lost at reboot). It contains passwords and keys:" /tmp) && act Backup do_backup "$v" ;;
+		4) confirm "Factory reset" "Erase EVERYTHING on /mnt/data: network settings, NexusBS station configuration, Bluetooth pairings, SSH host keys?" && \
+		   confirm "Factory reset: second confirmation" "This cannot be undone. Make a backup first.\n\nReally erase /mnt/data?" && \
+		   { act "Factory reset" do_factory_reset ERASE-ALL-DATA && confirm Reboot "Reboot now?" && { clear; do_reboot; exit 0; }; } ;;
+		esac
+	done
+}
+about() { cat <<EOF
+nexus-config: configuration of a NexusBS Pluto Nano ($(sed -n 's/^device-fw //p' $P/opt/VERSIONS 2>/dev/null | head -1)).
+Everything here is scriptable: nexus-config nonint FUNCTION [ARGS], nexus-config get ITEM,
+nexus-config help. Settings live in the U-Boot environment (the same keys as config.txt on the
+USB drive), /mnt/data/network/network.json and /mnt/data/nexus2. The USB drive's config.txt
+shows values changed here after the next boot; a key edited there still wins.
+EOF
+}
+menu() {
+	[ -t 0 ] && [ -t 1 ] || { err "the menu needs a terminal; use nexus-config nonint / get"; exit 2; }
+	command -v dialog > /dev/null 2>&1 || { err "dialog is missing; use nexus-config nonint / get"; exit 1; }
+	# a terminal type without a terminfo entry (e.g. some ssh clients) falls back to vt100
+	case "${TERM:-}" in ''|dumb|unknown) TERM=vt100 ;; esac
+	t=$(printf '%s' "$TERM" | cut -c1)
+	[ -e "/usr/share/terminfo/$t/$TERM" ] || [ -e "/etc/terminfo/$t/$TERM" ] || [ -e "$HOME/.terminfo/$t/$TERM" ] || TERM=vt100
+	export TERM
+	exec 4>&1
+	while :; do
+		c=$(dlg --title nexus-config --cancel-label Finish --menu "$(hostname)  -  role $(role)  -  $(sed -n 's/^device-fw //p' $P/opt/VERSIONS 2>/dev/null | head -1)" 16 76 6 \
+			1 "System         host name, role, USB, crystal, CPU clock, reboot" \
+			2 "Network        Wi-Fi, Ethernet, DNS, country, status" \
+			3 "Bluetooth      on/off, controller, paired devices" \
+			4 "NexusBS        station status, identity, restart, log" \
+			5 "Update         versions, USB drive update, backup, reset" \
+			6 "About / help") || break
+		case $c in 1) menu_system ;; 2) menu_network ;; 3) menu_bluetooth ;; 4) menu_station ;; 5) menu_update ;; 6) textbox About "$(about)"; textbox Help "$(usage)" ;; esac
+	done
+	clear
+}
+
+case "${1:-}" in
+'') menu ;;
+nonint)
+	shift
+	while :; do case "${1:-}" in
+		--no-apply) NOAPPLY=1; shift ;;
+		--rollback) ROLLBACK=${2:-}; case "$ROLLBACK" in ''|*[!0-9]*) err "--rollback SECONDS"; exit 2 ;; esac; shift 2 ;;
+		--no-rollback) ROLLBACK=0; shift ;;
+		*) break ;; esac; done
+	f=${1:-}; inlist "$f" $NONINT || { err "unknown function '${f}' (nexus-config help)"; exit 2; }
+	shift; exec 9> "$LOCK" && lock9 || { err "another nexus-config is busy"; exit 1; }
+	"$f" "$@"; exit $? ;;
+get) shift; get "$@"; exit $? ;;
+help|-h|--help) usage; exit 0 ;;
+*) usage >&2; exit 2 ;;
+esac

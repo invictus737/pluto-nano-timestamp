@@ -1,8 +1,10 @@
 # PlutoSDR (Pluto Nano, NexusBS firmware v0.39-nexusBS) device configuration: generic example.
 # The live file is config.txt on the Pluto's USB drive (written at every boot from the U-Boot
-# environment). Edit it there, save, eject the drive: the values go into the U-Boot environment
-# (the same keys work with `fw_setenv <key> <value>` over SSH). Never share a file with real
-# passwords in it.
+# environment). Edit it there, save, eject the drive: the values go into the U-Boot environment.
+# On the Pluto itself (SSH or serial console) `nexus-config` sets the same keys; the drive shows
+# those changes after the next boot, and only the keys edited on the drive are taken from it.
+# Never share a file with real passwords in it. Once nexus-config has written
+# /mnt/data/network/network.json, the [WLAN] ssid/pwd/ipaddr and [USB_ETHERNET] keys are ignored.
 
 [NETWORK]
 # host name: DHCP requests carry it (the router lists the Pluto under it) and mDNS answers
@@ -29,7 +31,8 @@ ipaddr_eth =
 netmask_eth = 255.255.255.0
 
 [SYSTEM]
-# reference oscillator correction in Hz (40 MHz nominal), measured per board
+# the measured frequency of this board's 40 MHz reference in Hz (empty = 40000000 nominal), e.g.
+# 39999331 = -16.725 ppm (ppm = (xo_correction - 40000000) / 40000000 x 1e6); active at the next boot
 xo_correction =
 udc_handle_suspend = 0
 # USB Communication Device Class Compatibility Mode [rndis|ncm|ecm]
@@ -37,6 +40,17 @@ usb_ethernet_mode = rndis
 # NexusBS station role [slave|master]: slave = SDR for NexusBS on another computer,
 # master = NexusBS runs on this Pluto (/mnt/data/nexus2, example /etc/nexus2/nexus2.example.toml)
 operating_mode = slave
+# USB-C role [peripheral|auto|host], applied at the next boot: peripheral = a computer is the host,
+# host = hub with Wi-Fi/Ethernet adapters, auto = host when no computer configures the port
+usb_mode = peripheral
+# CPU/DDR clock [standard|495_396|950_600|1100_750], applied at the next boot by rewriting the 64 KiB
+# FSBL block (< 1 s; a power cut during it needs DFU/JTAG recovery). 495_396 / 950_600: Tezuka files,
+# not tested on the reference board. 1100_750: tested on the reference board with heatsinks and a fan
+# only, above the -1 speed grade spec; needs cpu_clock_cooling_confirmed = yes, else standard is used.
+cpu_clock = standard
+cpu_clock_cooling_confirmed = no
+# Bluetooth controller at boot [on|off]; off also starts the NexusBS Player switch off
+bluetooth = on
 
 [ACTIONS]
 diagnostic_report = 0
