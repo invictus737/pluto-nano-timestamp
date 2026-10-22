@@ -60,6 +60,6 @@ jobs:
           cat README.md
       - name: Release
         run: |
-          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes-file out/README.md --target "$SHA"
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes-file out/README.md
           gh release edit "$TAG" --notes-file out/README.md
           gh release upload "$TAG" out/pluto.frm out/pluto.dfu out/boot*.frm out/SHA256SUMS out/README.md --clobber

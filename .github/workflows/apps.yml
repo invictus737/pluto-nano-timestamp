@@ -54,6 +54,6 @@ jobs:
       - name: Release apps-${{ inputs.inputs_tag }}
         run: |
           T="apps-$APPS_INPUTS_TAG"
-          gh release view "$T" > /dev/null 2>&1 || gh release create "$T" --title "$T" --notes-file out/README.md --target "$GITHUB_SHA"
+          gh release view "$T" > /dev/null 2>&1 || gh release create "$T" --title "$T" --notes-file out/README.md
           gh release edit "$T" --notes-file out/README.md
           gh release upload "$T" out/*.frm out/SHA256SUMS out/README.md --clobber
