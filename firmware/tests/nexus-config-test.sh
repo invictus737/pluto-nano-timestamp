@@ -353,8 +353,13 @@ rc 0 "S39bluetooth at boot with bluetooth=off" $R/etc/init.d/S39bluetooth start
 check "boot: AutoEnable=false, Player switch off" sh -c "grep -qx 'AutoEnable=false' $R/etc/bluetooth/main.conf && jq -e '.bt_off == true' $R/mnt/data/nexus2/player.json > /dev/null"
 rc 0 "bluetooth on" $NC nonint do_bluetooth on
 check "bluetooth on: env, AutoEnable=true, Player switch on" sh -c "grep -qx 'bluetooth=on' $R/env && grep -qx 'AutoEnable=true' $R/etc/bluetooth/main.conf && jq -e '.bt_off == false' $R/mnt/data/nexus2/player.json > /dev/null"
+# BlueZ storage as on the device: a paired device = <controller>/<address>/info with a [LinkKey]
+mkdir -p "$R/var/lib/bluetooth/11:22:33:44:55:66/AA:BB:CC:DD:EE:FF" "$R/var/lib/bluetooth/11:22:33:44:55:66/CC:DD:EE:FF:00:11"
+printf '[General]\nName=AirPods\n\n[LinkKey]\nKey=00\n' > "$R/var/lib/bluetooth/11:22:33:44:55:66/AA:BB:CC:DD:EE:FF/info"
+printf '[General]\nName=SeenOnly\n' > "$R/var/lib/bluetooth/11:22:33:44:55:66/CC:DD:EE:FF:00:11/info"
 rc 0 "bluetooth status" $NC get bt
 check "bluetooth status shows controller and paired device" sh -c "grep -q 'controller: 11:22:33:44:55:66' $T/out && grep -q 'Powered: yes' $T/out && grep -q 'AirPods' $T/out"
+check "bluetooth status lists only paired devices (LinkKey), never a seen-only one" sh -c "grep -q 'AA:BB:CC:DD:EE:FF AirPods' $T/out && ! grep -q SeenOnly $T/out"
 
 # ================================================================ NexusBS station
 rc 1 "station set without an apps slot" $NC nonint do_station_set CALLSIGN YO3TCO

@@ -251,7 +251,8 @@ do_net_rollback() { svc $SBIN/nexus-net revert > /dev/null && say "previous netw
 # ---------------------------------------------------------------- Bluetooth
 # bluetoothctl waits forever for a bluetoothd that does not run: only with the daemon, and bounded
 bt_running() { [ -f $P/var/run/bluetoothd.pid ] && kill -0 "$(cat $P/var/run/bluetoothd.pid)" 2>/dev/null; }
-btctl() { bt_running && bluetoothctl --timeout 5 "$@" 2>/dev/null; }
+# stdin closed: an unknown command otherwise leaves bluetoothctl waiting in its interactive prompt
+btctl() { bt_running && bluetoothctl --timeout 5 "$@" 2>/dev/null </dev/null; }
 player_bt_off() {   # keep the NexusBS Player's switch (player.json bt_off) in step
 	f=$STATION/player.json
 	# off before the station exists (first boot, slave role): the Player must start off all the same
@@ -276,8 +277,14 @@ bt_status() {
 	if [ -z "$s" ] || printf '%s' "$s" | grep -q 'No default controller'; then echo "controller: none (plug in the Wi-Fi/BT adapter; USB mode auto or host)"
 	else printf '%s\n' "$s" | sed -n 's/^Controller \([0-9A-Fa-f:]*\).*/controller: \1/p'
 		printf '%s\n' "$s" | grep -E '^[[:space:]]*(Name|Powered|Discoverable|Pairable): ' | sed 's/^[[:space:]]*/  /'
-		d=$(btctl paired-devices); printf '%s' "$d" | grep -q '^Device' || d=$(btctl devices Paired)
-		echo "paired devices:"; printf '%s\n' "$d" | sed -n 's/^Device /  /p'; fi
+		# BlueZ 5.65 has neither `paired-devices` nor a working `devices Paired`: read its storage,
+		# where every paired device is a directory named after its address with a [LinkKey] in info.
+		echo "paired devices:"
+		for f in $P/var/lib/bluetooth/*/[0-9A-F][0-9A-F]:*/info; do
+			[ -f "$f" ] && grep -q '^\[LinkKey\]' "$f" || continue
+			m=${f%/info}; m=${m##*/}; n=$(sed -n 's/^Name=//p' "$f" | head -1)
+			echo "  $m${n:+ $n}"
+		done; fi
 }
 
 # ---------------------------------------------------------------- NexusBS station
