@@ -76,14 +76,26 @@ u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master) ;; *) operating_mo
 d = "\t\ttouch /mnt/msd/SUCCESS_ENV_UPDATE\n"
 assert u.count(d) == 1, "update.sh: SUCCESS_ENV_UPDATE not found"
 u = u.replace(d, d + "\t\t[ -x /usr/sbin/nexus-role ] && /usr/sbin/nexus-role \"$operating_mode\" > /dev/null 2>&1\n")
+# boot*.frm / apps*.frm variants (same U-Boot/env or payload, different FSBL clock): exactly one of each
+# is accepted; several on the drive refuse the whole update (nothing is written) and are removed
+f = "\tif [[ -s ${FIRMWARE} ]]\n\tthen\n\t\thandle_frimware_frm \"${FIRMWARE}\" \"${FRM_MAGIC}\"\n\tfi\n"
+assert u.count(f) == 1, "update.sh: pluto.frm block not found"
+u = u.replace(f,
+    "\t# exactly one boot*.frm and one apps*.frm: several = the whole update is refused\n"
+    "\tbootimage=/mnt/msd/boot.frm; appsimage=; nb=0; na=0\n"
+    "\tfor f in /mnt/msd/boot*.frm; do case \"$f\" in */._*) ;; *) [ -s \"$f\" ] && nb=$((nb+1)) && bootimage=$f ;; esac; done\n"
+    "\tfor f in /mnt/msd/apps*.frm; do case \"$f\" in */._*) ;; *) [ -s \"$f\" ] && na=$((na+1)) && appsimage=$f ;; esac; done\n"
+    "\tif [ $nb -gt 1 ] || [ $na -gt 1 ]\n\tthen\n"
+    "\t\tls /mnt/msd/*.frm > /mnt/msd/FAILED_SEVERAL_FRM_FILES 2>&1\n"
+    "\t\trm -f /mnt/msd/*.frm; bootimage=/mnt/msd/boot.frm; appsimage=\n\tfi\n" + f)
 # apps.frm (application slot, apps-frm-install) and nexus-setup.txt (copied to /mnt/data/nexus2/setup.txt
 # for the application's provision.sh, then removed from the drive), after pluto.frm and boot.frm
 e = "\tif [[ -s ${bootimage} ]]\n\tthen\n\t\thandle_boot_frm \"${bootimage}\"\n\tfi\n"
 assert u.count(e) == 1, "update.sh: boot.frm block not found"
 u = u.replace(e, e +
-    "\n\tif [[ -s /mnt/msd/apps.frm ]]\n\tthen\n\t\tflash_indication_on\n"
-    "\t\t/usr/sbin/apps-frm-install /mnt/msd/apps.frm && do_reset=1\n"
-    "\t\tflash_indication_off\n\t\trm -f /mnt/msd/apps.frm /mnt/msd/._apps.frm\n\tfi\n"
+    "\n\tif [[ -n \"${appsimage}\" ]] && [[ -s \"${appsimage}\" ]]\n\tthen\n\t\tflash_indication_on\n"
+    "\t\t/usr/sbin/apps-frm-install \"${appsimage}\" && do_reset=1\n"
+    "\t\tflash_indication_off\n\t\trm -f \"${appsimage}\" /mnt/msd/._apps*.frm\n\tfi\n"
     "\n\tif [[ -s /mnt/msd/nexus-setup.txt ]]\n\tthen\n"
     "\t\tif grep -q ' /mnt/data ubifs ' /proc/mounts\n\t\tthen\n"
     "\t\t\tmkdir -p -m 0700 /mnt/data/nexus2 && cp /mnt/msd/nexus-setup.txt /mnt/data/nexus2/setup.txt && chmod 0600 /mnt/data/nexus2/setup.txt && sync && touch /mnt/msd/SETUP_SUCCESS && do_reset=1 || touch /mnt/msd/SETUP_FAILED\n"

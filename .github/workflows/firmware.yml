@@ -149,7 +149,7 @@ jobs:
       - name: Assemble firmware
         run: firmware/build-fw.sh "$PWD/fw" xsa/system_top.xsa
       - uses: actions/upload-artifact@v4
-        with: { name: pluto-nano-timestamp-frm, path: "fw/build/pluto.frm\nfw/build/pluto.frm.md5\nfw/build/pluto.dfu\nfw/build/boot.frm\nfw/build/boot.frm.md5\nfw/build/uboot-env-nexus.txt", if-no-files-found: error }
+        with: { name: pluto-nano-timestamp-frm, path: "fw/build/pluto.frm\nfw/build/pluto.frm.md5\nfw/build/pluto.dfu\nfw/build/boot*.frm\nfw/build/uboot-env-nexus.txt", if-no-files-found: error }
       - name: Image contents for review (rootfs archive, kernel config, size report)
         if: always()
         run: |

@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # Assemble apps.frm (application slot, see README "Application slot") from prepared inputs. Linux/CI.
 #   apps.frm = 4096-byte header | payload (ustar tar, xz --check=crc32) | [boot.bin] | md5 trailer (33 B)
-# usage: build-apps-frm.sh <inputs dir> <output dir> [--no-boot]
+# usage: build-apps-frm.sh <inputs dir> <output dir>
+# Outputs (same payload, only the carried boot.bin differs):
+#   apps.frm                  no boot.bin: the installed FSBL/clock stays
+#   apps-cpu950-ddr600.frm    + Tezuka FSBL CPU 950 MHz / DDR 600 MT/s
+#   apps-cpu1100-ddr750.frm   + Tezuka FSBL CPU 1100 MHz / DDR 750 MT/s
+#   apps-stock-clock.frm      + Tezuka standard-clock FSBL (back from an overclock)
 #   inputs: nexus2 (stripped ARMv7 musl ELF), nexus-apps.tar.xz (contrib/pluto/apps: provision.sh,
 #   start.sh, defaults/...), svxlink-root.tar.xz (bin lib share var etc/svxlink), SHA256SUMS (all three).
 # Payload (unpacked at boot to /opt/apps): nexus/ (nexus-apps verbatim) + nexus/bin/nexus2, svxlink/,
-# MANIFEST.txt. boot.bin: Tezuka v0.3.24 Nano BOOT_fsbl_CPU1100_DDR750, pinned by sha256.
+# MANIFEST.txt. boot.bin images: tezuka-boot.sh (pinned by sha256).
 set -euo pipefail
-IN=$(cd "${1:?inputs}" && pwd); OUT=$(mkdir -p "${2:?out}" && cd "$2" && pwd); WITH_BOOT=1
-[ "${3:-}" = --no-boot ] && WITH_BOOT=0
+IN=$(cd "${1:?inputs}" && pwd); OUT=$(mkdir -p "${2:?out}" && cd "$2" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/tezuka-boot.sh"
 SLOT_MAX=$((9 * 1024 * 1024 - 4096))
-TZ_ZIP=tezuka-nano-v0.3.24-a304a1f.zip
-TZ_URL=https://github.com/F5OEO/tezuka_fw/releases/download/v0.3.24/$TZ_ZIP
-TZ_ZIP_SHA=6ddc4af05f07e892cbcc9b08f6a9831f1130706962028c8c83a4587e4e8f7d36
-OC_SHA=d803035aece5cf1efca1a9c779b8629283929615515d31fe6888f71ec0165980
 cd "$IN"
 for f in nexus2 nexus-apps.tar.xz svxlink-root.tar.xz SHA256SUMS; do [ -s "$f" ] || { echo "missing input $f"; exit 1; }; done
 for f in nexus2 nexus-apps.tar.xz svxlink-root.tar.xz; do grep -q "  $f\$" SHA256SUMS || { echo "SHA256SUMS lacks $f"; exit 1; }; done
@@ -65,31 +66,31 @@ PY
 long=$(cd "$S/p" && find . | awk 'length($0) > 250'); [ -z "$long" ] || { echo "path too long for ustar: $long"; exit 1; }
 ( cd "$S/p" && tar --format=ustar --owner=0 --group=0 --numeric-owner --sort=name -cf - . ) | xz -9e --check=crc32 -c > "$S/payload"
 PS=$(stat -c %s "$S/payload"); [ "$PS" -le "$SLOT_MAX" ] || { echo "payload $PS > slot $SLOT_MAX"; exit 1; }
-BS=0; BM=; BD=none
-if [ $WITH_BOOT = 1 ]; then
-  W=$HERE/work-tezuka; mkdir -p "$W"
-  echo "$TZ_ZIP_SHA  $W/$TZ_ZIP" | sha256sum -c --status 2>/dev/null || curl -sfL -o "$W/$TZ_ZIP" "$TZ_URL"
-  echo "$TZ_ZIP_SHA  $W/$TZ_ZIP" | sha256sum -c
-  unzip -o -q -j "$W/$TZ_ZIP" "${TZ_ZIP%.zip}/sdimg/overclock/BOOT_fsbl_CPU1100_DDR750" -d "$S"
-  echo "$OC_SHA  $S/BOOT_fsbl_CPU1100_DDR750" | sha256sum -c
-  mv "$S/BOOT_fsbl_CPU1100_DDR750" "$S/boot.bin"
-  BS=$(stat -c %s "$S/boot.bin"); BM=$(md5sum "$S/boot.bin" | cut -d' ' -f1); BD="Tezuka v0.3.24 Nano BOOT_fsbl_CPU1100_DDR750"
-fi
-VER="apps-${APPS_INPUTS_TAG:-local}-$(date -u +%Y%m%d)"
-python3 -I - "$S" "$PS" "$(md5sum "$S/payload" | cut -d' ' -f1)" "$BS" "$BM" "$BD" "$VER" "$OUT/apps.frm" <<'PY'
+PM=$(md5sum "$S/payload" | cut -d' ' -f1)
+assemble() {   # assemble <out name> <boot.bin file or ""> <description>
+	local n=$1 bb=$2 bd=$3 BS=0 BM= F SIZE
+	[ -n "$bb" ] && { BS=$(stat -c %s "$bb"); BM=$(md5sum "$bb" | cut -d' ' -f1); }
+	python3 -I - "$S/payload" "$PS" "$PM" "$BS" "$BM" "$bd" "apps-${APPS_INPUTS_TAG:-local}-$(date -u +%Y%m%d)" "$bb" "$OUT/$n" <<'PY'
 import sys, hashlib, time
-st, ps, pm, bs, bm, bd, ver, outp = sys.argv[1:]
+pl, ps, pm, bs, bm, bd, ver, bb, outp = sys.argv[1:]
 hdr = ("NEXUSBS-APPS-FRM 1\npayload_size=%s\npayload_md5=%s\nbootbin_size=%s\nbootbin_md5=%s\n"
        "bootbin_desc=%s\nversion=%s\ncreated=%s\n") % (ps, pm, bs, bm, bd, ver, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
 hdr = hdr.encode(); assert len(hdr) < 4096; hdr += b'\0' * (4096 - len(hdr))
-body = hdr + open(st + '/payload', 'rb').read() + (open(st + '/boot.bin', 'rb').read() if int(bs) else b'')
+body = hdr + open(pl, 'rb').read() + (open(bb, 'rb').read() if int(bs) else b'')
 open(outp, 'wb').write(body + (hashlib.md5(body).hexdigest() + '\n').encode())
 PY
-# self-check exactly as apps-frm-install parses it
-F=$OUT/apps.frm; SIZE=$(stat -c %s "$F")
-[ "$(tail -c 33 "$F" | head -c 32)" = "$(head -c $((SIZE - 33)) "$F" | md5sum | cut -d' ' -f1)" ]
-[ $((4096 + PS + BS + 33)) -eq "$SIZE" ]
-head -c $((4096 + PS)) "$F" | tail -c "$PS" | xz -dc | tar -t > /dev/null
-(cd "$OUT" && sha256sum apps.frm > SHA256SUMS)
-cat "$OUT/SHA256SUMS"
-printf 'apps.frm %s bytes: payload %s of %s slot bytes (%s%%), boot.bin %s bytes\n' "$SIZE" "$PS" "$SLOT_MAX" "$((PS * 100 / SLOT_MAX))" "$BS"
+	# self-check exactly as apps-frm-install parses it
+	F=$OUT/$n; SIZE=$(stat -c %s "$F")
+	[ "$(tail -c 33 "$F" | head -c 32)" = "$(head -c $((SIZE - 33)) "$F" | md5sum | cut -d' ' -f1)" ]
+	[ $((4096 + PS + BS + 33)) -eq "$SIZE" ]
+	head -c $((4096 + PS)) "$F" | tail -c "$PS" | md5sum | grep -q "^$PM "
+	printf '%s: %s bytes, boot.bin %s bytes (%s)\n' "$n" "$SIZE" "$BS" "$bd"
+}
+xz -t "$S/payload"
+assemble apps.frm "" none
+for v in cpu950-ddr600 cpu1100-ddr750 std; do
+	tezuka_boot "$v" "$S/boot-$v.bin"
+	case $v in std) n=apps-stock-clock.frm ;; *) n=apps-$v.frm ;; esac
+	assemble "$n" "$S/boot-$v.bin" "$TZ_DESC"
+done
+printf 'payload %s of %s slot bytes (%s%%)\n' "$PS" "$SLOT_MAX" "$((PS * 100 / SLOT_MAX))"

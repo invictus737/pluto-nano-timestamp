@@ -1,0 +1,64 @@
+name: stage-1 release
+# Publishes the stage-1 files of a finished firmware.yml run (pluto.frm, pluto.dfu, boot*.frm) as release
+# stage1-<short sha> with one SHA256SUMS and a README table.
+on:
+  # push only registers the workflow on this (non-default) branch; the job runs on dispatch
+  push: { branches: [v0.39-std], paths: ['.github/workflows/release-stage1.yml'] }
+  workflow_dispatch:
+    inputs:
+      firmware_run: { description: 'run id of a successful firmware.yml run', required: true, type: string }
+permissions: { contents: write, actions: read }
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}', RUN: '${{ inputs.firmware_run }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Files of run ${{ inputs.firmware_run }}
+        run: |
+          [ "$(gh run view "$RUN" --json workflowName,conclusion -q '.workflowName + " " + .conclusion')" = "firmware (GitHub-hosted, Vivado installed in the job) success" ] || { echo "not a successful firmware.yml run"; exit 1; }
+          SHA=$(gh run view "$RUN" --json headSha -q .headSha); echo "SHA=$SHA" >> "$GITHUB_ENV"; echo "TAG=stage1-${SHA:0:7}" >> "$GITHUB_ENV"
+          gh run download "$RUN" -n pluto-nano-timestamp-frm -D out
+          cd out && rm -f *.md5 && ls -la
+          for f in pluto.frm boot.frm boot-cpu950-ddr600.frm boot-cpu1100-ddr750.frm; do [ -s $f ] || { echo "missing $f"; exit 1; }; done
+          [ $(stat -c %s pluto.frm) -le 14680064 ] || { echo "pluto.frm above 14 MiB"; exit 1; }
+          sha256sum pluto.frm pluto.dfu boot*.frm > SHA256SUMS
+      - name: README
+        run: |
+          cd out
+          { echo "# $TAG"
+            echo
+            echo "Stage 1 standalone firmware for the HamGeek Pluto Nano (pluto-nano-timestamp ${SHA:0:7}, firmware.yml run $RUN)."
+            echo "From the STOCK firmware: copy \`pluto.frm\` and **one** boot file to the USB drive, then eject."
+            echo "The stock update.sh only recognises the name \`boot.frm\`: to install an overclock variant from stock,"
+            echo "rename it to \`boot.frm\` on the drive (this firmware accepts the long names, exactly one at a time)."
+            echo
+            echo "| file | content | bytes | sha256 |"
+            echo "|---|---|---|---|"
+            for f in pluto.frm pluto.dfu boot.frm boot-cpu950-ddr600.frm boot-cpu1100-ddr750.frm; do
+              case $f in
+                pluto.frm) c="OS (FIT + md5), for every variant" ;; pluto.dfu) c="the same FIT without trailer, for a U-Boot DFU RAM boot only" ;;
+                boot.frm) c="Tezuka FSBL standard clocks + U-Boot + NexusBS env" ;;
+                boot-cpu950-ddr600.frm) c="FSBL CPU 950 MHz / DDR 600 MT/s, same U-Boot + env" ;;
+                boot-cpu1100-ddr750.frm) c="FSBL CPU 1100 MHz / DDR 750 MT/s, same U-Boot + env" ;;
+              esac
+              echo "| \`$f\` | $c | $(stat -c %s $f) | \`$(sha256sum $f | cut -c1-16)…\` |"
+            done
+            echo
+            echo "The boot variants differ from \`boot.frm\` only in FSBL bytes of the first 64 KiB block (and the md5 trailer)."
+          } > README.md
+          python3 - <<'PY'
+          ref = open('boot.frm', 'rb').read()
+          for n in ('boot-cpu950-ddr600.frm', 'boot-cpu1100-ddr750.frm'):
+              b = open(n, 'rb').read(); d = [i for i in range(len(ref) - 33) if ref[i] != b[i]]
+              assert len(b) == len(ref) and d and d[-1] < 0x10000
+              print(n, len(d), 'bytes differ, 0x%x..0x%x' % (d[0], d[-1]))
+          PY
+          cat README.md
+      - name: Release
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes-file out/README.md --target "$SHA"
+          gh release edit "$TAG" --notes-file out/README.md
+          gh release upload "$TAG" out/pluto.frm out/pluto.dfu out/boot*.frm out/SHA256SUMS out/README.md --clobber
