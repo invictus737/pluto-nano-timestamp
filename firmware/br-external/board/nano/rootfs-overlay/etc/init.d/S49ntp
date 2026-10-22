@@ -1,12 +1,18 @@
 #!/bin/sh
-# Wall clock from NTP (the Pluto has no RTC). BusyBox ntpd keeps retrying the servers, so it is
-# started at boot and syncs as soon as any interface (Wi-Fi, USB Ethernet, the USB link) has a
-# route and DNS. Servers: fw_setenv ntp_servers "a b c" (default pool.ntp.org).
+# Wall clock from NTP (the Pluto has no RTC: it boots at 1970, and TLS clients such as the TETRA
+# Brew link refuse every certificate as "not valid yet" until the clock is set). BusyBox ntpd waits
+# about 8.5 minutes before asking a server again that did not answer, so it is started only once an
+# interface (Wi-Fi, USB Ethernet, the USB link) has a default route: its first query then goes out
+# and sets the clock within seconds. The wait is bounded (10 minutes), then ntpd starts anyway.
+# Servers: fw_setenv ntp_servers "a b c" (default pool.ntp.org).
 case "$1" in
 start)
   S=$(fw_printenv -n ntp_servers 2>/dev/null || echo "0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org")
   A=""; for s in $S; do A="$A -p $s"; done
-  start-stop-daemon -S -q -b -m -p /var/run/ntpd.pid -x /usr/sbin/ntpd -- -n $A && echo "ntpd: $S" ;;
+  (i=0; while [ $i -lt 300 ] && ! ip -4 route show default 2>/dev/null | grep -q .; do sleep 2; i=$((i+1)); done
+   start-stop-daemon -S -q -b -m -p /var/run/ntpd.pid -x /usr/sbin/ntpd -- -n $A
+   logger -t ntp "ntpd started after $((i * 2)) s: $S") < /dev/null > /dev/null 2>&1 &
+  echo "ntpd: $S (starts when a default route exists)" ;;
 stop) start-stop-daemon -K -q -p /var/run/ntpd.pid ;;
 restart) $0 stop; sleep 1; $0 start ;;
 esac
