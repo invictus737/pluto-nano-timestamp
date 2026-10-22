@@ -336,7 +336,11 @@ sleep 13
 check "kept automatically once the network works" sh -c "[ ! -f $R/run/nexus-net/pending ] && jq -e '.wifi.networks[] | select(.ssid == \"NewNet\") | .priority == 47' $J.applied > /dev/null && grep -q 'confirmed automatically' $R/syslog"
 rm -f $R/gw_up
 touch $R/wpa_up
+# the running supplicant was started from config.txt with the stock /etc/wpa.conf
+mkdir -p $R/proc/4242; printf '/usr/sbin/wpa_supplicant\0-B\0-i\0wlan0\0-c\0/etc/wpa.conf\0-C\0/run/wpa_supplicant\0' > $R/proc/4242/cmdline
+echo 4242 > $R/run/wpa_supplicant.wlan0.pid; echo 'ctrl_interface=/var/run/wpa_supplicant' > $R/etc/wpa.conf
 rc 3 "wpa_supplicant running: change waits for the automatic check" $NC nonint --rollback 2 do_wifi_priority NewNet 48
+check "in-place reload wrote the networks into the supplicant's own file (-c /etc/wpa.conf), control path /run" sh -c "grep -q 'priority=48' $R/etc/wpa.conf && grep -qx 'ctrl_interface=/run/wpa_supplicant' $R/etc/wpa.conf && [ \"\$(stat -c %a $R/etc/wpa.conf)\" = 600 ]"
 check "wpa_supplicant running: networks reloaded in place, wlan0 not taken down" sh -c "grep -q 'wlan0 networks reloaded' $R/syslog && grep -q 'reconfigure' $R/argv.log"
 sleep 9
 check "network not working: rolled back after the window" sh -c "[ ! -f $R/run/nexus-net/pending ] && jq -e '.wifi.networks[] | select(.ssid == \"NewNet\") | .priority == 47' $J > /dev/null"

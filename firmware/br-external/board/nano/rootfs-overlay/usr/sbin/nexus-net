@@ -138,7 +138,12 @@ static_resolv() {
 # CONNECTED event). Only without a running supplicant is the interface taken down and up.
 restart_if() { for i in "$@"; do [ -e $P/sys/class/net/$i ] || continue
 	if [ $i = wlan0 ] && wpa_cli -p /run/wpa_supplicant -i wlan0 ping 2>/dev/null | grep -q PONG; then
-		wpa_cli -p /run/wpa_supplicant -i wlan0 reconfigure > /dev/null 2>&1; log "wlan0 networks reloaded"
+		# reconfigure re-reads the file the running supplicant was started with (-c): after a boot from
+		# config.txt that is the stock /etc/wpa.conf, not $WPA. Put the rendered networks there first.
+		pf=$P/run/wpa_supplicant.wlan0.pid
+		wc=$([ -r "$pf" ] && tr '\0' '\n' < $P/proc/$(cat "$pf")/cmdline 2>/dev/null | sed -n '/^-c$/{n;p;q}')
+		[ -n "$wc" ] && [ "$P$wc" != "$WPA" ] && [ -f "$WPA" ] && cp "$WPA" "$P$wc" && chmod 600 "$P$wc"
+		wpa_cli -p /run/wpa_supplicant -i wlan0 reconfigure > /dev/null 2>&1; log "wlan0 networks reloaded${wc:+ ($wc)}"
 	else ifdown -f $i > /dev/null 2>&1; ifup $i > /dev/null 2>&1; log "$i restarted"; fi; done; }
 # healthy IFACE...: each restarted interface that exists has an IPv4 address (wlan0: associated) and the
 # default gateway answers a ping. The rollback watcher confirms on its own after 3 healthy checks in a row.
