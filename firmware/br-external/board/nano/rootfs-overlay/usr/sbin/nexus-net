@@ -94,7 +94,7 @@ render() {
 				echo "GATEWAY=$(jq -r ".wifi.networks[$i].ipv4.gateway // empty" "$J")"
 				echo "DNS=\"$(jq -r "(.wifi.networks[$i].ipv4.dns // []) | join(\" \")" "$J")\""; fi; } > "$D/wifi/net$i.conf"
 			i=$((i+1)); done
-		grep -c '^	psk=\|key_mgmt=NONE' "$D/wpa_supplicant.conf" | grep -qx "$n" || { echo "nexus-net: a Wi-Fi key could not be derived" >&2; return 1; }
+		grep -cE '^	(psk=|key_mgmt=NONE)' "$D/wpa_supplicant.conf" | grep -qx "$n" || { echo "nexus-net: a Wi-Fi key could not be derived" >&2; return 1; }
 		chmod 600 "$D/wpa_supplicant.conf"
 	fi
 	return 0
