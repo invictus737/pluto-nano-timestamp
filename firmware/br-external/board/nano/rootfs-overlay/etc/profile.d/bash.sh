@@ -5,4 +5,6 @@ if [ -n "$BASH_VERSION" ]; then
   alias ll='ls -la'
 fi
 # station role at login
-case "$-" in *i*) echo "Role: $(fw_printenv -n operating_mode 2>/dev/null || echo slave)  -  configuration: nexus-config"; echo ;; esac
+# (master|light|slave; an unknown operating_mode counts as slave, as in S97app)
+case "$-" in *i*) r=$(fw_printenv -n operating_mode 2>/dev/null); case "$r" in master|light) ;; *) r=slave ;; esac
+	echo "Role: $r  -  configuration: nexus-config"; echo; unset r ;; esac

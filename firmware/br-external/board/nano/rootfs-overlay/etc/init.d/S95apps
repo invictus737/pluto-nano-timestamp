@@ -2,7 +2,7 @@
 # Application slot (qspi-apps, installed from an apps.frm by apps-frm-install): at every boot the header
 # and the payload md5 are checked, the payload (xz tar) is unpacked to /opt/apps (RAM) and
 # /opt/apps/nexus/provision.sh /opt/apps /mnt/data runs (idempotent: it fills only what is missing on
-# /mnt/data). S97app then starts /opt/apps/nexus/start.sh in the master role. A missing or invalid
+# /mnt/data). S97app then starts /opt/apps/nexus/start.sh in the master and light roles. A missing or invalid
 # slot leaves the firmware a standalone SDR. The slot is read only; /mnt/data belongs to provision.sh.
 . /usr/sbin/apps-flash-lib.sh
 D=/opt/apps

@@ -146,6 +146,26 @@ rc 0 "role master" $NC nonint do_role master
 check "role master in env, USB composite rebuilt, NexusBS started" sh -c "[ \"\$(sed -n 's/^operating_mode=//p' $R/env)\" = master ] && grep -q 'S23udc start' $R/argv.log && grep -q 'S97app start' $R/argv.log"
 check "get role" [ "$($NC get role)" = master ]
 check "nexus-role status" sh -c "$R/usr/sbin/nexus-role status | grep -q 'role: master'"
+rc 2 "role refused: Light (case matters)" $NC nonint do_role Light
+rc 2 "nexus-role refused: bogus" $R/usr/sbin/nexus-role bogus
+check "role unchanged after the refusals" [ "$(envv operating_mode)" = master ]
+: > $R/argv.log
+rc 0 "role light (from master)" $NC nonint do_role light
+check "role light in env, NexusBS restarted, USB composite and gadgets untouched" sh -c "[ \"$(envv operating_mode)\" = light ] && grep -qx 'S97app restart' $R/argv.log && ! grep -q 'S23udc\\|S55sdr_ip_gadget' $R/argv.log"
+check "get role light" [ "$($NC get role)" = light ]
+check "nexus-role status light" sh -c "$R/usr/sbin/nexus-role status | grep -q 'role: light'"
+: > $R/argv.log
+rc 0 "role light again: no restart" $NC nonint do_role light
+check "role light again: S97app start only (idempotent)" sh -c "grep -qx 'S97app start' $R/argv.log && ! grep -q 'S97app restart\\|S23udc' $R/argv.log"
+rc 0 "role slave (from light)" $NC nonint do_role slave
+check "role slave: USB composite rebuilt, gadget started, NexusBS stopped" sh -c "grep -q 'S23udc start' $R/argv.log && grep -q 'S55sdr_ip_gadget start' $R/argv.log && grep -qx 'S97app stop' $R/argv.log"
+: > $R/argv.log
+rc 0 "role light (from slave)" $NC nonint do_role light
+check "role light from slave: gadget stopped, USB composite rebuilt, NexusBS started" sh -c "grep -q 'S55sdr_ip_gadget stop' $R/argv.log && grep -q 'S23udc start' $R/argv.log && grep -qx 'S97app start' $R/argv.log"
+sed -i '/^operating_mode=/d' $R/env; echo operating_mode=bogus >> $R/env
+check "get role: an unknown env value counts as slave" [ "$($NC get role)" = slave ]
+$NC nonint do_role master > /dev/null
+check "role master again" [ "$(envv operating_mode)" = master ]
 rc 2 "usb_mode refused: usb3" $NC nonint do_usb_mode usb3
 rc 0 "usb_mode host (warns)" $NC nonint do_usb_mode host
 check "usb_mode host warning" grep -q WARNING $T/out
@@ -500,12 +520,20 @@ if [ -n "${PB_DIR:-}" ] && [ -f "$PB_DIR/update.sh" ]; then
 	sed 's/^bluetooth = .*/bluetooth = on\r/' /opt/config.drive > /mnt/msd/config.txt
 	( flash_indication_on() { :; }; flash_indication_off() { :; }; reset() { :; }; dfu() { :; }; do_reset=0; . $T/upd.sh; process_ini /mnt/msd/config.txt; echo "$do_reset" > $T/do_reset ) > /dev/null 2>&1
 	check "update.sh: an edit that leaves the installed clock alone does not reboot" [ "$(cat $T/do_reset)" = 0 ]
+	# station role edited on the drive: light is accepted, an unknown value keeps the current role
+	sed 's/^operating_mode = .*/operating_mode = light\r/' /opt/config.drive > /mnt/msd/config.txt
+	( flash_indication_on() { :; }; flash_indication_off() { :; }; reset() { :; }; dfu() { :; }; . $T/upd.sh; process_ini /mnt/msd/config.txt ) > /dev/null 2>&1
+	check "update.sh: operating_mode light accepted" sh -c "grep -qx operating_mode=light $R/env"
+	sed 's/^operating_mode = .*/operating_mode = lite\r/' /opt/config.drive > /mnt/msd/config.txt
+	( flash_indication_on() { :; }; flash_indication_off() { :; }; reset() { :; }; dfu() { :; }; . $T/upd.sh; process_ini /mnt/msd/config.txt ) > /dev/null 2>&1
+	check "update.sh: an unknown operating_mode keeps the current role" sh -c "grep -qx operating_mode=light $R/env"
+	check "S40network documents the light role" grep -q 'slave|master|light' $PB_DIR/S40network
 else echo "skip update.sh tests (STOCK_BOARD_DIR not given)"; fi
 
 # ================================================================ S97app supervisor (container only: real /opt, /var/run)
 if [ -n "${NEXUS_TEST_CONTAINER:-}" ]; then
 	mkdir -p /opt/apps/nexus /mnt/data/nexus2 /var/run /var/log
-	printf '#!/bin/sh\necho "$$ $APPS_DIR $DATA_DIR $(pwd)" >> /tmp/start.calls\nexec sleep 1000\n' > /opt/apps/nexus/start.sh
+	printf '#!/bin/sh\necho "$$ $APPS_DIR $DATA_DIR $(pwd)" >> /tmp/start.calls\necho "$NEXUS_ROLE" > /tmp/start.role\nexec sleep 1000\n' > /opt/apps/nexus/start.sh
 	chmod 755 /opt/apps/nexus/start.sh; rm -f /tmp/start.calls
 	sed -i '/^operating_mode=/d' $R/env; echo operating_mode=master >> $R/env
 	S97=$OVL/etc/init.d/S97app
@@ -513,6 +541,7 @@ if [ -n "${NEXUS_TEST_CONTAINER:-}" ]; then
 	sleep 1
 	check "S97app: start.sh runs with APPS_DIR/DATA_DIR in /mnt/data/nexus2" grep -q ' /opt/apps /mnt/data /mnt/data/nexus2$' /tmp/start.calls
 	check "S97app: the supervisor does not hold its caller's lock" flock -n $T/caller.lock true
+	check "S97app: role master in /run/nexus-role and NEXUS_ROLE" sh -c "[ \"\$(cat /run/nexus-role)\" = master ] && [ \"\$(cat /tmp/start.role)\" = master ]"
 	rc 0 "S97app start again: idempotent" $S97 start
 	check "S97app: already running, not started twice" sh -c "grep -q 'already running' $T/out && [ \$(wc -l < /tmp/start.calls) = 1 ]"
 	child=$(cut -d' ' -f1 /tmp/start.calls); sup=$(cat /var/run/nexus.pid)
@@ -525,6 +554,18 @@ if [ -n "${NEXUS_TEST_CONTAINER:-}" ]; then
 	check "S97app: an exiting child is not restarted in a tight loop" [ "$(wc -l < /tmp/start.calls)" = 1 ]
 	$S97 stop > /dev/null
 	check "S97app: log records the exit" grep -q 'exit 3' /var/log/nexus.log
+	# light: the application starts with NEXUS_ROLE=light and /run/nexus-role says light
+	sed -i '/^operating_mode=/d' $R/env; echo operating_mode=light >> $R/env
+	printf '#!/bin/sh\necho "$NEXUS_ROLE" > /tmp/start.role\nexec sleep 1000\n' > /opt/apps/nexus/start.sh; rm -f /tmp/start.role
+	rc 0 "S97app start (light)" $S97 start
+	sleep 1
+	check "S97app: role light in /run/nexus-role and NEXUS_ROLE" sh -c "[ \"\$(cat /run/nexus-role)\" = light ] && [ \"\$(cat /tmp/start.role)\" = light ]"
+	$S97 stop > /dev/null
+	# slave (and an unknown value): nothing started, the role file says slave
+	sed -i '/^operating_mode=/d' $R/env; echo operating_mode=bogus >> $R/env; rm -f /tmp/start.role
+	rc 0 "S97app start (unknown role)" $S97 start
+	sleep 1
+	check "S97app: unknown role = slave, nothing started" sh -c "[ \"\$(cat /run/nexus-role)\" = slave ] && [ ! -f /tmp/start.role ] && grep -q 'role slave' $T/out"
 	sed -i '/^operating_mode=/d' $R/env
 else echo "skip S97app supervisor tests (container only: NEXUS_TEST_CONTAINER)"; fi
 

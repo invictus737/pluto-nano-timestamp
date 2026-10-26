@@ -102,7 +102,7 @@ of ps7_init data; U-Boot is byte-identical), so U-Boot is not rewritten and the 
 64 KiB erase+program. /mnt/data is never touched.
 
 At boot `S95apps` verifies the slot (header, payload md5) and unpacks it to `/opt/apps`, runs
-`provision.sh`; `S97app` runs `start.sh` in `/mnt/data/nexus2` in the master role (a legacy
+`provision.sh`; `S97app` runs `start.sh` in `/mnt/data/nexus2` in the master and light roles (a legacy
 `/mnt/data/nexus2/app.conf` is then not started), again a fixed 15 s after any exit. The supervisor
 holds none of its caller's descriptors and `S97app stop` ends the running child with it (also a
 `start.sh` that waits on a configuration that does not start). An invalid or missing slot leaves a
@@ -202,7 +202,7 @@ network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and bac
 | menu | nonint | notes |
 |---|---|---|
 | 1 System: Host name | `do_hostname NAME` | U-Boot `hostname` + `/etc/hostname` now, avahi restarted (`NAME.local`); DHCP leases carry it from their next renewal. network.json no longer holds a host name |
-| Station role | `do_role master\|slave` | `nexus-role` (USB composite rebuilt, NexusBS started/stopped) |
+| Station role | `do_role master\|slave\|light` | `nexus-role` (USB composite rebuilt when slave is involved, NexusBS started/stopped/restarted) |
 | USB mode | `do_usb_mode peripheral\|auto\|host` | next boot; `host` = a computer on USB-C no longer sees the Pluto |
 | Crystal correction | `do_xo_correction HZ\|default [--now]` | the measured 40 MHz reference in Hz, 8 digits within +/-250 ppm (39990000-40010000); shown as Hz and ppm, ppm = (xo - 40e6) / 40e6 x 1e6 (39999331 = -16.725 ppm; slow crystal = tunes low = below 40000000); next boot, `--now` also writes the AD9363 (restart NexusBS then); same value again = no change; keep `[radio] ppm = 0` in nexus2.toml |
 | CPU/DDR clock | `do_cpu_clock VARIANT [--cooling-confirmed]` | `standard` (default, recommended), `495_396` and `950_600` (Tezuka files, not tested on the reference board), `1100_750` (tested on the reference board with heatsinks and a fan only; above the -1 speed grade spec; active cooling required: refused without `--cooling-confirmed`, the menu asks explicitly). The boot block is rewritten at the next restart: a power cut during that < 1 s write needs DFU/JTAG recovery. The menu offers the restart |
@@ -221,7 +221,7 @@ network.json, wpa_supplicant.conf (derived 256-bit keys only), setup.txt and bac
 | Controller and paired devices | `get bt` | |
 | 4 NexusBS: Status | `get station` | role, application slot version, running, callsign, dashboard URL, last setup result |
 | Station identity | `do_station_set KEY [VALUE]`, `do_station_setup` (KEY=value lines on stdin) | keys `CALLSIGN TRANSMIT DASHBOARD_USER DASHBOARD_PASSWORD DMR_ID DMR_NETWORK_ID DMR_PASSWORD BM_MASTER BM_API_KEY TETRA_ISSI TETRA_PASSWORD TETRA_HOST P25_TALKGROUP SVXLINK_CALLSIGN SVXLINK_AUTH_KEY SVXLINK_HOSTS XO_CORRECTION` (secret ones on stdin only). Written to `/mnt/data/nexus2/setup.txt` (0600), then `/opt/apps/nexus/bin/nexus2 provision --data /mnt/data/nexus2 --defaults /opt/apps/nexus/defaults`; setup.txt is removed afterwards whatever the outcome, `setup.result` is shown, an `XO_CORRECTION` goes to the U-Boot env. Restart NexusBS to use it |
-| Restart NexusBS | `do_station_restart` | `/etc/init.d/S97app restart` (master role only) |
+| Restart NexusBS | `do_station_restart` | `/etc/init.d/S97app restart` (master and light roles only) |
 | Dashboard login | `get station_login` | location of `/mnt/data/nexus2/dashboard-login.txt` (generated password; not displayed) |
 | NexusBS log | `do_station_log [LINES]` | tail of `/var/log/nexus.log` |
 | 5 Update: Versions | `get versions` | firmware, application slot, U-Boot, FSBL clock variant, kernel |
@@ -283,10 +283,18 @@ config.txt handling after the post-build.sh patches.
 
     firmware/tests/nexus-config-test.sh --docker
 
-## Station role: slave (default) or master
+## Station role: slave (default), master or light
 
-`config.txt` [SYSTEM] `operating_mode = slave|master` (U-Boot environment `operating_mode`), or
-`nexus-role slave|master` on the device; applied at once and at every boot, shown at login.
+`config.txt` [SYSTEM] `operating_mode = slave|master|light` (U-Boot environment `operating_mode`), or
+`nexus-role slave|master|light` (`nexus-config nonint do_role ...`) on the device; applied at once and at
+every boot, shown at login. Any other value is refused by `nexus-role`/`nexus-config` and ignored by
+update.sh (the current role stays); an unknown value already in the environment counts as slave.
+
+| role | SDR gadgets + iiod | USB SDR function | S97app (application slot) | application sees |
+|------|--------------------|------------------|---------------------------|------------------|
+| `slave` (default) | running | in the composite | nothing started | - |
+| `master` | stopped | left out | started | `NEXUS_ROLE=master`, `/run/nexus-role` = `master` |
+| `light` | stopped | left out | started | `NEXUS_ROLE=light`, `/run/nexus-role` = `light` |
 
 - **slave** (default): the Pluto is the SDR of a NexusBS running elsewhere, e.g. a Raspberry Pi.
   Both timestamp SDR gadgets run: USB FunctionFS (`sdr_usb_gadget`, `uri=usb:...,direct=1`) and
@@ -295,10 +303,17 @@ config.txt handling after the post-build.sh patches.
 - **master**: NexusBS runs on the Pluto (S97app: the application slot, or `/mnt/data/<name>/app.conf`) and uses the radio
   directly; both SDR gadgets are stopped and the USB SDR function is left out of the composite.
   Switching rebuilds the USB composite, so a USB link drops for a few seconds.
-- `S97app start` is idempotent (a running station is not started twice when `nexus-role master` or
-  update.sh calls it again); `S97app restart` stops and starts it.
+- **light**: the radio exactly as in master (gadgets stopped, no USB SDR function, S97app starts the
+  application); the application runs its light mode (the application slot's `start.sh` runs
+  `nexus2 light`). Switching between master and light does not touch the USB composite; `nexus-role`
+  restarts the application so that it starts in the new mode.
+- How the application learns the role: `S97app` writes the role in force (`master`, `light` or
+  `slave`, one word and a newline) to `/run/nexus-role` at every start and stop, and exports
+  `NEXUS_ROLE` with the same value into the environment of `start.sh` and the `app.conf` applications.
+- `S97app start` is idempotent (a running station is not started twice when `nexus-role master|light`
+  or update.sh calls it again); `S97app restart` stops and starts it.
 
-In the master role the application opens the radio with `driver=plutosdr,uri=local:` plus
+In the master and light roles the application opens the radio with `driver=plutosdr,uri=local:` plus
 `local_timestamp=1` (NexusBS) or `direct=1`, and `timestamp_every=N` (soapyplutosdr-ts patch 0003,
 `PlutoSDR_LocalTS`): the FPGA's timestamped DMA blocks are used in place, no gadget, no extra thread
 or queue, waits are poll() on the DMA buffer (no CPU while idle, no clock syscall on the fast path).

@@ -23,7 +23,7 @@ install -m 0644 "$HERE/motd" "$T/etc/motd"
 # root's login shell is bash (SSH and serial console); init scripts keep busybox /bin/sh
 [ -x "$T/bin/bash" ] && sed -i 's#^root:\([^:]*\):0:0:\([^:]*\):\([^:]*\):.*#root:\1:0:0:\2:\3:/bin/bash#' "$T/etc/passwd"
 grep -qx /bin/bash "$T/etc/shells" 2>/dev/null || echo /bin/bash >> "$T/etc/shells"
-# config.txt [SYSTEM] operating_mode = slave|master (station role, nexus-role): written by S40network,
+# config.txt [SYSTEM] operating_mode = slave|master|light (station role, nexus-role): written by S40network,
 # read back by update.sh like the stock keys and applied at once
 python3 - "$T/etc/init.d/S40network" "$T/sbin/update.sh" "$T/etc/init.d/S45msd" <<'PY'
 import sys
@@ -64,8 +64,8 @@ assert s.count(a) == 1, "S40network: usb_ethernet_mode read not found"
 s = s.replace(a, a + "\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n")
 b = "\techo \"usb_ethernet_mode = $USB_ETH_MODE\"$'\\r' >> $CONF\n"
 assert s.count(b) == 1, "S40network: usb_ethernet_mode line not found"
-s = s.replace(b, b + "\techo \"# NexusBS station role [slave|master]: slave = SDR for NexusBS on another computer,\"$'\\r' >> $CONF\n"
-                     "\techo \"# master = NexusBS runs on this Pluto\"$'\\r' >> $CONF\n"
+s = s.replace(b, b + "\techo \"# NexusBS station role [slave|master|light]: slave = SDR for NexusBS on another computer,\"$'\\r' >> $CONF\n"
+                     "\techo \"# master = NexusBS runs on this Pluto, light = as master with NexusBS in its light mode\"$'\\r' >> $CONF\n"
                      "\techo \"operating_mode = $OP_MODE\"$'\\r' >> $CONF\n")
 # config.txt [SYSTEM] usb_mode (S96usbrole): peripheral (default) | auto | host
 rep("\tOP_MODE=`fw_printenv -n operating_mode 2> /dev/null || echo slave`\n",
@@ -106,7 +106,7 @@ assert u.count(w) == 1, "update.sh: pwd_wlan line not found"
 u = u.replace(w, w + "\t\techo \"country_wlan $country_wlan\" >> /opt/fw_set.tmp\n")
 c = "\t\techo \"netmask_eth $netmask_eth\" >> /opt/fw_set.tmp\n"
 assert u.count(c) == 1, "update.sh: netmask_eth line not found"
-u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master|slave) ;; *) operating_mode=`fw_printenv -n operating_mode 2> /dev/null || echo slave` ;; esac\n"
+u = u.replace(c, c + "\t\tcase \"$operating_mode\" in master|slave|light) ;; *) operating_mode=`fw_printenv -n operating_mode 2> /dev/null || echo slave` ;; esac\n"
                      "\t\techo \"operating_mode $operating_mode\" >> /opt/fw_set.tmp\n"
                      "\t\tcase \"$usb_mode\" in peripheral|auto|host) ;; *) usb_mode=`fw_printenv -n usb_mode 2> /dev/null || echo peripheral` ;; esac\n"
                      "\t\techo \"usb_mode $usb_mode\" >> /opt/fw_set.tmp\n"
@@ -174,7 +174,7 @@ i = "\t\tcp $CONF /mnt/msd\n"
 assert m.count(i) == 1, "S45msd: config.txt copy not found"
 open(msd, "w").write(m.replace(i, i + "\t\tcp $CONF /opt/config.drive\n"))
 PY
-# master role: no SDR gadgets (NexusBS on the Pluto uses the radio directly). The USB SDR function must
+# master and light roles: no SDR gadgets (NexusBS on the Pluto uses the radio directly). The USB SDR function must
 # not even be in the composite then: a FunctionFS function without its daemon blocks the UDC bind.
 python3 - "$T/etc/init.d/S23udc" <<'PY'
 import sys
@@ -185,8 +185,8 @@ def rep(old, new):
     s = s.replace(old, new)
 rep("SDR_USB_GADGET_DEBUG=`fw_printenv -n sdr_usb_gadget_debug 2> /dev/null || echo 0`\n",
     "SDR_USB_GADGET_DEBUG=`fw_printenv -n sdr_usb_gadget_debug 2> /dev/null || echo 0`\n"
-    "# station role (config.txt operating_mode): the SDR USB gadget only as a slave\n"
-    "SDRG=1; [ \"`fw_printenv -n operating_mode 2> /dev/null`\" = master ] && SDRG=0\n")
+    "# station role (config.txt operating_mode): the SDR USB gadget only as a slave (not master or light)\n"
+    "SDRG=1; case \"`fw_printenv -n operating_mode 2> /dev/null`\" in master|light) SDRG=0 ;; esac\n")
 rep("\tmkdir -p $GADGET/functions/ffs.sdr_gadget_ffs\n", "\t[ $SDRG = 1 ] && mkdir -p $GADGET/functions/ffs.sdr_gadget_ffs\n")
 rep("\tln -s $GADGET/functions/ffs.sdr_gadget_ffs $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n",
     "\t[ $SDRG = 1 ] && ln -s $GADGET/functions/ffs.sdr_gadget_ffs $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n")
@@ -195,7 +195,7 @@ rep("\tmkdir -p /dev/sdr_gadget_ffs\n\tmount sdr_gadget_ffs -t functionfs /dev/s
 rep("\tif [ \"$SDR_USB_GADGET_DEBUG\" == \"1\" ]\n", "\tif [ $SDRG = 0 ]\n\tthen\n\t\t:\n\telif [ \"$SDR_USB_GADGET_DEBUG\" == \"1\" ]\n")
 rep("\trm $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n", "\trm -f $GADGET/configs/c.1/ffs.sdr_gadget_ffs\n")
 rep("\trmdir $GADGET/functions/ffs.sdr_gadget_ffs\n", "\trmdir $GADGET/functions/ffs.sdr_gadget_ffs 2> /dev/null\n")
-# master role: no iiod either (NexusBS owns the radio; iiod next to it would share the AD9361), so the
+# master and light roles: no iiod either (NexusBS owns the radio; iiod next to it would share the AD9361), so the
 # IIO FunctionFS function leaves the composite with it (a FunctionFS function without its daemon blocks the bind)
 rep("\tmkdir -p $GADGET/functions/ffs.iio_ffs\n", "\t[ $SDRG = 1 ] && mkdir -p $GADGET/functions/ffs.iio_ffs\n")
 rep("\tln -s $GADGET/functions/ffs.iio_ffs $GADGET/configs/c.1/ffs.iio_ffs\n",

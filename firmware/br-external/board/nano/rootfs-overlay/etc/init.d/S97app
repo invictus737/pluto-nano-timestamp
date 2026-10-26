@@ -4,9 +4,12 @@
 # file that must exist). Applications built into the image under /opt/<name>/app.conf still work;
 # their configuration is taken from /mnt/data/<name>/, else /mnt/jffs2/<name>/.
 # Each starts only when its configuration exists, restarts after any exit (fixed 15 s), and logs to
-# /var/log/<name>.log (RAM). Only in the master role (nexus-role master); in the default slave role
-# the Pluto is an SDR for NexusBS on another computer and starts nothing.
+# /var/log/<name>.log (RAM). Only in the master and light roles (nexus-role master|light); in the
+# default slave role the Pluto is an SDR for NexusBS on another computer and starts nothing.
 # The application slot's start.sh (S95apps) follows the same rule.
+# The role in force (master, light or slave; an unknown operating_mode counts as slave) is written to
+# /run/nexus-role at every start and stop, and the applications get it as NEXUS_ROLE in their
+# environment: the application slot's start.sh runs NexusBS in its light mode for light.
 if [ "$1" = restart ]; then "$0" stop; exec "$0" start; fi
 # supervise LOG CMD...: run CMD in the current directory, again 15 s after any exit, until TERM. The
 # supervisor holds none of its caller's descriptors (a caller's lock or terminal), and TERM stops the
@@ -23,8 +26,12 @@ supervise() {
     sleep 15 & c=$!; wait $c
   done
 }
-[ "$1" = start ] && [ "$(fw_printenv -n operating_mode 2>/dev/null || echo slave)" != master ] && \
-  { echo "role slave: SDR for an external NexusBS host (nexus-role master to run it here)"; exit 0; }
+NEXUS_ROLE=$(fw_printenv -n operating_mode 2>/dev/null || echo slave)
+case "$NEXUS_ROLE" in master|light) ;; *) NEXUS_ROLE=slave ;; esac
+export NEXUS_ROLE
+case "$1" in start|stop) echo "$NEXUS_ROLE" > /run/nexus-role.tmp 2>/dev/null && mv /run/nexus-role.tmp /run/nexus-role ;; esac
+[ "$1" = start ] && [ "$NEXUS_ROLE" = slave ] && \
+  { echo "role slave: SDR for an external NexusBS host (nexus-role master or light to run it here)"; exit 0; }
 # The application slot (S95apps, apps.frm): /opt/apps/nexus/start.sh, run in /mnt/data/nexus2, restarted
 # after any exit like the app.conf applications. When it is present, a legacy /mnt/data/nexus2/app.conf
 # is not started as well.
@@ -34,13 +41,13 @@ if [ -x $NS ]; then
   PID=/var/run/nexus.pid; LOG=/var/log/nexus.log
   case "$1" in
   start)
-    # idempotent: nexus-role master and update.sh call start again on a running station
+    # idempotent: nexus-role master|light and update.sh call start again on a running station
     if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "nexus (application slot) already running"; else
     mkdir -p /mnt/data/nexus2
     ( cd /mnt/data/nexus2 || exit 1
       export APPS_DIR=/opt/apps DATA_DIR=/mnt/data
       supervise "$LOG" $NS ) < /dev/null > /dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
-    echo $! > "$PID"; echo "nexus (application slot) started (log $LOG)"; fi ;;
+    echo $! > "$PID"; echo "nexus (application slot) started, role $NEXUS_ROLE (log $LOG)"; fi ;;
   stop)
     [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"
     for n in nexus2 svxlink; do pids=$(pidof $n) && kill $pids 2>/dev/null; done

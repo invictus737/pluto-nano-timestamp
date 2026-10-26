@@ -31,7 +31,7 @@ inlist() { x=$1; shift; for i in "$@"; do [ "$i" = "$x" ] && return 0; done; ret
 is_secret() { inlist "$1" $SECRET_KEYS; }
 ip4() { printf '%s' "$1" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'; }
 upper() { printf '%s' "$1" | tr a-z A-Z; }
-role() { r=$(env_get operating_mode); [ "$r" = master ] || r=slave; echo $r; }
+role() { r=$(env_get operating_mode); case "$r" in master|light) ;; *) r=slave ;; esac; echo $r; }
 ppm() { awk -v x="$1" 'BEGIN { printf "%+.3f", (x - 40000000) / 40 }'; }
 bytes() { printf '%s' "$1" | wc -c | tr -d ' '; }
 lock9() { n=0; while ! flock -n 9; do n=$((n + 1)); [ $n -ge 30 ] && return 1; sleep 1; done; }   # busybox flock has no -w
@@ -53,9 +53,13 @@ do_hostname() {
 	log "hostname $h"; say "host name: $h (mDNS $h.local; DHCP leases carry it from their next renewal)"
 }
 do_role() {
-	case "${1:-}" in master|slave) ;; *) err "role: master or slave"; return 2 ;; esac
+	case "${1:-}" in master|slave|light) ;; *) err "role: master, slave or light"; return 2 ;; esac
 	svc $SBIN/nexus-role "$1" || return 1
-	[ "$1" = master ] && say "NexusBS runs on this Pluto; the SDR gadgets are stopped" || say "SDR for NexusBS on another computer; NexusBS here is stopped"
+	case "$1" in
+	master) say "NexusBS runs on this Pluto; the SDR gadgets are stopped" ;;
+	light) say "NexusBS runs on this Pluto in its light mode; the SDR gadgets are stopped" ;;
+	*) say "SDR for NexusBS on another computer; NexusBS here is stopped" ;;
+	esac
 }
 do_usb_mode() {
 	case "${1:-}" in peripheral|auto|host) ;; *) err "USB mode: peripheral, auto or host"; return 2 ;; esac
@@ -339,7 +343,7 @@ do_station_setup() {   # KEY=value lines on stdin (the nexus-setup.txt format)
 	station_apply "$t"
 }
 do_station_restart() {
-	[ "$(role)" = master ] || { err "role slave: NexusBS does not run on this Pluto (nexus-config nonint do_role master)"; return 1; }
+	[ "$(role)" != slave ] || { err "role slave: NexusBS does not run on this Pluto (nexus-config nonint do_role master|light)"; return 1; }
 	svc $INITD/S97app restart
 }
 station_status() {
@@ -456,7 +460,7 @@ net_status_text() {
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; cat <<'EOF'
 
 nonint functions:
-  do_hostname NAME                     do_role master|slave            do_usb_mode peripheral|auto|host
+  do_hostname NAME                     do_role master|slave|light      do_usb_mode peripheral|auto|host
   do_xo_correction HZ|default [--now]  do_cpu_clock VARIANT [--cooling-confirmed]
   do_reboot  do_shutdown
   do_wifi_add SSID [--open] [--priority N]   (passphrase on stdin)
@@ -511,8 +515,8 @@ menu_system() {
 			7 "Shut down") || return
 		case $c in
 		1) v=$(ask "Host name" "Host name (letters, digits, -). DHCP requests carry it, mDNS answers <name>.local." "$(hostname)") && act "Host name" do_hostname "$v" ;;
-		2) v=$(dlg --title "Station role" --default-item "$(role)" --menu "slave: SDR for NexusBS on another computer (USB/IP gadgets, iiod).\nmaster: NexusBS runs on this Pluto and uses the radio directly.\nSwitching rebuilds the USB composite (a USB link drops for a few seconds)." 15 76 2 \
-				slave "SDR for an external NexusBS" master "NexusBS on this Pluto") && act "Station role" do_role "$v" ;;
+		2) v=$(dlg --title "Station role" --default-item "$(role)" --menu "slave: SDR for NexusBS on another computer (USB/IP gadgets, iiod).\nmaster: NexusBS runs on this Pluto and uses the radio directly.\nlight: as master, NexusBS in its light mode.\nSwitching to or from slave rebuilds the USB composite (a USB link drops\nfor a few seconds); master <-> light restarts NexusBS." 17 76 3 \
+				slave "SDR for an external NexusBS" master "NexusBS on this Pluto" light "NexusBS light mode on this Pluto") && act "Station role" do_role "$v" ;;
 		3) v=$(dlg --title "USB mode" --default-item "$(get usb_mode)" --menu "USB-C port role, applied at the next boot.\nperipheral: a computer is the USB host (USB network, drive, SDR over USB).\nauto: peripheral; host when no computer configures the port within 20 s.\nhost: always host (hub with Wi-Fi/Ethernet adapters); a computer no longer sees the Pluto." 16 76 3 \
 				peripheral "a computer is the host (default)" auto "host when no computer is found" host "always host") && act "USB mode" do_usb_mode "$v" ;;
 		4) v=$(dlg --title "Crystal correction" --inputbox "Measured frequency of this board's 40 MHz crystal in Hz (+/-250 ppm),\ne.g. 39999331. ppm = (xo - 40000000) / 40000000 x 1e6 (39999331 = -16.725).\nA slow crystal tunes the radio low: xo below 40000000. 1 ppm = 438 Hz\nat 438 MHz. Keep [radio] ppm = 0 in nexus2.toml. 'default' removes it.\nActive at the next boot. Pluto manual: chapter 'Crystal correction'" 14 78 "$x") || continue

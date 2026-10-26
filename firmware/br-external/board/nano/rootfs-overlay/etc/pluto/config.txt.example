@@ -38,8 +38,9 @@ xo_correction =
 udc_handle_suspend = 0
 # USB Communication Device Class Compatibility Mode [rndis|ncm|ecm]
 usb_ethernet_mode = rndis
-# NexusBS station role [slave|master]: slave = SDR for NexusBS on another computer,
-# master = NexusBS runs on this Pluto (/mnt/data/nexus2, example /etc/nexus2/nexus2.example.toml)
+# NexusBS station role [slave|master|light]: slave = SDR for NexusBS on another computer,
+# master = NexusBS runs on this Pluto (/mnt/data/nexus2, example /etc/nexus2/nexus2.example.toml),
+# light = as master, NexusBS in its light mode
 operating_mode = slave
 # USB-C role [peripheral|auto|host], applied at the next boot: peripheral = a computer is the host,
 # host = hub with Wi-Fi/Ethernet adapters, auto = host when no computer configures the port
