@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AIC8800D80/D81 USB Wi-Fi driver, built IN the kernel tree as ordinary modules (no out-of-tree taint):
+# AIC8800D80/D81 and AIC8800DC/DW USB Wi-Fi driver (one driver for both families), built IN the kernel tree as ordinary modules (no out-of-tree taint):
 # the pinned community driver (github.com/shenmintao/aic8800d80, branch legacy-mcu1) plus
 # patches/aic8800 is copied to drivers/net/wireless/aic8800 and hooked into Kconfig/Makefile; the
 # kernel config (kernel-nano.config) selects it as modules. Its firmware goes to /lib/firmware of the
@@ -35,13 +35,34 @@ for f in fw_patch_table_8800d80_u02.bin fw_adid_8800d80_u02.bin fw_patch_8800d80
          fmacfw_8800d80_u02.bin aic_userconfig_8800d80.txt; do
   install -m 0644 "$SRC/fw/aic8800D80/$f" "$OVL/lib/firmware/$f"
 done
+# AIC8800DC/DW (a69c:88dc; the FC is the Bluetooth combo of the same family): no loader stage, the
+# Wi-Fi driver (aic8800_fdrv) uploads its own patch, patch table and calibration image per chip revision
+# (U02 and U02H) and reads the userconfig (dc, or dw when the chip reports itself as DW). The DPD
+# calibration runs at every start (CONFIG_FORCE_DPD_CALIB), so no dpdresult file is read or written. The
+# RF-test (lmacfw_rf), IP-camera (_ipc) and Bluetooth patch images (fw_patch*/fw_adid*: only with
+# CONFIG_LOAD_BT_PATCH_IN_FDRV, off) are not used. All names differ from the D80 set.
+for f in fmacfw_patch_8800dc_u02.bin fmacfw_patch_tbl_8800dc_u02.bin fmacfw_calib_8800dc_u02.bin \
+         fmacfw_patch_8800dc_h_u02.bin fmacfw_patch_tbl_8800dc_h_u02.bin fmacfw_calib_8800dc_h_u02.bin \
+         aic_userconfig_8800dc.txt aic_userconfig_8800dw.txt aic_userconfig_8800dw_u2.txt aic_userconfig_8800dw_w311.txt; do
+  install -m 0644 "$SRC/fw/aic8800DC/$f" "$OVL/lib/firmware/$f"
+done
+# TX power ceiling: every lvl_* entry of each userconfig at most AIC_TXPWR_MAX dBm
+cap_userconfig() {
+  UC=$OVL/lib/firmware/$1
+  awk -v max="$AIC_TXPWR_MAX" -F= 'BEGIN { OFS = "=" }
+    /^lvl_/ && $2 + 0 > max { $2 = max } { print }' "$UC" > "$UC.new" && mv "$UC.new" "$UC"
+  sed -i "1a # Pluto Nano: every lvl_* TX power entry capped at $AIC_TXPWR_MAX dBm (firmware/aic8800-intree.sh)" "$UC"
+  grep -q '^lvl_' "$UC" || { echo "aic8800: no TX power entries in $1"; exit 1; }
+  grep -E '^lvl_' "$UC" | awk -F= -v max="$AIC_TXPWR_MAX" '$2 + 0 > max { bad = 1 } END { exit bad }' || { echo "aic8800: TX power cap failed ($1)"; exit 1; }
+  grep -E '^(enable|lvl_11b_11ag_1m_2g4|lvl_11a_6m_5g)=' "$UC" | sed "s|^|$1: |"
+}
+cap_userconfig aic_userconfig_8800d80.txt
+# the D80 legacy (SDK V3) parser has no txpwr_loss keys: it logs "invalid cmd: loss_enable/loss_value".
+# The DC/DW parser knows loss_enable_2g4/loss_value_2g4/_5g (off in the shipped files): kept there.
 UC=$OVL/lib/firmware/aic_userconfig_8800d80.txt
-awk -v max="$AIC_TXPWR_MAX" -F= 'BEGIN { OFS = "=" }
-  /^lvl_/ && $2 + 0 > max { $2 = max } { print }' "$UC" > "$UC.new" && mv "$UC.new" "$UC"
-sed -i "1a # Pluto Nano: every lvl_* TX power entry capped at $AIC_TXPWR_MAX dBm (firmware/aic8800-intree.sh)" "$UC"
-# the D80 legacy (SDK V3) parser has no txpwr_loss keys: it logs "invalid cmd: loss_enable/loss_value"
 sed -i -e '/^loss_enable=/d' -e '/^loss_value=/d' -e '/^# txpwr_loss/d' "$UC"
 ! grep -q '^loss_' "$UC" || { echo "aic8800: loss keys left in the userconfig"; exit 1; }
-grep -E '^lvl_' "$UC" | awk -F= -v max="$AIC_TXPWR_MAX" '$2 + 0 > max { bad = 1 } END { exit bad }' || { echo "aic8800: TX power cap failed"; exit 1; }
-grep -E '^(enable|lvl_11b_11ag_1m_2g4|lvl_11a_6m_5g)=' "$UC"
-ls -la "$OVL/lib/firmware" | grep 8800d80
+for f in aic_userconfig_8800dc.txt aic_userconfig_8800dw.txt aic_userconfig_8800dw_u2.txt aic_userconfig_8800dw_w311.txt; do
+  cap_userconfig $f
+done
+ls -la "$OVL/lib/firmware" | grep -E '8800(d80|dc|dw)'

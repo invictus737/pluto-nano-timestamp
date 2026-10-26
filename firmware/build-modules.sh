@@ -16,5 +16,9 @@ rm -f "$OVL/lib/modules/$KREL/build" "$OVL/lib/modules/$KREL/source"
 rm -f "$OVL/lib/modules/$KREL"/modules.*.bin "$OVL/lib/modules/$KREL/modules.builtin.modinfo"
 for f in modules.dep modules.alias; do [ -s "$OVL/lib/modules/$KREL/$f" ] || { echo "no $f"; exit 1; }; done
 for m in aic_load_fw aic8800_fdrv; do grep -q "/$m.ko:" "$OVL/lib/modules/$KREL/modules.dep" || { echo "module $m missing"; exit 1; }; done
+# the adapters this image supports bind by these aliases: D80 loader, D81 running (both vendor IDs), DC/FC
+for id in "aic_load_fw usb:vA69Cp8D80d" "aic8800_fdrv usb:vA69Cp8D81d" "aic8800_fdrv usb:v368Bp8D81d" "aic8800_fdrv usb:vA69Cp88DCd"; do
+  set -- $id; grep -q "^alias $2.* $1\$" "$OVL/lib/modules/$KREL/modules.alias" || { echo "modules.alias: no $2 for $1"; exit 1; }
+done
 grep -c '' "$OVL/lib/modules/$KREL/modules.alias" | sed 's/^/modules.alias lines: /'
 find "$OVL/lib/modules/$KREL" -name '*.ko' -exec ls -la {} \;

@@ -1,6 +1,7 @@
-# AICSemi AIC8800 USB Wi-Fi/Bluetooth adapter, "driver CD" storage mode (usb-storage ignores it)
+# AICSemi AIC8800 USB Wi-Fi/Bluetooth adapter, "driver CD" storage mode (usb-storage ignores it);
+# it re-enumerates as a D80/D81 (8d80 loader, 8d81 running) or a DC/FC (88dc)
 DefaultVendor=0xa69c
 DefaultProduct=0x5726
 TargetVendor=0xa69c
-TargetProductList="8d80,8d81"
+TargetProductList="8d80,8d81,88dc"
 StandardEject=1
