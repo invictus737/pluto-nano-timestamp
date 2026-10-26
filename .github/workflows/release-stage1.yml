@@ -27,7 +27,7 @@ jobs:
           [ $(stat -c %s run/pluto.frm) -le 14680064 ] || { echo "pluto.frm above 14 MiB"; exit 1; }
       - name: boot*.frm (every Tezuka FSBL)
         run: |
-          sudo apt-get install -y -q u-boot-tools > /dev/null
+          sudo apt-get update -q > /dev/null && sudo apt-get install -y -q u-boot-tools > /dev/null
           firmware/build-boot-frm.sh - boot
           rm -f run/boot-cpu*.frm   # older runs also built clock variants: not published
           for f in run/boot*.frm; do cmp "$f" "boot/${f#run/}" || { echo "${f#run/} differs from the run's"; exit 1; }; echo "${f#run/} identical to the run's"; done
