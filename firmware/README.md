@@ -450,6 +450,15 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
   stick, Wi-Fi on channel 9: the controller hopped on 22 channels, none in 2441-2463 MHz. What it
   cannot remove is the time sharing of one radio/antenna in a combo stick: A2DP streaming raised the
   Wi-Fi round trip from about 6 ms to 17 ms (max 104 ms), no loss.
+- Light hotspot (`S46light-ap`, `/usr/sbin/light-ap start|stop|status`, light role only): the Pluto
+  also serves the Wi-Fi network it joins as an access point on interface `wlap0` (AP + station on one
+  AIC8800 radio, same channel), with the same SSID and passphrase as its station configuration. A
+  Nexus-Light peer that joins the strongest access point of that SSID lands on the Pluto next to it
+  instead of a distant router. Only Espressif MACs (and `/mnt/data/light-ap.allow`, one MAC or
+  `MAC/mask` per line) are accepted, so phones and laptops stay on the router. The peer's subnet
+  192.168.77.0/24 is routed, not NATed: the router needs a static route to 192.168.77.0/24 via the
+  Pluto's address for the peer's Internet (Brew) and dashboard. `/mnt/data/light-ap.disable` turns it
+  off. Log tag `light-ap`. Not started on 5 GHz (the ESP32-S3 peer is 2.4 GHz only).
 - `hcitool`, `hciconfig` and the other BlueZ HCI tools are in the image (BLUEZ5_UTILS_DEPRECATED).
 
 ## SSH, SCP, SFTP

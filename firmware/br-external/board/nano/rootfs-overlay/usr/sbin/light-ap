@@ -1,0 +1,103 @@
+#!/bin/sh
+# Light hotspot: in the light role, the Pluto also serves its own Wi-Fi network as an access point
+# for the Nexus-Light peer (ESP32-S3) next to it. Same SSID and passphrase as the network the Pluto
+# itself joins (read from its wpa_supplicant configuration), on the same channel (one radio, AP +
+# station). A peer that joins the strongest access point of that SSID lands here, a few centimetres
+# away, instead of on a distant router. Only Espressif MACs (and /mnt/data/light-ap.allow) are
+# accepted; phones and laptops stay on the router. Routed, not NATed: 192.168.77.0/24 behind the
+# Pluto; the router needs a route to it via the Pluto's address for the peer's Internet (Brew) and
+# for its dashboard.
+#   light-ap start|stop|status
+IF=${LIGHT_AP_IF:-wlap0}; STA=${LIGHT_AP_STA:-wlan0}
+NET=${LIGHT_AP_NET:-192.168.77}; RUN=/run/light-ap
+log() { logger -t light-ap "$*"; echo "light-ap: $*"; }
+role() { cat /run/nexus-role 2>/dev/null || fw_printenv -n operating_mode 2>/dev/null; }
+
+# The network block the station is associated with now (wpa_cli status id=N, 0-based; else the
+# first): ssid and psk as wpa_supplicant writes them (quoted text, or hex digits).
+sta_field() {
+	id=$(wpa_cli -i $STA status 2>/dev/null | sed -n 's/^id=//p')
+	awk -v k="$1" -v want=$(( ${id:-0} + 1 )) '/^[ \t]*network[ \t]*=/{n++}
+		n==want && $0 ~ "^[ \t]*"k"=" { sub("^[ \t]*"k"=", ""); print; exit }' \
+		"$(readlink -f /etc/wpa_supplicant.conf)"
+}
+# Espressif OUIs (ESP32 family) as hostapd MAC masks, plus the operator's own list
+accept_list() {
+	for o in 24:0a:c4 24:6f:28 24:62:ab 24:58:7c 24:dc:c3 28:37:2f 28:84:85 30:ae:a4 30:c6:f7 34:85:18 \
+		34:86:5d 34:b4:72 34:b7:da 3c:61:05 3c:71:bf 3c:84:27 40:22:d8 40:4c:ca 40:91:51 44:17:93 \
+		48:27:e2 48:31:b7 48:3f:da 48:55:19 4c:11:ae 4c:75:25 54:32:04 58:bf:25 58:cf:79 5c:cf:7f \
+		60:01:94 60:55:f9 64:b7:08 64:e8:33 68:67:25 68:b6:b3 70:04:1d 70:b8:f6 7c:87:ce 7c:9e:bd \
+		7c:df:a1 80:65:99 84:0d:8e 84:cc:a8 84:f3:eb 84:f7:03 84:fc:e6 8c:4b:14 8c:aa:b5 8c:bf:ea \
+		90:38:0c 90:97:d5 94:3c:c6 94:b5:55 94:b9:7e 98:cd:ac 98:f4:ab a0:20:a6 a0:76:4e a0:b7:65 \
+		a4:7b:9d a4:cf:12 a8:03:2a a8:42:e3 a8:48:fa ac:0b:fb ac:15:18 ac:67:b2 b4:3a:45 b4:8a:0a \
+		b4:e6:2d b8:d6:1a bc:dd:c2 c0:49:ef c0:4e:30 c4:4f:33 c4:5b:be c4:5d:83 c4:dd:57 c8:2b:96 \
+		c8:2e:18 c8:c9:a3 c8:f0:9e cc:50:e3 cc:7b:5c cc:8d:a2 cc:db:a7 d4:8a:fc d4:d4:da d4:f9:8d \
+		d8:13:2a d8:a0:1d d8:bc:38 d8:bf:c0 dc:06:75 dc:4f:22 dc:54:75 dc:da:0c e0:5a:1b e0:98:06 \
+		e4:65:b8 e4:b0:63 e8:06:90 e8:31:cd e8:68:e7 e8:9f:6d e8:db:84 ec:62:60 ec:64:c9 ec:94:cb \
+		ec:da:3b ec:fa:bc f0:08:d1 f0:9e:9e f0:f5:bd f4:12:fa f4:cf:a2 fc:b4:67 fc:f5:c4; do
+		echo "$o:00:00:00/ff:ff:ff:00:00:00"
+	done
+	[ -f /mnt/data/light-ap.allow ] && grep -E '^[0-9A-Fa-f:/]+$' /mnt/data/light-ap.allow
+}
+
+start() {
+	[ "$(role)" = light ] || [ "${LIGHT_AP_FORCE:-0}" = 1 ] || { log "not the light role, not started"; return 0; }
+	[ -f /mnt/data/light-ap.disable ] && { log "disabled by /mnt/data/light-ap.disable"; return 0; }
+	command -v hostapd > /dev/null || { log "no hostapd in this firmware"; return 1; }
+	# the station must be associated: the access point takes its channel
+	n=0; ch=
+	while [ $n -lt 60 ]; do
+		ch=$(iw dev $STA info 2>/dev/null | awk '/channel/{print $2; exit}')
+		[ -n "$ch" ] && break; sleep 2; n=$((n+1))
+	done
+	[ -n "$ch" ] || { log "$STA not associated, not started"; return 1; }
+	[ "$ch" -le 14 ] || { log "$STA is on 5 GHz channel $ch: the 2.4 GHz peer cannot join, not started"; return 1; }
+	ssid=$(sta_field ssid); psk=$(sta_field psk)
+	[ -n "$ssid" ] && [ -n "$psk" ] || { log "no ssid/psk in the station configuration, not started"; return 1; }
+	mkdir -p $RUN; chmod 700 $RUN
+	iw dev $IF info > /dev/null 2>&1 || iw dev $STA interface add $IF type __ap || { log "cannot add $IF"; return 1; }
+	accept_list > $RUN/accept
+	umask 077
+	{
+		echo "interface=$IF"; echo "driver=nl80211"; echo "ctrl_interface=$RUN/ctrl"
+		echo "hw_mode=g"; echo "channel=$ch"; echo "ieee80211n=1"; echo "wmm_enabled=1"
+		case "$ssid" in \"*) echo "ssid=$(echo "$ssid" | sed 's/^"//; s/"$//')" ;; *) echo "ssid2=$ssid" ;; esac
+		echo "wpa=2"; echo "wpa_key_mgmt=WPA-PSK"; echo "rsn_pairwise=CCMP"
+		case "$psk" in \"*) echo "wpa_passphrase=$(echo "$psk" | sed 's/^"//; s/"$//')" ;; *) echo "wpa_psk=$psk" ;; esac
+		echo "macaddr_acl=1"; echo "accept_mac_file=$RUN/accept"
+		echo "ap_max_inactivity=300"; echo "disassoc_low_ack=0"
+	} > $RUN/hostapd.conf
+	ip link set $IF up 2>/dev/null
+	ip addr flush dev $IF; ip addr add $NET.1/24 dev $IF
+	hostapd -B -P $RUN/hostapd.pid $RUN/hostapd.conf > $RUN/hostapd.log 2>&1 || {
+		log "hostapd failed: $(tail -1 $RUN/hostapd.log)"; return 1; }
+	echo 1 > /proc/sys/net/ipv4/ip_forward
+	dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+	{
+		echo "interface $IF"; echo "start $NET.10"; echo "end $NET.60"; echo "max_leases 50"
+		echo "lease_file $RUN/leases"; echo "pidfile $RUN/udhcpd.pid"
+		echo "option subnet 255.255.255.0"; echo "option router $NET.1"; echo "option lease 3600"
+		[ -n "$dns" ] && echo "option dns $dns"
+	} > $RUN/udhcpd.conf
+	touch $RUN/leases
+	udhcpd $RUN/udhcpd.conf
+	log "access point on channel $ch, $NET.0/24 routed via $(ip -4 -o addr show $STA | awk '{print $4}' | cut -d/ -f1)"
+}
+stop() {
+	[ -f $RUN/udhcpd.pid ] && kill "$(cat $RUN/udhcpd.pid)" 2>/dev/null
+	[ -f $RUN/hostapd.pid ] && kill "$(cat $RUN/hostapd.pid)" 2>/dev/null
+	sleep 1; iw dev $IF del 2>/dev/null
+	rm -f $RUN/*.pid
+	log "stopped"
+}
+case "$1" in
+start) start ;;
+stop) stop ;;
+restart) stop; start ;;
+status)
+	if [ -f $RUN/hostapd.pid ] && kill -0 "$(cat $RUN/hostapd.pid)" 2>/dev/null; then
+		echo "running on $IF, channel $(iw dev $IF info 2>/dev/null | awk '/channel/{print $2; exit}')"
+		iw dev $IF station dump 2>/dev/null | awk '/^Station/{print "  peer " $2} /signal:/{print "    signal " $2 " dBm"}'
+	else echo "not running"; fi ;;
+*) echo "usage: light-ap start|stop|restart|status"; exit 2 ;;
+esac
