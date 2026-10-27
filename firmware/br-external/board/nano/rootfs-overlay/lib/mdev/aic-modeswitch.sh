@@ -43,7 +43,8 @@ unlock() { rm -rf "$1"; }
 mkdir -p "$RUN" && lock "$RUN/dev-$NAME" || exit 0
 QSAVED=; QLOCK=
 cleanup() {
-	[ -n "$QSAVED" ] && { printf '%s' "$(cat "$RUN/quirks.saved")" > "$Q" && log "$NAME: usb-storage quirks restored ('$(cat "$Q")')"; rm -f "$RUN/quirks.saved"; }
+	# with a newline: a zero-byte write (empty saved list) is ignored by sysfs and would keep the entry
+	[ -n "$QSAVED" ] && { printf '%s\n' "$(cat "$RUN/quirks.saved")" > "$Q" && log "$NAME: usb-storage quirks restored ('$(cat "$Q")')"; rm -f "$RUN/quirks.saved"; }
 	[ -n "$QLOCK" ] && unlock "$RUN/quirks.lock"; unlock "$RUN/dev-$NAME"
 }
 trap cleanup EXIT
@@ -73,7 +74,7 @@ OLD=$(cat "$Q" 2>/dev/null)
 printf '%s' "$OLD" > "$RUN/quirks.saved"; QSAVED=1
 NEW=$(printf '%s' "$OLD" | tr ',' '\n' | grep -v -i "^$VID:$PID:" | grep -v '^$' | tr '\n' ',')
 NEW="$NEW$VID:$PID:"
-printf '%s' "$NEW" > "$Q" || { log "$NAME: quirks write failed"; exit 1; }
+printf '%s\n' "$NEW" > "$Q" || { log "$NAME: quirks write failed"; exit 1; }
 log "$NAME: usb-storage quirks '$NEW' (was '$OLD'), re-authorizing the device"
 echo 0 > "$D/authorized"; sleep "$STEP"; echo 1 > "$D/authorized"
 # the sd disk whose sysfs path lies under this USB device
