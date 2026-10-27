@@ -569,6 +569,79 @@ if [ -n "${NEXUS_TEST_CONTAINER:-}" ]; then
 	sed -i '/^operating_mode=/d' $R/env
 else echo "skip S97app supervisor tests (container only: NEXUS_TEST_CONTAINER)"; fi
 
+# ================================================================ AIC driver CD (aic-modeswitch.sh, blockdev.sh)
+AB=$T/aicbin; mkdir -p $AB
+AM=$OVL/lib/mdev/aic-modeswitch.sh; BD=$OVL/lib/mdev/blockdev.sh
+# fakes: usb_modeswitch switches (AIC_MS=switch: the device re-enumerates as 8d80) or times out (-7);
+# eject records the quirks parameter it sees and re-enumerates the device as 88dc (AIC_EJ=switch) or not
+afake() { { echo '#!/bin/sh'; echo 'echo "$(basename "$0") $*" >> "$NEXUS_ROOT/aic.log"'; cat; } > $AB/$1; chmod 755 $AB/$1; }
+afake usb_modeswitch <<'F'
+if [ "$AIC_MS" = switch ]; then echo 8d80 > "$AIC_DEV/idProduct"; echo 9 > "$AIC_DEV/devnum"; echo "Mode switch succeeded"; exit 0; fi
+echo "Sending the message returned error -7"; echo "Response reading failed (error -7)"; echo "Device is gone"; exit 0
+F
+afake eject <<'F'
+echo "quirks=$(cat "$NEXUS_ROOT/sys/module/usb_storage/parameters/quirks") authorized=$(cat "$AIC_DEV/authorized")" >> "$NEXUS_ROOT/aic.log"
+[ "$AIC_EJ" = switch ] && { echo 88dc > "$AIC_DEV/idProduct"; echo 4 > "$AIC_DEV/devnum"; }; exit 0
+F
+afake umount < /dev/null
+afake sleep < /dev/null
+mkdir -p $R/lib/mdev; printf '#!/bin/sh\necho "automounter $MDEV" >> "$NEXUS_ROOT/aic.log"\n' > $R/lib/mdev/automounter.sh; chmod 755 $R/lib/mdev/automounter.sh
+cp $OVL/etc/usb_modeswitch.d/a69c:5721 $R/etc/ 2>/dev/null; mkdir -p $R/etc/usb_modeswitch.d; cp $OVL/etc/usb_modeswitch.d/* $R/etc/usb_modeswitch.d/
+# aic_setup PRODUCT: a fresh storage-mode stick at /devices/usb1/1-1 with its disk sda (sda1 mounted)
+aic_setup() {
+	rm -rf $R/sys/devices/usb1 $R/sys/block $R/run/aic-modeswitch; : > $R/aic.log; : > $R/syslog
+	U=$R/sys/devices/usb1/1-1; mkdir -p $U/1-1:1.0/host0/block/sda/sda1 $R/sys/block $R/sys/class/block $R/sys/module/usb_storage/parameters
+	echo a69c > $U/idVendor; echo ${1:-5721} > $U/idProduct; echo 1 > $U/busnum; echo 3 > $U/devnum; echo 1 > $U/authorized
+	ln -sfn ../devices/usb1/1-1/1-1:1.0/host0/block/sda $R/sys/block/sda
+	ln -sfn ../../devices/usb1/1-1/1-1:1.0/host0/block/sda $R/sys/class/block/sda
+	ln -sfn ../../devices/usb1/1-1/1-1:1.0/host0/block/sda/sda1 $R/sys/class/block/sda1
+	printf '0bda:8153:u' > $R/sys/module/usb_storage/parameters/quirks
+	printf '/dev/root / squashfs ro 0 0\n/dev/sda1 /media/sda1 vfat rw 0 0\n' > $R/proc/mounts.aic
+}
+aic() { ( cp $R/proc/mounts $R/proc/mounts.keep; cp $R/proc/mounts.aic $R/proc/mounts
+	PATH=$AB:$PATH AIC_DEV=$R/sys/devices/usb1/1-1 DEVPATH=/devices/usb1/1-1 BUSNUM=001 DEVNUM=003 "$AM" --fg; r=$?
+	cp $R/proc/mounts.keep $R/proc/mounts; exit $r ); }
+Qf=$R/sys/module/usb_storage/parameters/quirks
+aic_setup; export AIC_MS=switch AIC_EJ=switch
+rc 0 "aic-modeswitch: D80 stick switched by usb_modeswitch" aic
+check "aic-modeswitch: usb_modeswitch with bus/device and the standard config" grep -qx "usb_modeswitch -b 001 -g 003 -c $R/etc/usb_modeswitch.d/a69c:5721" $R/aic.log
+check "aic-modeswitch: no storage route for a switched stick (no eject, quirks untouched)" sh -c "! grep -q '^eject' $R/aic.log && [ \"\$(cat $Qf)\" = 0bda:8153:u ]"
+check "aic-modeswitch: logged under its tag" grep -q 'switched (left storage mode)' $R/syslog
+aic_setup; export AIC_MS=fail AIC_EJ=switch
+rc 0 "aic-modeswitch: DC stick (usb_modeswitch -7) switched by the storage route" aic
+check "aic-modeswitch: eject /dev/sda with this VID:PID added to the kept quirks, device re-authorized" sh -c "grep -qx 'eject /dev/sda' $R/aic.log && grep -qx 'quirks=0bda:8153:u,a69c:5721: authorized=1' $R/aic.log"
+check "aic-modeswitch: the mounted partition is unmounted first" grep -qx 'umount /media/sda1' $R/aic.log
+check "aic-modeswitch: quirks parameter restored exactly" [ "$(cat $Qf)" = 0bda:8153:u ]
+check "aic-modeswitch: locks released" sh -c "[ -z \"\$(ls $R/run/aic-modeswitch 2>/dev/null | grep -v quirks.saved)\" ] && [ ! -e $R/run/aic-modeswitch/quirks.saved ]"
+check "aic-modeswitch: each step logged" sh -c "grep -q 'storage route' $R/syslog && grep -q 'disk sda' $R/syslog && grep -q 'sda ejected' $R/syslog && grep -q 'left storage mode after the eject' $R/syslog"
+aic_setup; printf '' > $Qf; export AIC_MS=fail AIC_EJ=switch
+rc 0 "aic-modeswitch: storage route with an empty quirks parameter" aic
+check "aic-modeswitch: quirks was a69c:5721: during the eject, empty again afterwards" sh -c "grep -qx 'quirks=a69c:5721: authorized=1' $R/aic.log && [ ! -s $Qf ]"
+aic_setup; export AIC_MS=fail AIC_EJ=stay
+rc 1 "aic-modeswitch: a stick that stays in storage mode gives up (bounded)" aic
+check "aic-modeswitch: quirks restored after giving up" [ "$(cat $Qf)" = 0bda:8153:u ]
+aic_setup 88dc; export AIC_MS=fail AIC_EJ=switch
+rc 0 "aic-modeswitch: a device in Wi-Fi mode is left alone" aic
+check "aic-modeswitch: nothing run for 88dc" [ ! -s $R/aic.log ]
+aic_setup; mkdir -p $R/run/aic-modeswitch/dev-1-1; echo $$ > $R/run/aic-modeswitch/dev-1-1/pid
+rc 0 "aic-modeswitch: second run for the same device (live lock) exits" aic
+check "aic-modeswitch: no second usb_modeswitch" [ ! -s $R/aic.log ]
+aic_setup; mkdir -p $R/run/aic-modeswitch/dev-1-1; echo 999999 > $R/run/aic-modeswitch/dev-1-1/pid; export AIC_MS=switch
+rc 0 "aic-modeswitch: a stale lock (owner gone) is taken over" aic
+check "aic-modeswitch: stale lock: usb_modeswitch ran" grep -q '^usb_modeswitch' $R/aic.log
+aic_setup; : > $R/aic.log
+rc 0 "aic-modeswitch: without --fg it returns at once (background)" env PATH=$AB:$PATH DEVPATH= "$AM"
+aic_setup
+( PATH=$AB:$PATH MDEV=sda ACTION=add "$BD" )
+( PATH=$AB:$PATH MDEV=sda1 ACTION=add "$BD" )
+check "blockdev: the AIC driver CD is never mounted" sh -c "! grep -q automounter $R/aic.log && grep -q 'AIC driver CD, not mounted' $R/syslog"
+echo 0781 > $R/sys/devices/usb1/1-1/idVendor; echo 5567 > $R/sys/devices/usb1/1-1/idProduct
+( PATH=$AB:$PATH MDEV=sda1 ACTION=add "$BD" )
+( PATH=$AB:$PATH MDEV=sda1 ACTION=remove "$BD" )
+check "blockdev: an ordinary drive goes to the automounter (add and remove)" sh -c "[ \$(grep -c 'automounter sda1' $R/aic.log) = 2 ]"
+unset AIC_MS AIC_EJ
+rm -rf $R/sys/devices/usb1 $R/sys/block $R/sys/class/block $R/run/aic-modeswitch
+
 # ================================================================ secrets
 leak=0
 for s in $SECRETS; do

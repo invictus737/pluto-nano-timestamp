@@ -147,12 +147,26 @@ Standard Linux mechanisms only; nothing is loaded by board scripts.
   from the D80 set), DPD calibration at every start (no result file), userconfig
   `aic_userconfig_8800dc.txt` (or `_8800dw*.txt` when the chip reports a DW), TX power capped at 15 dBm
   like the D80. Wi-Fi only: the DC/FC Bluetooth patch upload (`CONFIG_LOAD_BT_PATCH_IN_FDRV` or
-  `aic_btusb`) is not built. Not yet tested on hardware.
+  `aic_btusb`) is not built. **2.4 GHz only** (the DC/DW chips have no 5 GHz radio). Tested on a DC
+  stick: re-enumerates as `a69c:88dc`, `wlan0` associates (2.4 GHz), DHCP.
 - **Driver CD mode** (`a69c:5721..572f`, Pandora `1111:1111`): `usb-storage` ignores these IDs (linux
-  patch 0004, `US_FL_IGNORE_DEVICE`, so nothing is mounted), mdev calls `usb_modeswitch` with the
-  standard configuration file `/etc/usb_modeswitch.d/<vid>:<pid>` (StandardEject), the adapter
-  re-enumerates in Wi-Fi/Bluetooth mode (`TargetProductList` 8d80, 8d81, 88dc: D80 and DC sticks share the
-  `a69c:5721` storage ID; a DC stick shows "Aic MSC" with `aic8800fc_windows_wifi_driver.exe`).
+  patch 0004, `US_FL_IGNORE_DEVICE`, so nothing is mounted at boot or for ordinary drives), mdev runs
+  `/lib/mdev/aic-modeswitch.sh` (in the background, every wait bounded, log tag `aic-modeswitch`):
+  1. `usb_modeswitch` with the standard configuration file `/etc/usb_modeswitch.d/<vid>:<pid>`
+     (StandardEject; the Pandora its two vendor CDBs). D80 sticks switch here.
+  2. If the same device (sysfs path, bus/device number) is still in storage mode about 6 s later (a DC
+     stick times out the raw CBW: `error -7 ... Device is gone`), the storage route: `<vid>:<pid>:`
+     (empty flags) is appended to `/sys/module/usb_storage/parameters/quirks` (the other entries
+     kept), the device is re-authorized (`authorized` 0/1), usb-storage takes it as a SCSI disk ("AIC
+     flash", write protected), the script waits for the `sd` disk whose sysfs path lies under that USB
+     device, unmounts anything mounted from it, `eject`s it and restores the quirks parameter exactly.
+     One fallback at a time (the parameter is shared); a second run for the same device and stale
+     locks are handled.
+  The `sd` mdev rule goes through `/lib/mdev/blockdev.sh`: the stock automounter, except for a disk
+  whose USB device is one of these IDs, so the driver CD is never mounted under `/media` (nor its
+  `runme*` files run). Either way the adapter re-enumerates in Wi-Fi/Bluetooth mode
+  (`TargetProductList` 8d80, 8d81, 88dc: D80 and DC sticks share the `a69c:5721` storage ID; a DC stick
+  shows "Aic MSC" with `aic8800fc_windows_wifi_driver.exe`).
 - **Bluetooth**: kernel `btusb`; the AIC `368b:8d81` controller needs a zero-length packet after ACL
   bulk OUT transfers, now a `btusb` quirk-table entry (linux patch 0003, `BTUSB_ACL_TX_ZLP`) instead of
   the former kprobe module. BlueZ `bluetoothd` with the audio plugins (A2DP/AVRCP) and bluez-alsa
