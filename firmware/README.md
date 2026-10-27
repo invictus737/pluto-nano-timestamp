@@ -441,6 +441,16 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
   `AutoEnable=false` in the RAM copy of main.conf and `bt_off` in the NexusBS Player's
   `/mnt/data/nexus2/player.json` (creating the station directory when it does not exist yet), so the
   controller stays powered off from boot on.
+- Bluetooth / Wi-Fi coexistence (`S42bt-coex`, `/usr/sbin/bt-coex --watch`, every role): every
+  Bluetooth adapter (any make: standard HCI) gets the 2.4 GHz Wi-Fi channels in use as "bad" in its
+  frequency hopping (HCI Set AFH Host Channel Classification for BR/EDR, LE Set Host Channel
+  Classification for LE): Wi-Fi center +- half width + 1 MHz, again at every Wi-Fi change (`iw event`)
+  and every 30 s (an adapter forgets it at reset). Log tag `bt-coex` (map sent, status per adapter,
+  00 = accepted); `hcitool afh <address>` shows the map in use on a connection. Measured with the D80
+  stick, Wi-Fi on channel 9: the controller hopped on 22 channels, none in 2441-2463 MHz. What it
+  cannot remove is the time sharing of one radio/antenna in a combo stick: A2DP streaming raised the
+  Wi-Fi round trip from about 6 ms to 17 ms (max 104 ms), no loss.
+- `hcitool`, `hciconfig` and the other BlueZ HCI tools are in the image (BLUEZ5_UTILS_DEPRECATED).
 
 ## SSH, SCP, SFTP
 

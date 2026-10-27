@@ -1,0 +1,19 @@
+#!/bin/sh
+# Bluetooth / Wi-Fi coexistence (bt-coex --watch): every Bluetooth adapter is told the 2.4 GHz Wi-Fi
+# channels in use (HCI AFH host channel classification), so its hopping avoids them. Every role; idle
+# without a Bluetooth adapter or without 2.4 GHz Wi-Fi.
+PID=/var/run/bt-coex.pid
+case "$1" in
+start)
+	[ -f $PID ] && kill -0 "$(cat $PID)" 2>/dev/null && exit 0
+	start-stop-daemon -S -b -m -p $PID -x /bin/sh -- /usr/sbin/bt-coex --watch && echo "bt-coex started" ;;
+stop)
+	# the watcher and its subshells (sh ... bt-coex --watch) and its iw event reader
+	for p in $(pidof sh) $(pidof iw); do
+		case "$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)" in *"bt-coex --watch"*|"iw event "*) kill $p 2>/dev/null ;; esac
+	done
+	rm -f $PID
+	echo "bt-coex stopped" ;;
+restart) "$0" stop; exec "$0" start ;;
+esac
+exit 0

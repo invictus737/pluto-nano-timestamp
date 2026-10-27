@@ -56,10 +56,13 @@ wait_gone() { n=0; while [ $n -lt "$1" ]; do same || return 0; sleep "$STEP"; n=
 
 log "$NAME: $VID:$PID storage mode (bus $BUS device $DEV): usb_modeswitch"
 if [ -f "$CFG/$VID:$PID" ]; then
-	out=$(usb_modeswitch -b "$BUS" -g "$DEV" -c "$CFG/$VID:$PID" 2>&1); r=$?
+	# at most 3 s: a stick that times out the raw CBW (DC, error -7) goes straight to the storage route
+	usb_modeswitch -b "$BUS" -g "$DEV" -c "$CFG/$VID:$PID" > "$RUN/out-$NAME" 2>&1 & mp=$!
+	n=0; while [ $n -lt 30 ] && kill -0 $mp 2>/dev/null; do usleep 100000; n=$((n + 1)); done
+	kill $mp 2>/dev/null; wait $mp; r=$?; out=$(cat "$RUN/out-$NAME" 2>/dev/null); rm -f "$RUN/out-$NAME"
 	log "$NAME: usb_modeswitch exit $r: $(printf '%s' "$out" | grep -iE 'error|success|not|gone|found' | tr '\n' ' ' | cut -c1-300)"
 else log "$NAME: no $CFG/$VID:$PID"; fi
-wait_gone 6 && { log "$NAME: switched (left storage mode)"; exit 0; }
+wait_gone 2 && { log "$NAME: switched (left storage mode)"; exit 0; }
 
 log "$NAME: still $VID:$PID after usb_modeswitch: storage route (usb-storage + SCSI eject)"
 [ -w "$Q" ] || { log "$NAME: $Q not writable, giving up"; exit 1; }

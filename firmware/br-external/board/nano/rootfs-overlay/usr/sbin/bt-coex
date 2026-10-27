@@ -1,0 +1,67 @@
+#!/bin/sh
+# Bluetooth / Wi-Fi coexistence on 2.4 GHz, for any Bluetooth adapter and any Wi-Fi.
+# The Bluetooth controllers are told (standard HCI, Bluetooth Core) which channels the
+# Wi-Fi uses, so their frequency hopping avoids them:
+#   BR/EDR (A2DP, calls): HCI Set AFH Host Channel Classification (0x03/0x003F), 79 channels
+#   LE:                   HCI LE Set Host Channel Classification (0x08/0x0014), 37 channels
+# Excluded: every 2.4 GHz Wi-Fi channel in use here (center +- half width + GUARD MHz).
+#   bt-coex          apply once to every adapter (hci0, hci1, ...)
+#   bt-coex --watch  apply now, at every Wi-Fi change (iw event) and every 30 s (adapters
+#                    powered on or plugged later forget the classification at reset);
+#                    started by S42bt-coex. Check: logread / /var/log/messages, tag bt-coex;
+#                    with a connection up, hcitool afh <address> shows the map in use.
+GUARD=${GUARD:-1}
+LOG="logger -t bt-coex"
+
+# "center halfwidth" of every 2.4 GHz Wi-Fi interface in use
+wifi_bands() {
+	for w in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+		iw dev "$w" info 2>/dev/null | awk '/channel/ {
+			c = $0; sub(/.*center1: /, "", c); sub(/ MHz.*/, "", c)
+			wd = $0; sub(/.*width: /, "", wd); sub(/ MHz.*/, "", wd)
+			if (c + 0 > 0 && c + 0 < 2500) print c, wd / 2 }'
+	done
+}
+
+# hex byte list ("ff ff ...") of NBITS channels at FIRST + STEP*k MHz (LE: two ranges),
+# bit = 1 usable, 0 = on a Wi-Fi channel
+channel_map() { # $1 = br|le, $2 = bands
+	echo "$2" | awk -v kind="$1" -v guard="$GUARD" '
+	{ c[NR] = $1; h[NR] = $2 } 
+	END {
+		n = (kind == "br") ? 79 : 37; nb = (kind == "br") ? 10 : 5
+		for (k = 0; k < nb * 8; k++) bit[k] = 0
+		for (k = 0; k < n; k++) {
+			if (kind == "br") f = 2402 + k
+			else f = (k <= 10) ? 2404 + 2 * k : 2428 + 2 * (k - 11)
+			ok = 1
+			for (i = 1; i <= NR; i++) if (c[i] != "" && f >= c[i] - h[i] - guard && f <= c[i] + h[i] + guard) ok = 0
+			bit[k] = ok
+		}
+		s = ""
+		for (b = 0; b < nb; b++) { v = 0; for (j = 7; j >= 0; j--) v = v * 2 + bit[b * 8 + j]; s = s sprintf("%02x ", v) }
+		print s }'
+}
+
+LAST=
+apply() {
+	bands=$(wifi_bands)
+	br=$(channel_map br "$bands"); le=$(channel_map le "$bands")
+	ad=
+	for d in $(hciconfig 2>/dev/null | awk -F: '/^hci/{print $1}'); do
+		hciconfig "$d" 2>/dev/null | grep -q "UP RUNNING" || continue
+		r1=$(hcitool -i "$d" cmd 0x03 0x003f $br 2>&1 | awk '/> HCI Event: 0x0e/{getline; print $NF}')
+		r2=$(hcitool -i "$d" cmd 0x08 0x0014 $le 2>&1 | awk '/> HCI Event: 0x0e/{getline; print $NF}')
+		ad="$ad $d:${r1:-?}/${r2:-?}"
+	done
+	state="$(echo $bands) $br $le $ad"
+	[ "$state" = "$LAST" ] || $LOG "Wi-Fi 2.4 GHz (center, half width MHz): ${bands:-none}; BR/EDR map $br; LE map $le; adapters (BR/EDR/LE status, 00 = accepted):${ad:- none}"
+	LAST=$state
+}
+
+apply
+[ "$1" = --watch ] || exit 0
+# one reader: Wi-Fi events from iw, plus a tick every 30 s
+( iw event 2>/dev/null & while :; do sleep 30; echo tick; done ) | while read -r line; do
+	case "$line" in tick|*connected*|*ch_switch*|*disconnected*) apply ;; esac
+done
