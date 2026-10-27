@@ -616,7 +616,7 @@ check "aic-modeswitch: locks released" sh -c "[ -z \"\$(ls $R/run/aic-modeswitch
 check "aic-modeswitch: each step logged" sh -c "grep -q 'storage route' $R/syslog && grep -q 'disk sda' $R/syslog && grep -q 'sda ejected' $R/syslog && grep -q 'left storage mode after the eject' $R/syslog"
 aic_setup; printf '' > $Qf; export AIC_MS=fail AIC_EJ=switch
 rc 0 "aic-modeswitch: storage route with an empty quirks parameter" aic
-check "aic-modeswitch: quirks was a69c:5721: during the eject, empty again afterwards" sh -c "grep -qx 'quirks=a69c:5721: authorized=1' $R/aic.log && [ ! -s $Qf ]"
+check "aic-modeswitch: quirks was a69c:5721: during the eject, empty again afterwards (newline write: sysfs ignores a zero-byte write)" sh -c "grep -qx 'quirks=a69c:5721: authorized=1' $R/aic.log && [ -z \"\$(cat $Qf)\" ] && [ \"\$(wc -c < $Qf)\" -eq 1 ]"
 aic_setup; export AIC_MS=fail AIC_EJ=stay
 rc 1 "aic-modeswitch: a stick that stays in storage mode gives up (bounded)" aic
 check "aic-modeswitch: quirks restored after giving up" [ "$(cat $Qf)" = 0bda:8153:u ]
