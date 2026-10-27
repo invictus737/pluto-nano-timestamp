@@ -4,12 +4,13 @@
 # itself joins (read from its wpa_supplicant configuration), on the same channel (one radio, AP +
 # station). A peer that joins the strongest access point of that SSID lands here, a few centimetres
 # away, instead of on a distant router. Only Espressif MACs (and /mnt/data/light-ap.allow) are
-# accepted; phones and laptops stay on the router. Routed, not NATed: 192.168.77.0/24 behind the
-# Pluto; the router needs a route to it via the Pluto's address for the peer's Internet (Brew) and
-# for its dashboard.
+# accepted; phones and laptops stay on the router. Proxy ARP, no router change and no NAT: the peer
+# gets an address of the station's own /24 outside the router's DHCP pool (.250-.253 by default,
+# LIGHT_AP_HOSTS), the Pluto answers ARP for it on the station side and routes it, so the router,
+# the Internet (Brew) and the LAN (dashboard) see the peer as one more LAN host.
 #   light-ap start|stop|status
 IF=${LIGHT_AP_IF:-wlap0}; STA=${LIGHT_AP_STA:-wlan0}
-NET=${LIGHT_AP_NET:-192.168.77}; RUN=/run/light-ap
+HOSTS=${LIGHT_AP_HOSTS:-250 251 252 253}; RUN=/run/light-ap
 log() { logger -t light-ap "$*"; echo "light-ap: $*"; }
 role() { cat /run/nexus-role 2>/dev/null || fw_printenv -n operating_mode 2>/dev/null; }
 
@@ -67,26 +68,37 @@ start() {
 		echo "macaddr_acl=1"; echo "accept_mac_file=$RUN/accept"
 		echo "ap_max_inactivity=300"; echo "disassoc_low_ack=0"
 	} > $RUN/hostapd.conf
+	sta_ip=$(ip -4 -o addr show $STA | awk '{print $4; exit}')
+	case "$sta_ip" in */24) ;; *) log "$STA address '$sta_ip' is not a /24, not started"; return 1 ;; esac
+	sta_ip=${sta_ip%/24}; net=${sta_ip%.*}
+	gw=$(ip -4 route show default dev $STA | awk '{print $3; exit}')
 	ip link set $IF up 2>/dev/null
-	ip addr flush dev $IF; ip addr add $NET.1/24 dev $IF
+	ip addr flush dev $IF; ip addr add $sta_ip/32 dev $IF
 	hostapd -B -P $RUN/hostapd.pid $RUN/hostapd.conf > $RUN/hostapd.log 2>&1 || {
 		log "hostapd failed: $(tail -1 $RUN/hostapd.log)"; return 1; }
+	for h in $HOSTS; do ip route replace $net.$h/32 dev $IF; done
+	for i in $STA $IF; do echo 1 > /proc/sys/net/ipv4/conf/$i/proxy_arp; done
 	echo 1 > /proc/sys/net/ipv4/ip_forward
 	dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+	first=${HOSTS%% *}; last=${HOSTS##* }
 	{
-		echo "interface $IF"; echo "start $NET.10"; echo "end $NET.60"; echo "max_leases 50"
+		echo "interface $IF"; echo "start $net.$first"; echo "end $net.$last"; echo "max_leases 4"
 		echo "lease_file $RUN/leases"; echo "pidfile $RUN/udhcpd.pid"
-		echo "option subnet 255.255.255.0"; echo "option router $NET.1"; echo "option lease 3600"
+		echo "option subnet 255.255.255.0"; echo "option router ${gw:-$sta_ip}"; echo "option lease 3600"
 		[ -n "$dns" ] && echo "option dns $dns"
 	} > $RUN/udhcpd.conf
 	touch $RUN/leases
 	udhcpd $RUN/udhcpd.conf
-	log "access point on channel $ch, $NET.0/24 routed via $(ip -4 -o addr show $STA | awk '{print $4}' | cut -d/ -f1)"
+	log "access point on channel $ch, peers $net.$first-$last (proxy ARP via $sta_ip)"
 }
 stop() {
 	[ -f $RUN/udhcpd.pid ] && kill "$(cat $RUN/udhcpd.pid)" 2>/dev/null
 	[ -f $RUN/hostapd.pid ] && kill "$(cat $RUN/hostapd.pid)" 2>/dev/null
-	sleep 1; iw dev $IF del 2>/dev/null
+	sleep 1
+	net=$(ip -4 -o addr show $STA | awk '{print $4; exit}'); net=${net%/*}; net=${net%.*}
+	[ -n "$net" ] && for h in $HOSTS; do ip route del $net.$h/32 dev $IF 2>/dev/null; done
+	echo 0 > /proc/sys/net/ipv4/conf/$STA/proxy_arp 2>/dev/null
+	iw dev $IF del 2>/dev/null
 	rm -f $RUN/*.pid
 	log "stopped"
 }

@@ -455,10 +455,11 @@ keeps its own IPv4 settings when the Pluto moves between networks. eth0 is a nor
   AIC8800 radio, same channel), with the same SSID and passphrase as its station configuration. A
   Nexus-Light peer that joins the strongest access point of that SSID lands on the Pluto next to it
   instead of a distant router. Only Espressif MACs (and `/mnt/data/light-ap.allow`, one MAC or
-  `MAC/mask` per line) are accepted, so phones and laptops stay on the router. The peer's subnet
-  192.168.77.0/24 is routed, not NATed: the router needs a static route to 192.168.77.0/24 via the
-  Pluto's address for the peer's Internet (Brew) and dashboard. `/mnt/data/light-ap.disable` turns it
-  off. Log tag `light-ap`. Not started on 5 GHz (the ESP32-S3 peer is 2.4 GHz only).
+  `MAC/mask` per line) are accepted, so phones and laptops stay on the router. No router change and
+  no NAT: the peer gets an address of the station's /24 outside the router's DHCP pool (.250-.253,
+  `LIGHT_AP_HOSTS`) and the Pluto answers ARP for it (proxy ARP) and routes it, so the router, the
+  Internet (Brew) and the LAN (dashboard) see it as one more LAN host. `/mnt/data/light-ap.disable`
+  turns it off. Log tag `light-ap`. Not started on 5 GHz (the ESP32-S3 peer is 2.4 GHz only).
 - `hcitool`, `hciconfig` and the other BlueZ HCI tools are in the image (BLUEZ5_UTILS_DEPRECATED).
 
 ## SSH, SCP, SFTP
