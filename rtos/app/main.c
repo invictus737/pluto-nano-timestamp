@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -686,6 +687,14 @@ SYSINIT_MODULE_REFERENCE(wlan_tkip);
 SYSINIT_MODULE_REFERENCE(wlan_ccmp);
 SYSINIT_REFERENCE(rtwn_rtl8188eufw);
 SYSINIT_REFERENCE(rtwn_rtl8192cfwT);
+/* the other drivers of the dev_usb_wlan set: Ralink RT2870/3070/5370 (run, firmware below),
+ * RT2501/RT73 (rum), RT2500 (ural), ZyDAS ZD1211 (zyd), Realtek RTL8187 (urtw) */
+SYSINIT_DRIVER_REFERENCE(run, uhub);
+SYSINIT_REFERENCE(runfw);
+SYSINIT_DRIVER_REFERENCE(rum, uhub);
+SYSINIT_DRIVER_REFERENCE(ural, uhub);
+SYSINIT_DRIVER_REFERENCE(zyd, uhub);
+SYSINIT_DRIVER_REFERENCE(urtw, uhub);
 #endif
 
 /*
@@ -729,48 +738,97 @@ static void w80211_quote(FILE *f, const char *k, const char *v)
   fputs("\"\n", f);
 }
 
+static void w80211_network(FILE *f, const char *ssid, const char *psk, int prio)
+{
+  fputs("network={\n", f);
+  w80211_quote(f, "ssid", ssid);
+  size_t n = psk != NULL ? strlen(psk) : 0;
+  if (n == 0) {
+    fputs("\tkey_mgmt=NONE\n", f);
+  } else if (n == 64 && strspn(psk, "0123456789abcdefABCDEF") == 64) {
+    fprintf(f, "\tpsk=%s\n", psk); /* raw 256-bit key, unquoted */
+  } else {
+    w80211_quote(f, "psk", psk);
+  }
+  fprintf(f, "\tscan_ssid=1\n\tpriority=%d\n}\n", prio);
+}
+
+/* every configured network (config.txt [WIFI] slots), the first slot preferred */
+static int w80211_conf(void)
+{
+  FILE *f = fopen("/etc/wpa_supplicant.conf", "w");
+  if (f == NULL) {
+    return -1;
+  }
+  fputs("ap_scan=1\n", f);
+  int count = 0;
+  for (int i = 0; i < 16; i++) {
+    const char *ssid = NULL, *psk = NULL;
+    if (nexus_config_wifi(i, &ssid, &psk) == 0 && ssid != NULL && ssid[0] != '\0') {
+      w80211_network(f, ssid, psk, 16 - i);
+      count++;
+    }
+  }
+  if (count == 0 && w80211_ssid != NULL) {
+    w80211_network(f, w80211_ssid, w80211_psk, 1);
+    count = 1;
+  }
+  fclose(f);
+  return count;
+}
+
+/*
+ * Hotplug: a parent device (rtwn0, run0, ...) can arrive or leave at any time. wlan0 is cloned
+ * on it when it appears (wlan1 if the AIC station already owns wlan0) and wpa_supplicant is
+ * started for that interface; when the stick leaves, net80211 destroys the clone with it and the
+ * loop waits for the next one. One supplicant per interface name, started once.
+ */
 static void *w80211_main(void *arg)
 {
   (void)arg;
+  static bool supplicant[2];
   char dev[32];
-  while (w80211_parent(dev, sizeof(dev)) != 0) {
-    usleep(200000);
-  }
-  printf("wifi: %s (net80211), creating wlan0\n", dev);
-  {
-    char *av[] = {"ifconfig", "wlan0", "create", "wlandev", dev, "up", NULL};
-    optind = 0; /* newlib getopt keeps its state across libbsd programs: 0 = reinitialise */
-    if (rtems_bsd_command_ifconfig(6, av) != 0) {
-      printf("wifi: wlan0 on %s not created\n", dev);
-      return NULL;
+  for (;;) {
+    while (w80211_parent(dev, sizeof(dev)) != 0) {
+      usleep(200000);
+    }
+    unsigned int n = if_nametoindex("wlan0") != 0 && if_nametoindex("wlan1") == 0 ? 1 : 0;
+    char ifn[8];
+    snprintf(ifn, sizeof(ifn), "wlan%u", n);
+    if (if_nametoindex(ifn) == 0) {
+      printf("wifi: %s (net80211), creating %s\n", dev, ifn);
+      char *av[] = {"ifconfig", ifn, "create", "wlandev", dev, "up", NULL};
+      optind = 0; /* newlib getopt keeps its state across libbsd programs: 0 = reinitialise */
+      if (rtems_bsd_command_ifconfig(6, av) != 0) {
+        printf("wifi: %s on %s not created\n", ifn, dev);
+        sleep(2);
+        continue;
+      }
+    }
+    if (!supplicant[n]) {
+      int nets = w80211_conf();
+      if (nets > 0) {
+        char iarg[12];
+        snprintf(iarg, sizeof(iarg), "-i%s", ifn);
+        char *wv[] = {"wpa_supplicant", "-s", "-Dbsd", iarg, "-c", "/etc/wpa_supplicant.conf", NULL};
+        optind = 0;
+        int rc = rtems_bsd_command_wpa_supplicant_fork(6, wv);
+        supplicant[n] = rc == 0;
+        printf("wifi: wpa_supplicant on %s, %d network(s), %s\n", ifn, nets,
+               rc == 0 ? "started" : "failed");
+      }
+    }
+    /* stay on this parent until it leaves (the clone goes with it) */
+    while (w80211_parent(dev, sizeof(dev)) == 0 && if_nametoindex(ifn) != 0) {
+      usleep(500000);
     }
   }
-  FILE *f = fopen("/etc/wpa_supplicant.conf", "w");
-  if (f == NULL) {
-    return NULL;
-  }
-  fputs("ap_scan=1\nnetwork={\n", f);
-  w80211_quote(f, "ssid", w80211_ssid);
-  if (w80211_psk != NULL) {
-    w80211_quote(f, "psk", w80211_psk);
-  } else {
-    fputs("\tkey_mgmt=NONE\n", f);
-  }
-  fputs("\tscan_ssid=1\n}\n", f);
-  fclose(f);
-  char *wv[] = {"wpa_supplicant", "-s", "-Dbsd", "-iwlan0", "-c", "/etc/wpa_supplicant.conf", NULL};
-  optind = 0;
-  int rc = rtems_bsd_command_wpa_supplicant_fork(6, wv);
-  printf("wifi: wpa_supplicant on wlan0 for \"%s\" %s\n", w80211_ssid, rc == 0 ? "started" : "failed");
   return NULL;
 }
 
 static void wifi80211_start(const char *ssid, const char *psk)
 {
 #ifdef RTEMS_BSD_MODULE_NET80211
-  if (ssid == NULL) {
-    return;
-  }
   w80211_ssid = ssid;
   w80211_psk = psk;
   spawn(w80211_main, 5, 16384);
