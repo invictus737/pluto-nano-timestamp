@@ -71,7 +71,7 @@ struct aicwf_fw_file {
             with open(os.path.join(a.src, rel), "rb") as f:
                 data = f.read()
             name = os.path.basename(rel)
-            if name.startswith("aic_userconfig_"):
+            if name.startswith("aic_userconfig"):
                 data = cap_userconfig(data, rel)
             # published path: <family>/<name> (the transport directory is dropped)
             pub = "/".join(rel.split("/")[-2:])

@@ -22,6 +22,8 @@
 #     aic_userconfig_8800d80.txt       per-rate TX power targets, capped at 15 dBm here
 #     aic_powerlimit_8800d80.txt       per-country power limits
 #   AIC8800DC/DW (a69c:88dc/88dd, ROM firmware + RAM patches):
+#   AIC8800 (plain, 0x8800/0x8801): fmacfw.bin, fw_adid*.bin, fw_patch*.bin, fw_patch_table*.bin
+#     (u03 variants for the later ROM), aic_userconfig.txt
 #     fmacfw_patch_8800dc_u02.bin, fmacfw_patch_8800dc_h_u02.bin        Wi-Fi ROM patch
 #     fmacfw_patch_tbl_8800dc_u02.bin, fmacfw_patch_tbl_8800dc_h_u02.bin patch descriptor
 #     fmacfw_calib_8800dc_u02.bin, fmacfw_calib_8800dc_h_u02.bin        DPD calibration
@@ -56,6 +58,14 @@ usb/aic8800DC/aic_userconfig_8800dc.txt|1d51362568e82cb087dd2ce6414063b367558392
 usb/aic8800DC/aic_userconfig_8800dw.txt|1d51362568e82cb087dd2ce6414063b367558392fc8567d9c10e823fd2ee4bc6
 usb/aic8800DC/aic_powerlimit_8800dc.txt|a21645878dd5a065c48eaf4aee36349d214fd43e530a47af23973e5e81b9904a
 usb/aic8800DC/aic_powerlimit_8800dw.txt|a21645878dd5a065c48eaf4aee36349d214fd43e530a47af23973e5e81b9904a
+usb/aic8800/fmacfw.bin|a5d142031150b33771ec80772b1e7c96d57a1c7dccc8151a4f729408d7bd0f57
+usb/aic8800/fw_adid.bin|1a54cd5f56552b1df20ae20377194ea1e0b1c6e65df8873c3d6a5ab0f4760828
+usb/aic8800/fw_adid_u03.bin|6c7cc9d899d2a4e5b91b0f009aa6679498131adc27d220b96ec162536370a190
+usb/aic8800/fw_patch.bin|d9e164c90fd76f767bb7f5d5041a1e0f7b69096d7a408ff605920f909207ee14
+usb/aic8800/fw_patch_u03.bin|5f024e0b80802a30797d5afb3d06e3a8d02efe74d7ed0f7d4ee807093a579067
+usb/aic8800/fw_patch_table.bin|38d572126d767d2fe34b011076675195ddcb108c67dbaca0c14dbc9dc9617964
+usb/aic8800/fw_patch_table_u03.bin|0b1f6c1f1c845e3b0665a1bd1a5cd433d55bd24b79a86bbb6b06c8446453e1a1
+usb/aic8800/aic_userconfig.txt|2940418e3a83d0b718618213572bcd77d54b561d83da7057d40274139321952b
 "
 
 sha256() {
