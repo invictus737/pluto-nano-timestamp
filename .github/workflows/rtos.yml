@@ -174,8 +174,9 @@ jobs:
             ~/.rustup/linked
             ~/.cargo/registry
             nexus/target
-          key: 'rtos-nexus2-cargo-v1-${{ steps.nref.outputs.ref }}-${{ env.K_CARGO }}'
-          restore-keys: rtos-nexus2-cargo-v1-
+          key: "rtos-nexus2-cargo-v1-${{ hashFiles('nexus/vendor/libc/**') }}-${{ steps.nref.outputs.ref }}-${{ env.K_CARGO }}"
+          # build-std treats a changed vendor/libc as fresh: only reuse a target built on the same libc
+          restore-keys: "rtos-nexus2-cargo-v1-${{ hashFiles('nexus/vendor/libc/**') }}-"
       - name: Cached target of the same nexus2 commit counts as fresh (cargo compares mtimes)
         if: steps.cargo.outputs.cache-hit == 'true'
         run: find nexus -path nexus/target -prune -o -type f -print0 | xargs -0 touch -d '2000-01-01 00:00:00'
