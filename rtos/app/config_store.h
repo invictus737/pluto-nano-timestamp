@@ -4,8 +4,10 @@
  * nexus2.toml) through the media server, U-Boot environment mirroring and the `config` shell
  * command. Formats and keys: rtos/config/README.md.
  *
- * Call order in Init: nexus_config_init() BEFORE rtems_bsd_initialize() (the media server must
- * be listening when the USB drive attaches at boot), nexus_config_shell_register() any time.
+ * Call order in Init: nexus_config_early() BEFORE rtems_bsd_initialize() (the media server must
+ * be listening when the USB drive attaches at boot), then nexus_config_init() (QSPI + JFFS2
+ * mount, which may take a while) in parallel with USB enumeration; drive drop-ins wait for it.
+ * nexus_config_shell_register() any time.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -20,6 +22,8 @@
  * build-time Wi-Fi default, start the media server; 0 when /data is persistent, -1 when the
  * configuration only lives in RAM (flash problem: logged) */
 int nexus_config_init(void);
+/* starts the media server only (cheap); nexus_config_init() calls it too if needed */
+void nexus_config_early(void);
 
 /* the value or NULL; the pointer stays valid for the life of the system */
 const char *nexus_config_get(const char *key);

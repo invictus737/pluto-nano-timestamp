@@ -19,6 +19,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <rtems.h>
@@ -58,6 +59,11 @@ static kv_t store;
 static int data_ok;   /* /data mounted and writable */
 static int flash_ok;  /* QSPI layer usable */
 static char *last_drive;
+/* nexus_config_init() finished: the media listener holds drive drop-ins until then, because the
+ * media server is started before /data is mounted (nexus_config_early) */
+static pthread_mutex_t ready_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ready_cv = PTHREAD_COND_INITIALIZER;
+static int config_ready;
 static void (*callbacks[8])(void);
 static int n_callbacks;
 
@@ -178,10 +184,12 @@ static int write_atomic(const char *path, const void *data, size_t len, mode_t m
   if (rc == 0) {
     rc = rename(tmp, path);
     if (rc != 0 && errno == EEXIST) {
-      /* RTEMS JFFS2 does not rename over an existing file: keep the old one as .bak until
-       * the new one is in place, so an interruption always leaves a valid file */
+      /* RTEMS JFFS2 does not rename over an existing file: keep the old one as .old until
+       * the new one is in place, so an interruption always leaves a valid file (recovered by
+       * recover_swap() at the next boot). Not .bak: nexus2.toml.bak is the station rollback
+       * copy, which this swap would otherwise delete right after install_station() wrote it. */
       char bak[168];
-      snprintf(bak, sizeof(bak), "%s.bak", path);
+      snprintf(bak, sizeof(bak), "%s.old", path);
       (void)unlink(bak);
       rc = rename(path, bak);
       if (rc == 0) {
@@ -204,6 +212,26 @@ static int file_exists(const char *path)
 {
   struct stat st;
   return stat(path, &st) == 0;
+}
+
+/* finish or undo a write_atomic() swap that a reset interrupted: <path>.old without <path> is
+ * the previous valid file; with <path> present it is stale. A leftover .tmp is never valid. */
+static void recover_swap(const char *path)
+{
+  char old[168], tmp[168];
+  snprintf(old, sizeof(old), "%s.old", path);
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  (void)unlink(tmp);
+  if (!file_exists(old)) {
+    return;
+  }
+  if (!file_exists(path)) {
+    if (rename(old, path) == 0) {
+      printf("config: %s restored from an interrupted update\n", path);
+    }
+  } else {
+    (void)unlink(old);
+  }
 }
 
 /* ---- JFFS2 over the QSPI nvmfs region ---- */
@@ -305,7 +333,14 @@ static int data_mount(void)
     data_report("mounted");
     return 0;
   }
-  printf("config: /data does not mount (errno %d), formatting the nvmfs region\n", errno);
+  int mount_errno = errno;
+  if (mount_errno == EIO || mount_errno == ENOMEM) {
+    /* a flash read error or a memory shortage says nothing about the contents: never wipe
+     * the configuration for it (`config format yes` does that on request) */
+    printf("config: /data does not mount (errno %d), configuration in RAM only\n", mount_errno);
+    return -1;
+  }
+  printf("config: /data does not mount (errno %d), formatting the nvmfs region\n", mount_errno);
   if (erase_data_region() != 0) {
     printf("config: erase failed, configuration kept in RAM only\n");
     return -1;
@@ -805,6 +840,11 @@ static rtems_status_code media_listener(rtems_media_event event, rtems_media_sta
   (void)arg;
   if (event == RTEMS_MEDIA_EVENT_MOUNT && state == RTEMS_MEDIA_STATE_SUCCESS && dest != NULL) {
     printf("config: USB drive %s mounted at %s\n", src ? src : "?", dest);
+    pthread_mutex_lock(&ready_mtx);
+    while (!config_ready) {
+      pthread_cond_wait(&ready_cv, &ready_mtx);
+    }
+    pthread_mutex_unlock(&ready_mtx);
     char *d = strdup(dest);
     pthread_mutex_lock(&mtx);
     free(last_drive);
@@ -825,6 +865,11 @@ static rtems_status_code media_listener(rtems_media_event event, rtems_media_sta
 
 static void media_start(void)
 {
+  static int started;
+  if (started) {
+    return;
+  }
+  started = 1;
   (void)rtems_filesystem_register(RTEMS_FILESYSTEM_TYPE_DOSFS, rtems_dosfs_initialize);
   rtems_status_code sc = rtems_bdbuf_init();
   if (sc == RTEMS_SUCCESSFUL) {
@@ -882,6 +927,18 @@ static void seed_wifi_default(void)
   cfg_update_free(&u);
 }
 
+void nexus_config_early(void)
+{
+  media_start();
+}
+
+static double mono_s(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 int nexus_config_init(void)
 {
   static int done;
@@ -890,12 +947,18 @@ int nexus_config_init(void)
   }
   done = 1;
   kv_init(&store);
+  double t0 = mono_s();
   flash_ok = qspi_nor_init() == 0;
   data_ok = flash_ok && data_mount() == 0;
+  printf("config: flash and /data ready in %.0f ms\n", (mono_s() - t0) * 1e3);
   if (data_ok) {
     char *t = NULL;
     size_t len = 0;
     unlink(CONF_TMP);
+    recover_swap(NEXUS_CONFIG_FILE);
+    recover_swap(AUTH_KEYS);
+    recover_swap(STATION_TOML);
+    recover_swap(STATION_TOML ".bak");
     if (read_file(NEXUS_CONFIG_FILE, &t, &len, CFG_MAX_TEXT) == 0) {
       int n = cfg_load_flat(t, len, &store);
       free(t);
@@ -908,6 +971,10 @@ int nexus_config_init(void)
   }
   seed_wifi_default();
   media_start();
+  pthread_mutex_lock(&ready_mtx);
+  config_ready = 1;
+  pthread_cond_broadcast(&ready_cv);
+  pthread_mutex_unlock(&ready_mtx);
   return data_ok ? 0 : -1;
 }
 
