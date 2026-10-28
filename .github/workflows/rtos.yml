@@ -71,11 +71,14 @@ jobs:
           # unexpected ID) before Init: that only proves the start code ran up to the L2 setup.
           if grep -q "fatal code: 2304" out/qemu.log; then echo "::warning::QEMU L2C-310 model limit (start code reached L2 init)"; exit 0; fi
           grep -q "Nexus-BS RTOS" out/qemu.log
+      - name: nexus2 commit (rtos/NEXUS_REF pins the Nexus-BS-2.0_RTOS commit of this image)
+        id: nref
+        run: echo "ref=$(cat rtos/NEXUS_REF)" >> "$GITHUB_OUTPUT"
       - name: nexus2 source (private repo, read-only deploy key)
         id: nsrc
         continue-on-error: true
         uses: actions/checkout@v4
-        with: { repository: invictus737/nexus-bs2-src, ref: Nexus-BS-2.0_RTOS, path: nexus, ssh-key: '${{ secrets.NEXUS_SRC_KEY }}' }
+        with: { repository: invictus737/nexus-bs2-src, ref: '${{ steps.nref.outputs.ref }}', path: nexus, ssh-key: '${{ secrets.NEXUS_SRC_KEY }}' }
       - name: nexus2 on RTEMS (type check report)
         if: steps.nsrc.outcome == 'success'
         continue-on-error: true
