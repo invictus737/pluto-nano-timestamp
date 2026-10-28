@@ -29,10 +29,14 @@ export RUSTFLAGS="--cfg getrandom_backend=\"custom\" $LINK"
 # Pluto profile: opt-level z overall, 3 on the radio/DSP crates, fat LTO, one codegen unit,
 # strip; panic = unwind is load-bearing (RF workers catch_unwind to isolate a failed mode).
 PROFILE=${NEXUS_PROFILE:-pluto-performance}
+# std and the crates on the corrected RTEMS libc (nexus2 vendor/libc): a linked nightly whose
+# rust-src workspace patches libc (rtos/ci/rust-toolchain.sh); the workspace [patch] covers
+# the crates themselves
+RUST_TOOLCHAIN=${RUST_TOOLCHAIN:-$("$(dirname "$0")/rust-toolchain.sh" nightly-2025-07-01 "$SRC/vendor/libc" nexus-rtems-libc)}
 cd "$SRC"
 # compiler output about the private source goes to a file (draft release), not the public log
 LOG=${OUT%.elf}-link.log
-if ! cargo +"${RUST_TOOLCHAIN:-nightly-2025-07-01}" build -p nexus2 --profile "$PROFILE" --target armv7-rtems-eabihf \
+if ! cargo +"$RUST_TOOLCHAIN" build -p nexus2 --profile "$PROFILE" --target armv7-rtems-eabihf \
   -Zbuild-std=std,panic_unwind > "$LOG" 2>&1; then
   echo "nexus2 link failed: $(grep -cE '^error' "$LOG" || true) errors, $(grep -c 'undefined reference' "$LOG" || true) undefined references (log in the draft release)"
   exit 1

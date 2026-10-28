@@ -9,10 +9,14 @@ export PATH="$TOOLS/bin:$PATH"
 export CC_armv7_rtems_eabihf=arm-rtems6-gcc CXX_armv7_rtems_eabihf=arm-rtems6-g++ AR_armv7_rtems_eabihf=arm-rtems6-ar
 export CFLAGS_armv7_rtems_eabihf="$(PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig pkg-config --cflags "$PKG")"
 export CXXFLAGS_armv7_rtems_eabihf="$CFLAGS_armv7_rtems_eabihf"
+# std and the crates on the corrected RTEMS libc (nexus2 vendor/libc): a linked nightly whose
+# rust-src workspace patches libc (rtos/ci/rust-toolchain.sh); the workspace [patch] covers
+# the crates themselves
+RUST_TOOLCHAIN=${RUST_TOOLCHAIN:-$("$(dirname "$0")/rust-toolchain.sh" nightly-2025-07-01 "$SRC/vendor/libc" nexus-rtems-libc)}
 cd "$SRC"
 # getrandom 0.3 has no RTEMS backend: nexus2 provides a custom one (bins/nexus2/src/rtems_entropy.rs)
 export RUSTFLAGS="${RUSTFLAGS:-} --cfg getrandom_backend=\"custom\""
-cargo +"${RUST_TOOLCHAIN:-nightly-2025-07-01}" check -p nexus2 --release --target armv7-rtems-eabihf \
+cargo +"$RUST_TOOLCHAIN" check -p nexus2 --release --target armv7-rtems-eabihf \
   -Zbuild-std=std,panic_abort --message-format short > "$REPORT.raw" 2>&1
 rc=$?
 {

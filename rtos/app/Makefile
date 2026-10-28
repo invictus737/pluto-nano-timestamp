@@ -34,6 +34,10 @@ $(B)/main.o: main.c | $(B)
 $(B)/platform.o: platform.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# `abi` shell command: table generated from nexus2 scripts/rtems-abi (rtos/ci/nexus2-abi.sh)
+$(B)/abi.o: abi.c abi_table.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(B)/ssh_server.o: ssh_server.c ssh_server.h $(SSH_SECRETS) | $(B)
 	$(CC) $(CFLAGS) $(SSH_CFLAGS) -c $< -o $@
 
@@ -54,8 +58,8 @@ $(B)/config_kv.o: config_kv.c config_kv.h | $(B)
 $(B)/qspi_nor.o: qspi_nor.c qspi_nor.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS) $(RUST_LIB)
-	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS) -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -ljffs2 -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
+$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) $(RUST_LIB)
+	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -ljffs2 -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
 	$(SIZE) $@
 
 $(B)/nexus-rtos.bin: $(B)/nexus-rtos.elf
@@ -77,7 +81,7 @@ $(B)/main_n2.o: main.c | $(B)
 	$(CC) $(CFLAGS) -DNEXUS_RUST_MAIN -c $< -o $@
 $(B)/posix_compat.o: posix_compat.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(B)/libnexusrtos.a: $(B)/main_n2.o $(B)/posix_compat.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS)
+$(B)/libnexusrtos.a: $(B)/main_n2.o $(B)/posix_compat.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS)
 	rm -f $@ && $(AR) rcs $@ $^
 nexus2lib: $(B)/libnexusrtos.a
 .PHONY: nexus2lib
