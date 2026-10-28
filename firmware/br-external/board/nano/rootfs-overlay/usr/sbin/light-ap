@@ -11,7 +11,7 @@
 #   light-ap start|stop|status
 IF=${LIGHT_AP_IF:-wlap0}; STA=${LIGHT_AP_STA:-wlan0}
 HOSTS=${LIGHT_AP_HOSTS:-250 251 252 253}; RUN=/run/light-ap
-log() { logger -t light-ap "$*"; echo "light-ap: $*"; }
+log() { logger -t light-ap "$*" 2>/dev/null; echo "$(date +%T) light-ap: $*"; }
 role() { cat /run/nexus-role 2>/dev/null || fw_printenv -n operating_mode 2>/dev/null; }
 
 # The network block the station is associated with now (wpa_cli status id=N, 0-based; else the
@@ -47,7 +47,7 @@ start() {
 	command -v hostapd > /dev/null || { log "no hostapd in this firmware"; return 1; }
 	# the station must be associated: the access point takes its channel
 	n=0; ch=
-	while [ $n -lt 60 ]; do
+	while [ $n -lt 150 ]; do
 		ch=$(iw dev $STA info 2>/dev/null | awk '/channel/{print $2; exit}')
 		[ -n "$ch" ] && break; sleep 2; n=$((n+1))
 	done
