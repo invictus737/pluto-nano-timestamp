@@ -18,7 +18,7 @@
  * dashboard user name and for root. Public keys compiled in from rtos/ssh/authorized_keys
  * are accepted for any user name. The host key comes from the generated ssh_secrets.h
  * (rtos/ssh/gen_secrets.py).
- * All waits are blocking (accept, select with a timeout, semaphores): no polling loops.
+ * All waits are blocking (accept, poll with a timeout, semaphores): no polling loops.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -52,7 +52,7 @@ void nexus_ssh_set_password_checker(int (*check)(const char *user, const char *p
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -488,14 +488,13 @@ static int term_size(WOLFSSH *ssh, word32 cols, word32 rows, word32 px, word32 p
 /* Relay between the SSH channel and the backend socket                                        */
 /* ------------------------------------------------------------------------------------------ */
 
+/* poll(), not select(): newlib's fd_set holds descriptors 0..63 only, and the descriptor table
+ * is larger than that (CONFIGURE_MAXIMUM_FILE_DESCRIPTORS) */
 static int wait_readable(int fd, int timeout_s)
 {
-  fd_set rf;
-  struct timeval tv = {.tv_sec = timeout_s, .tv_usec = 0};
-  FD_ZERO(&rf);
-  FD_SET(fd, &rf);
-  int n = select(fd + 1, &rf, NULL, NULL, &tv);
-  return n > 0 ? 1 : n; /* 1 readable, 0 timeout, -1 error */
+  struct pollfd p = {.fd = fd, .events = POLLIN};
+  int n = poll(&p, 1, timeout_s * 1000);
+  return n > 0 ? 1 : n; /* 1 readable (or hung up: the read reports it), 0 timeout, -1 error */
 }
 
 static int write_all(int fd, const uint8_t *p, size_t n)
@@ -674,14 +673,8 @@ static void relay_session(struct ssh_slot *s, int fd)
     return;
   }
   for (;;) {
-    fd_set rf;
-    int maxfd = s->tcp > r.fd ? s->tcp : r.fd;
-    struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
-
-    FD_ZERO(&rf);
-    FD_SET(s->tcp, &rf);
-    FD_SET(r.fd, &rf);
-    int n = select(maxfd + 1, &rf, NULL, NULL, &tv);
+    struct pollfd pf[2] = {{.fd = s->tcp, .events = POLLIN}, {.fd = r.fd, .events = POLLIN}};
+    int n = poll(pf, 2, 30 * 1000);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -697,7 +690,7 @@ static void relay_session(struct ssh_slot *s, int fd)
       }
       continue;
     }
-    if (FD_ISSET(r.fd, &rf)) {
+    if (pf[1].revents & (POLLIN | POLLHUP | POLLERR)) {
       ssize_t got = read(r.fd, buf, sizeof(buf));
       if (got <= 0) {
         if (got < 0 && (errno == EINTR || errno == EAGAIN)) {
@@ -716,7 +709,7 @@ static void relay_session(struct ssh_slot *s, int fd)
         }
       }
     }
-    if (FD_ISSET(s->tcp, &rf) && relay_ssh_step(&r) != 0) {
+    if ((pf[0].revents & (POLLIN | POLLHUP | POLLERR)) && relay_ssh_step(&r) != 0) {
       break;
     }
   }
