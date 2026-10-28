@@ -24,6 +24,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+/* Linux/RT-Thread errno values missing from RTEMS newlib */
+#ifndef ESHUTDOWN
+#define ESHUTDOWN 108
+#endif
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
 #include <pthread.h>
 #include <time.h>
 
