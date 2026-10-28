@@ -34,24 +34,44 @@ if not tty:
 if not os.path.isfile(a.itb):
     sys.exit(f"no image {a.itb}")
 
-fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-at = termios.tcgetattr(fd)
-at[0] = 0                                    # iflag
-at[1] = 0                                    # oflag
-at[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
-at[3] = 0                                    # lflag: raw
-at[4] = at[5] = termios.B115200
-termios.tcsetattr(fd, termios.TCSANOW, at)
+def open_tty():
+    """(Re)open the console; the CH340 disappears while the Pluto is powered off."""
+    while True:
+        try:
+            f = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            break
+        except OSError:
+            time.sleep(0.05)
+    at = termios.tcgetattr(f)
+    at[0] = 0                                # iflag
+    at[1] = 0                                # oflag
+    at[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+    at[3] = 0                                # lflag: raw
+    at[4] = at[5] = termios.B115200
+    termios.tcsetattr(f, termios.TCSANOW, at)
+    return f
+
+
+fd = open_tty()
 log = open(a.log, "ab")
 buf = bytearray()
 
 
 def pump(t=0.05):
+    global fd
     end = time.time() + t
     while time.time() < end:
         try:
             d = os.read(fd, 4096)
         except BlockingIOError:
+            d = b""
+        except OSError:                      # power cycle: the console went away
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            print("\n== console gone (power cycle), reopening")
+            fd = open_tty()
             d = b""
         if d:
             buf.extend(d)
@@ -64,7 +84,10 @@ def pump(t=0.05):
 
 
 def send(s):
-    os.write(fd, s.encode() if isinstance(s, str) else s)
+    try:
+        os.write(fd, s.encode() if isinstance(s, str) else s)
+    except OSError:
+        pass
 
 
 def wait_for(pat, timeout, every=None, tick=None):
