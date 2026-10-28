@@ -1,0 +1,53 @@
+NANO>bootm ${fit_load_address}#config-1
+## Loading kernel from FIT Image at 02080000 ...
+   Using 'config-1' configuration
+   Trying 'rtems-1' kernel subimage
+     Description:  Nexus-BS RTOS
+     Type:         Kernel Image
+     Compression:  uncompressed
+     Data Start:   0x0216d024
+     Data Size:    5660060 Bytes = 5.4 MiB
+     Architecture: ARM
+     OS:           Linux
+     Load Address: 0x00104000
+     Entry Point:  0x00104040
+     Hash algo:    md5
+     Hash value:   60d48769e7e30d5483c5a1d6989c76b9
+   Verifying Hash Integrity ... md5+ OK
+## Loading fdt from FIT Image at 02080000 ...
+   Using 'config-1' configuration
+   Trying 'fdt-1' fdt subimage
+     Description:  stub
+     Type:         Flat Device Tree
+     Compression:  uncompressed
+     Data Start:   0x020800cc
+     Data Size:    296 Bytes = 296 Bytes
+     Architecture: ARM
+   Verifying Hash Integrity ... OK
+   Booting using the fdt blob at 0x20800cc
+Working FDT set to 20800cc
+   Loading Kernel Image to 104000
+   Loading Device Tree to 1db1f000, end 1db22127 ... OK
+Working FDT set to 1db1f000
+Starting kernel ...
+Nexus-BS RTOS 0.1.0-m2 (RTEMS 6.2.0.8abcb58186ce78c742b5a972d7a7a127082422a5) Pluto Nano
+boot 1.006 s, cpus 2, arm 1099999989 Hz, uart ref 99999999 Hz, PL configured
+nexus0: <RTEMS Nexus device>
+ehci0: <Zynq-7000 EHCI> on nexus0
+ehci0: ULPI PHY vendor 0424 product 0007
+ehci0: id 0xe441fa05 caplength 0x40
+usbus0: EHCI version 1.0
+usbus0: stop timeout
+usbus0 on ehci0
+zy7_slcr0: <Zynq-7000 slcr block> on nexus0
+usbus0: 480Mbps High Speed USB v2.0
+bsd: up at 2.160 s
+info: lo0: link state changed to UP
+rust: start at 2.161 s
+RTEMS Shell on /dev/console. Use 'helip' to list commands.
+SHLL [/] # nfo: version 6.2.1 starting
+ugen0.1: <Xilinx EHCI root HUB> at usbus0
+uhub0 on usbus0
+uhub0: <Xilinx EHCI root HUB, class 9/0, rev 2.00/1.00, addr 1> on usbus0
+err: no valid interfaces found
+uhub0: 1 port with 1 removable, self powered
