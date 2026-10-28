@@ -684,7 +684,7 @@ static void usb_watchdog_thread(void *parameter)
         }
         LOG_W("no AIC8800 interface %d s after start: power-cycling empty USB ports",
               round == 0 ? WLAN_USB_WATCHDOG_FIRST_MS / 1000 : WLAN_USB_WATCHDOG_SECOND_MS / 1000);
-        LOG_W("USB rescan: %d port(s) cycled", aicwf_usb_rescan(1));
+        LOG_W("USB rescan: %d port(s) cycled", aicwf_usb_rescan(0));
     }
 }
 
@@ -716,7 +716,7 @@ void aicwf_wifi_fwdiag(void)
 
 int aicwf_wifi_usb_rescan(void)
 {
-    return aicwf_usb_rescan(1);
+    return aicwf_usb_rescan(0); /* explore only: a port power cycle from this thread hung the shell */
 }
 
 int aicwf_wifi_reprobe(void)

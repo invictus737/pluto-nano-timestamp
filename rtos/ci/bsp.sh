@@ -1,24 +1,44 @@
 #!/usr/bin/env bash
-# RTEMS 6.2 kernel for the Pluto BSP and rtems-libbsd (FreeBSD 14 base) with the Zynq EHCI glue.
+# RTEMS 6.2 kernel for the Pluto BSP and rtems-libbsd (FreeBSD 14 base) with the Pluto pieces.
+# Incremental: the libbsd tree (sources + waf build directory) lives in $LIBBSD_WORK and is cached
+# by CI. A restored tree gets its pristine copies of the patched files back, the overlay re-applied
+# and only the changed objects rebuilt (waf compares contents). The kernel is built once per
+# kernel-input hash (rtos/bsp/**, toolchain) and stays in the prefix.
 # usage: rtos/ci/bsp.sh <toolchain prefix> <bsp prefix>
 set -euo pipefail
-TOOLS=${1:?toolchain prefix}; PREFIX=${2:?bsp prefix}; VER=6.2; WORK=${WORK:-$PWD/work-rtems}; HERE=$(cd "$(dirname "$0")/.." && pwd)
-BSP=arm/xilinx_zynq_zedboard
+TOOLS=${1:?toolchain prefix}; PREFIX=${2:?bsp prefix}; VER=6.2; HERE=$(cd "$(dirname "$0")/.." && pwd)
+WORK=${LIBBSD_WORK:-$PWD/work-rtems}; BSP=arm/xilinx_zynq_zedboard
+URL=https://ftp.rtems.org/pub/rtems/releases/6/$VER/sources
 export PATH="$TOOLS/bin:$PATH"
-mkdir -p "$WORK" && cd "$WORK"
-rm -rf rtems-$VER rtems-libbsd-fb14-$VER
-curl -sfL https://ftp.rtems.org/pub/rtems/releases/6/$VER/sources/rtems-$VER.tar.xz | tar xJ
-curl -sfL https://ftp.rtems.org/pub/rtems/releases/6/$VER/sources/rtems-libbsd-fb14-$VER.tar.xz | tar xJ
-cd rtems-$VER
-cp "$HERE/bsp/config.ini" config.ini
-./waf configure --prefix="$PREFIX" | tail -5
-./waf -j"$(nproc)" | tail -3
-./waf install | tail -2
-cd ../rtems-libbsd-fb14-$VER
+mkdir -p "$WORK" "$PREFIX"
+if [ ! -f "$PREFIX/.pluto-kernel" ]; then
+  echo "kernel: full build"
+  T=$(mktemp -d); (cd "$T" && curl -sfL "$URL/rtems-$VER.tar.xz" | tar xJ)
+  cp "$HERE/bsp/config.ini" "$T/rtems-$VER/config.ini"
+  (cd "$T/rtems-$VER" && ./waf configure --prefix="$PREFIX" | tail -3 && ./waf -j"$(nproc)" | tail -2 && ./waf install | tail -1)
+  rm -rf "$T"; touch "$PREFIX/.pluto-kernel"
+else
+  echo "kernel: cached"
+fi
+LB=$WORK/rtems-libbsd-fb14-$VER
+PATCHED="libbsd.py freebsd/sys/dev/usb/usb_msctest.c freebsd/sys/dev/usb/usb_msctest.h"
+INI_SUM=$(sha256sum "$HERE/libbsd/pluto.ini" | cut -c1-16)
+if [ ! -f "$LB/.pluto-configured" ]; then
+  echo "libbsd: fresh tree"
+  rm -rf "$LB"; (cd "$WORK" && curl -sfL "$URL/rtems-libbsd-fb14-$VER.tar.xz" | tar xJ)
+  for f in $PATCHED; do mkdir -p "$LB/.pristine/$(dirname "$f")"; cp -p "$LB/$f" "$LB/.pristine/$f"; done
+else
+  echo "libbsd: cached tree, incremental build"
+  for f in $PATCHED; do cp "$LB/.pristine/$f" "$LB/$f"; done
+fi
 "$HERE/libbsd/aic8800/fetch-firmware.sh" "$WORK/aicwf_fw_data.c"
-"$HERE/libbsd/apply.sh" "$PWD"
-./waf configure --prefix="$PREFIX" --rtems="$PREFIX" --rtems-tools="$TOOLS" --rtems-bsps=$BSP --buildset=buildset/pluto.ini | tail -5
-./waf -j"$(nproc)" | tail -3
-./waf install | tail -2
+"$HERE/libbsd/apply.sh" "$LB" >/dev/null
+cd "$LB"
+if [ "$(cat .pluto-configured 2>/dev/null)" != "$INI_SUM" ]; then
+  ./waf configure --prefix="$PREFIX" --rtems="$PREFIX" --rtems-tools="$TOOLS" --rtems-bsps=$BSP --buildset=buildset/pluto.ini | tail -3
+  echo "$INI_SUM" > .pluto-configured
+fi
+S=$SECONDS; ./waf -j"$(nproc)" | tail -2; echo "libbsd build: $((SECONDS - S)) s"
+./waf install | tail -1
 install -D -m 644 "$WORK/aicwf_fw_data.c" "$PREFIX/share/aicwf/aicwf_fw_data.c"
-ls -la "$PREFIX/arm-rtems6/xilinx_zynq_zedboard/lib/libbsd.a" "$PREFIX/lib/pkgconfig/"
+ls -la "$PREFIX/arm-rtems6/xilinx_zynq_zedboard/lib/libbsd.a"

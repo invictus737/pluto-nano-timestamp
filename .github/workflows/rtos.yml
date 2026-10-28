@@ -1,7 +1,9 @@
 name: rtos (Nexus-BS RTEMS image, no Linux)
-# Bitstream: the nano-system_top.xsa of the last successful v0.39-std firmware run (same HDL
-# inputs, checked by firmware/xsa-key.sh). Toolchain and BSP+libbsd are cached; the image is
-# rebuilt every run. Output: rtos.itb (FIT: fpga + RTEMS kernel) for `run dfu_ram` + `bootm`.
+# Two jobs. `base` (Wi-Fi, SSH, config, drivers: rtos.itb) is the fast lane: every cache warm, an
+# rtos/app change is a one-minute compile, a libbsd/driver change an incremental waf build of the
+# changed objects only. `station` (nexus2 + native Pluto driver: rtos-nexus2.itb) starts after it
+# with the same prefixes and a cached cargo target. Outputs go to the draft release rtos-ci-<run>.
+# Bitstream: nano-system_top.xsa of the last successful v0.39-std firmware run.
 on:
   workflow_dispatch:
     inputs:
@@ -9,146 +11,213 @@ on:
   push:
     branches: [Nexus-BS-2.0_RTOS]
     paths: ['rtos/**', '.github/workflows/rtos.yml']
+# a newer push supersedes a running build
+concurrency: { group: 'rtos-${{ github.ref }}', cancel-in-progress: true }
 permissions: { actions: read, contents: write }
 env:
   RTEMS_TOOLS: /opt/rtems/6
   RTEMS_BSP_PREFIX: /opt/rtems/bsp
+  LIBBSD_WORK: /opt/rtems/libbsd-work
   WOLF_PREFIX: /opt/rtems/wolf
+  SDR_PREFIX: /opt/rtems/sdr
+  TAG: 'rtos-ci-${{ github.run_number }}'
 jobs:
-  image:
+  base:
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-      - name: Host packages
-        run: sudo apt-get update -q && sudo apt-get install -y -q build-essential flex bison texinfo unzip zlib1g-dev python3-dev libncurses-dev pkg-config u-boot-tools xz-utils device-tree-compiler qemu-system-arm
+      - run: sudo mkdir -p /opt/rtems && sudo chown runner /opt/rtems
+      - name: Cache keys (kernel inputs, then libbsd inputs; a libbsd change restores the previous tree of the same kernel)
+        run: |
+          h() { for f in $(git ls-files "$@" | sort); do sha256sum "$f"; done | sha256sum | cut -c1-20; }
+          { echo "K_TC=rtems-6.2-arm-tools-v1-$(h rtos/ci/toolchain.sh)"
+            echo "K_KERNEL=rtems-6.2-pluto-bsp-v2-$(h rtos/ci/toolchain.sh rtos/bsp)-"
+            echo "K_LIBBSD=$(h rtos/ci/bsp.sh rtos/libbsd)"
+            echo "K_WOLF=rtems-6.2-wolfssh-v1-$(h rtos/ci/wolfssh.sh rtos/ssh/user_settings.h rtos/ci/toolchain.sh)"
+            echo "K_SDR=rtems-6.2-pluto-sdr-v2-$(h rtos/sdr)"
+            echo "K_CARGO=$(h rtos/ci/nexus2-link.sh rtos/ci/rust-toolchain.sh)"; } >> "$GITHUB_ENV"
+      - name: Toolchain cache
+        id: tc
+        uses: actions/cache/restore@v4
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ env.K_TC }}' }
+      - name: BSP + libbsd cache (exact, else the previous libbsd tree of this kernel)
+        id: bsp
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.RTEMS_BSP_PREFIX }}
+            ${{ env.LIBBSD_WORK }}
+          key: '${{ env.K_KERNEL }}${{ env.K_LIBBSD }}'
+          restore-keys: '${{ env.K_KERNEL }}'
+      - name: Host packages (build dependencies only when something is built from scratch)
+        run: |
+          P="u-boot-tools device-tree-compiler"
+          [ "${{ steps.tc.outputs.cache-hit }}" = true ] || P="$P build-essential flex bison texinfo unzip zlib1g-dev python3-dev libncurses-dev pkg-config xz-utils"
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $P > /dev/null
       - name: Bitstream (xsa from the v0.39-std firmware run)
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           RUN='${{ inputs.xsa_run }}'
           [ -n "$RUN" ] || RUN=$(gh run list -R "$GITHUB_REPOSITORY" -b v0.39-std -w firmware.yml -s success -L 1 --json databaseId --jq '.[0].databaseId')
-          echo "xsa from run $RUN"
           gh run download "$RUN" -R "$GITHUB_REPOSITORY" -n nano-system_top.xsa -D xsa
-          unzip -l xsa/system_top.xsa | grep -E 'system_top.bit|ps7_init.c'
-          unzip -p xsa/system_top.xsa system.hwh | grep -oE 'PCW_ACT_(APU|UART|USB0)_PERIPHERAL_FREQMHZ" VALUE="[^"]*"'
-      - name: Toolchain cache
-        id: tc
-        uses: actions/cache/restore@v4
-        with: { path: '${{ env.RTEMS_TOOLS }}', key: 'rtems-6.2-arm-tools-v1-${{ hashFiles(''rtos/ci/toolchain.sh'') }}' }
       - name: RTEMS 6.2 toolchain (source builder, first run only)
         if: steps.tc.outputs.cache-hit != 'true'
-        run: sudo mkdir -p $RTEMS_TOOLS && sudo chown runner $RTEMS_TOOLS && rtos/ci/toolchain.sh $RTEMS_TOOLS
-      - name: Save the toolchain now (kept even if a later step fails)
+        run: rtos/ci/toolchain.sh $RTEMS_TOOLS
+      - name: Save the toolchain
         if: steps.tc.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
-        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ steps.tc.outputs.cache-primary-key }}' }
-      - name: BSP + libbsd cache
-        id: bsp
-        uses: actions/cache/restore@v4
-        with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: 'rtems-6.2-pluto-bsp-v1-${{ hashFiles(''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/libbsd/*'', ''rtos/libbsd/aic8800/if_aicwf_usb.c'', ''rtos/libbsd/aic8800/aicwf_usbif.h'', ''rtos/libbsd/aic8800/fetch-firmware.sh'', ''rtos/libbsd/aic8800/gen_fwdata.py'', ''rtos/ci/toolchain.sh'') }}' }
-      - name: RTEMS kernel (Pluto BSP) + libbsd with the Zynq EHCI glue
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ env.K_TC }}' }
+      - name: RTEMS kernel + libbsd (incremental on a restored tree)
         if: steps.bsp.outputs.cache-hit != 'true'
-        run: sudo mkdir -p $RTEMS_BSP_PREFIX && sudo chown runner $RTEMS_BSP_PREFIX && rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
-      - name: Save BSP + libbsd now
+        run: rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
+      - name: Save BSP + libbsd
         if: steps.bsp.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
-        with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: '${{ steps.bsp.outputs.cache-primary-key }}' }
+        with:
+          path: |
+            ${{ env.RTEMS_BSP_PREFIX }}
+            ${{ env.LIBBSD_WORK }}
+          key: '${{ env.K_KERNEL }}${{ env.K_LIBBSD }}'
+      - name: wolfSSL + wolfSSH cache
+        id: wolf
+        uses: actions/cache/restore@v4
+        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ env.K_WOLF }}' }
+      - name: wolfSSL + wolfSSH (first run only)
+        id: wolfb
+        if: steps.wolf.outputs.cache-hit != 'true'
+        run: rtos/ci/wolfssh.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $WOLF_PREFIX
+      - name: Save wolfSSL + wolfSSH
+        if: steps.wolf.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ env.K_WOLF }}' }
+      - name: Image (rtos.itb)
+        env:
+          NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
+          NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
+          NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
+        run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
+      - name: Draft release with the base image (repository is public; drafts are visible to collaborators only)
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release create "$TAG" out/rtos.itb out/nexus-rtos.elf out/nexus-rtos.map out/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --draft --target "$GITHUB_SHA" --title "RTOS CI ${{ github.run_number }} (${GITHUB_SHA::7})" \
+            --notes "Draft: CI outputs of the Nexus-BS RTOS branch, not a release."
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,createdAt \
+            --jq '[.[] | select(.isDraft and (.tagName | startswith("rtos-ci-")))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+            while read -r old; do gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes; done
+
+  station:
+    needs: base
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo mkdir -p /opt/rtems && sudo chown runner /opt/rtems
+      - name: Cache keys (kernel inputs, then libbsd inputs; a libbsd change restores the previous tree of the same kernel)
+        run: |
+          h() { for f in $(git ls-files "$@" | sort); do sha256sum "$f"; done | sha256sum | cut -c1-20; }
+          { echo "K_TC=rtems-6.2-arm-tools-v1-$(h rtos/ci/toolchain.sh)"
+            echo "K_KERNEL=rtems-6.2-pluto-bsp-v2-$(h rtos/ci/toolchain.sh rtos/bsp)-"
+            echo "K_LIBBSD=$(h rtos/ci/bsp.sh rtos/libbsd)"
+            echo "K_WOLF=rtems-6.2-wolfssh-v1-$(h rtos/ci/wolfssh.sh rtos/ssh/user_settings.h rtos/ci/toolchain.sh)"
+            echo "K_SDR=rtems-6.2-pluto-sdr-v2-$(h rtos/sdr)"
+            echo "K_CARGO=$(h rtos/ci/nexus2-link.sh rtos/ci/rust-toolchain.sh)"; } >> "$GITHUB_ENV"
+      - name: Toolchain, BSP, wolf caches (saved by the base job)
+        uses: actions/cache/restore@v4
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ env.K_TC }}', fail-on-cache-miss: true }
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.RTEMS_BSP_PREFIX }}
+            ${{ env.LIBBSD_WORK }}
+          key: '${{ env.K_KERNEL }}${{ env.K_LIBBSD }}'
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ env.K_WOLF }}' }
+      - name: Host packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends u-boot-tools device-tree-compiler > /dev/null
+      - name: Bitstream
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          RUN='${{ inputs.xsa_run }}'
+          [ -n "$RUN" ] || RUN=$(gh run list -R "$GITHUB_REPOSITORY" -b v0.39-std -w firmware.yml -s success -L 1 --json databaseId --jq '.[0].databaseId')
+          gh run download "$RUN" -R "$GITHUB_REPOSITORY" -n nano-system_top.xsa -D xsa
       - name: Native Pluto driver host unit tests (framing, timestamps, DMA ring)
         run: make -C rtos/sdr/test
       - name: SoapySDR + native Pluto driver cache
         id: sdr
         uses: actions/cache/restore@v4
-        with: { path: /opt/rtems/sdr, key: 'rtems-6.2-pluto-sdr-v1-${{ hashFiles(''rtos/sdr/**'', ''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/ci/toolchain.sh'') }}' }
-      - name: SoapySDR 0.8.1 + native Pluto driver (libSoapySDR.a, libSoapyPlutoRtems.a with ADI no-OS)
-        id: sdrb
+        with: { path: '${{ env.SDR_PREFIX }}', key: '${{ env.K_SDR }}-${{ env.K_KERNEL }}${{ env.K_LIBBSD }}' }
+      - name: SoapySDR 0.8.1 + native Pluto driver
         if: steps.sdr.outputs.cache-hit != 'true'
-        continue-on-error: true
         run: |
-          sudo mkdir -p /opt/rtems/sdr && sudo chown runner /opt/rtems/sdr
-          rtos/sdr/build-soapysdr.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr
+          rtos/sdr/build-soapysdr.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $SDR_PREFIX
           rtos/sdr/fetch-noos.sh $RUNNER_TEMP/noos
-          rtos/sdr/build-pluto-driver.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr $RUNNER_TEMP/noos /opt/rtems/sdr
-      - name: Save SoapySDR + native Pluto driver now
-        if: steps.sdr.outputs.cache-hit != 'true' && steps.sdrb.outcome == 'success'
+          rtos/sdr/build-pluto-driver.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $SDR_PREFIX $RUNNER_TEMP/noos $SDR_PREFIX
+      - name: Save SoapySDR + native Pluto driver
+        if: steps.sdr.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
-        with: { path: /opt/rtems/sdr, key: '${{ steps.sdr.outputs.cache-primary-key }}' }
-      - name: Rust nightly with rust-src (build-std)
-        run: rustup toolchain install nightly --profile minimal --component rust-src && rustc +nightly -V
-      - name: Rust std probe (M3, armv7-rtems-eabihf)
-        id: rust
-        continue-on-error: true
-        run: rtos/rust-probe/build.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/librust.a
-      - name: wolfSSL + wolfSSH cache
-        id: wolf
-        uses: actions/cache/restore@v4
-        with: { path: '${{ env.WOLF_PREFIX }}', key: 'rtems-6.2-wolfssh-v1-${{ hashFiles(''rtos/ci/wolfssh.sh'', ''rtos/ssh/user_settings.h'', ''rtos/ci/toolchain.sh'') }}' }
-      - name: wolfSSL + wolfSSH for the SSH server (M2e; image builds without SSH if this fails)
-        id: wolfb
-        if: steps.wolf.outputs.cache-hit != 'true'
-        continue-on-error: true
-        run: sudo mkdir -p $WOLF_PREFIX && sudo chown runner $WOLF_PREFIX && rtos/ci/wolfssh.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $WOLF_PREFIX
-      - name: Save wolfSSL + wolfSSH now
-        if: steps.wolf.outputs.cache-hit != 'true' && steps.wolfb.outcome == 'success'
-        uses: actions/cache/save@v4
-        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ steps.wolf.outputs.cache-primary-key }}' }
-      - name: Image
-        env:
-          RUST_LIB: '${{ github.workspace }}/librust.a'
-          # SSH host key (OpenSSH ed25519; empty = ephemeral key per build), read by
-          # rtos/ssh/gen_secrets.py. SSH passwords are the nexus2 dashboard credentials.
-          NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
-          # first-boot Wi-Fi network when /data/nexus.conf has none (rtos/config/gen-wifi-defaults.sh)
-          NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
-          NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
-        run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
-      - name: QEMU smoke test (xilinx-zynq-a9, console on UART1)
-        continue-on-error: true
-        run: |
-          timeout 45 qemu-system-arm -M xilinx-zynq-a9 -m 512M -no-reboot -nographic \
-            -serial null -serial mon:stdio -kernel out/nexus-rtos.elf </dev/null > out/qemu.log 2>&1 || true
-          cat out/qemu.log | head -80
-          # QEMU's PL310 model reports an ID the ZedBoard BSP rejects (fatal 0x900, L2C-310
-          # unexpected ID) before Init: that only proves the start code ran up to the L2 setup.
-          if grep -q "fatal code: 2304" out/qemu.log; then echo "::warning::QEMU L2C-310 model limit (start code reached L2 init)"; exit 0; fi
-          grep -q "Nexus-BS RTOS" out/qemu.log
+        with: { path: '${{ env.SDR_PREFIX }}', key: '${{ steps.sdr.outputs.cache-primary-key }}' }
       - name: nexus2 commit (rtos/NEXUS_REF pins the Nexus-BS-2.0_RTOS commit of this image)
         id: nref
         run: echo "ref=$(cat rtos/NEXUS_REF)" >> "$GITHUB_OUTPUT"
       - name: nexus2 source (private repo, read-only deploy key)
-        id: nsrc
-        continue-on-error: true
         uses: actions/checkout@v4
         with: { repository: invictus737/nexus-bs2-src, ref: '${{ steps.nref.outputs.ref }}', path: nexus, ssh-key: '${{ secrets.NEXUS_SRC_KEY }}' }
-      - name: nexus2 on RTEMS (type check report)
-        if: steps.nsrc.outcome == 'success'
+      - name: Rust toolchain + cargo target cache
+        id: cargo
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/nightly-2025-07-01-*
+            ~/.rustup/linked
+            ~/.cargo/registry
+            nexus/target
+          key: 'rtos-nexus2-cargo-v1-${{ steps.nref.outputs.ref }}-${{ env.K_CARGO }}'
+          restore-keys: rtos-nexus2-cargo-v1-
+      - name: Cached target of the same nexus2 commit counts as fresh (cargo compares mtimes)
+        if: steps.cargo.outputs.cache-hit == 'true'
+        run: find nexus -path nexus/target -prune -o -type f -print0 | xargs -0 touch -d '2000-01-01 00:00:00'
+      - name: Rust nightly-2025-07-01 linked copy with std built on the RTEMS libc (vendor/libc)
+        run: echo "RUST_TOOLCHAIN=$(rtos/ci/rust-toolchain.sh nightly-2025-07-01 $PWD/nexus/vendor/libc nexus-rtems-libc)" >> "$GITHUB_ENV"
+      - name: libc ABI vs the RTEMS 6.2 + libbsd headers (arm-rtems6-gcc vs rustc, fails on mismatch)
+        id: abi
         continue-on-error: true
-        run: rtos/ci/nexus2-check.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/nexus $PWD/out/nexus2-rtems-check.txt
+        run: rtos/ci/nexus2-abi.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/nexus $PWD/out/abi
       - name: Station image (nexus2 + native Pluto driver linked into RTEMS)
         id: n2img
-        if: steps.nsrc.outcome == 'success'
         continue-on-error: true
         env:
+          WOLF_PREFIX: '${{ env.WOLF_PREFIX }}'
           NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
           NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
           NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
-        run: rtos/ci/image-nexus2.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr $PWD/nexus xsa/system_top.xsa out
-      - name: Outputs to a draft release (repository is public; drafts are visible to collaborators only)
+        run: |
+          # the C side (libnexusrtos.a) is a link argument cargo does not track: relink every run
+          touch nexus/bins/nexus2/src/main.rs
+          rtos/ci/image-nexus2.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $SDR_PREFIX $PWD/nexus xsa/system_top.xsa out
+      - name: Save Rust toolchain + cargo target
+        if: steps.cargo.outputs.cache-hit != 'true' && steps.n2img.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/nightly-2025-07-01-*
+            ~/.rustup/linked
+            ~/.cargo/registry
+            nexus/target
+          key: '${{ steps.cargo.outputs.cache-primary-key }}'
+      - name: Station outputs to the draft release
         if: always()
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
-          TAG=rtos-ci-${{ github.run_number }}
-          FILES=$(ls out/rtos-nexus2.itb out/nexus2.map out/rtos.itb out/nexus-rtos.elf out/nexus-rtos.map out/SHA256SUMS out/qemu.log out/nexus2-rtems-check.txt out/nexus2-rtems-check.txt.raw out/nexus2-link.log rtos/rust-probe/build-*.log 2>/dev/null || true)
-          [ -n "$FILES" ] || { echo "nothing to publish"; exit 0; }
-          gh release create "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
-            --title "RTOS CI ${{ github.run_number }} (${GITHUB_SHA::7})" --notes "Draft: CI outputs of the Nexus-BS RTOS branch, not a release."
-          # keep only the 5 newest RTOS CI drafts
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,createdAt \
-            --jq '[.[] | select(.isDraft and (.tagName | startswith("rtos-ci-")))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
-            while read -r old; do gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes; done
+          [ -f out/abi/abi-report.txt ] && cp out/abi/abi-report.txt out/abi-report.txt && cp out/abi/abi_table.h out/abi-table.h
+          FILES=$(ls out/abi-report.txt out/abi-table.h out/rtos-nexus2.itb out/nexus2.map out/nexus2-link.log 2>/dev/null || true)
+          [ -z "$FILES" ] || gh release upload "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --clobber
       # the station steps continue on error so the draft release still gets the logs; the run
       # must not look green when the image the board needs was not built
       - name: Station image result
         if: always()
         run: |
-          if [ "${{ steps.nsrc.outcome }}" != "success" ]; then echo "::error::nexus2 source checkout failed: no station image"; exit 1; fi
+          if [ "${{ steps.abi.outcome }}" != "success" ]; then echo "::error::libc ABI check failed (abi-report.txt in the draft release): std/nexus2 would run with wrong layouts"; exit 1; fi
           if [ "${{ steps.n2img.outcome }}" != "success" ] || [ ! -f out/rtos-nexus2.itb ]; then echo "::error::station image (rtos-nexus2.itb) not built, see nexus2-link.log in the draft release"; exit 1; fi
