@@ -41,10 +41,11 @@ RAM-boot first through `run dfu_ram`; flashing is a separate, explicit step.
 | M2b | USB Wi-Fi from libbsd: rtwn (RTL8188EU/8192CU/8812AU/8821AU), net80211, wpa_supplicant | WPA2 association, DHCP |
 | M2c | AIC8800: storage-mode eject driver (SCSI eject via usb_msc_eject), fullmac Wi-Fi driver ported from aic8800_fdrv to net80211 (model: if_rsu), firmware in the image | D80 + DC sticks associate, DHCP |
 | M2d | AIC8800 BT: HCI over USB (+ BT patch download), BTstack host, A2DP source like the Linux BT Player | A2DP to headphones |
+| M2e | SSH: wolfSSH server (public-key auth, keys in the data partition) giving the RTEMS shell + nexus commands, SFTP/SCP for files and updates | `ssh` + `scp` to the Pluto |
 | M3 | Rust std on `armv7-rtems-eabihf` (build-std): threads, sockets, time | Rust thread + UDP echo on board |
 | M4 | AD9363 (ADI no-OS ad9361 driver) + AXI DMAC RX/TX with timestamps; `rf-front` backend `pluto-native` implementing RxIo/TxIo/DuplexIo instead of SoapySDR | RX samples flowing, TX on dummy load |
 | M5 | Full `nexus2` on RTEMS: SoapySDR replaced by M4, `reqwest` (tokio/mio) gated or replaced by std-only HTTP, `getrandom`/`ring` RTEMS backend, `ctrlc` gated; config + calibration files on a QSPI file system | all four modes on air, dashboard, Brew/BrandMeister/P25/svxlink networks |
-| M6 | QSPI install as an alternative boot (`nexus_os=rtems`), Linux kept for recovery | cold boot to RF in < 3 s |
+| M6 | QSPI layout: two image slots A/B (whole RTEMS+nexus2 image, update written to the inactive slot over SFTP/dashboard, hash check, switch, automatic fallback) + JFFS2 data partition (nexus2.toml, calibration, SSH keys, logs); bank 0 restored before any reset; Linux kept for recovery | cold boot to RF in < 3 s, update + rollback proven |
 
 ## Risks
 
