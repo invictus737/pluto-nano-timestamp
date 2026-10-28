@@ -32,18 +32,26 @@ jobs:
           unzip -p xsa/system_top.xsa system.hwh | grep -oE 'PCW_ACT_(APU|UART|USB0)_PERIPHERAL_FREQMHZ" VALUE="[^"]*"'
       - name: Toolchain cache
         id: tc
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with: { path: '${{ env.RTEMS_TOOLS }}', key: 'rtems-6.2-arm-tools-v1-${{ hashFiles(''rtos/ci/toolchain.sh'') }}' }
       - name: RTEMS 6.2 toolchain (source builder, first run only)
         if: steps.tc.outputs.cache-hit != 'true'
         run: sudo mkdir -p $RTEMS_TOOLS && sudo chown runner $RTEMS_TOOLS && rtos/ci/toolchain.sh $RTEMS_TOOLS
+      - name: Save the toolchain now (kept even if a later step fails)
+        if: steps.tc.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ steps.tc.outputs.cache-primary-key }}' }
       - name: BSP + libbsd cache
         id: bsp
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: 'rtems-6.2-pluto-bsp-v1-${{ hashFiles(''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/libbsd/**'', ''rtos/ci/toolchain.sh'') }}' }
       - name: RTEMS kernel (Pluto BSP) + libbsd with the Zynq EHCI glue
         if: steps.bsp.outputs.cache-hit != 'true'
         run: sudo mkdir -p $RTEMS_BSP_PREFIX && sudo chown runner $RTEMS_BSP_PREFIX && rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
+      - name: Save BSP + libbsd now
+        if: steps.bsp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: '${{ steps.bsp.outputs.cache-primary-key }}' }
       - name: Rust nightly with rust-src (build-std)
         run: rustup toolchain install nightly --profile minimal --component rust-src && rustc +nightly -V
       - name: Rust std probe (M3, armv7-rtems-eabihf)
