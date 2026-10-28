@@ -5,12 +5,12 @@
 # station). A peer that joins the strongest access point of that SSID lands here, a few centimetres
 # away, instead of on a distant router. Only Espressif MACs (and /mnt/data/light-ap.allow) are
 # accepted; phones and laptops stay on the router. Proxy ARP, no router change and no NAT: the peer
-# gets an address of the station's own /24 outside the router's DHCP pool (.250-.253 by default,
-# LIGHT_AP_HOSTS), the Pluto answers ARP for it on the station side and routes it, so the router,
+# gets an address of the station's own /24 outside the router's DHCP pool (.250 by default; more
+# peers: LIGHT_AP_HOSTS="250 251"), the Pluto answers ARP for it on the station side and routes it, so the router,
 # the Internet (Brew) and the LAN (dashboard) see the peer as one more LAN host.
 #   light-ap start|stop|status
 IF=${LIGHT_AP_IF:-wlap0}; STA=${LIGHT_AP_STA:-wlan0}
-HOSTS=${LIGHT_AP_HOSTS:-250 251 252 253}; RUN=/run/light-ap
+HOSTS=${LIGHT_AP_HOSTS:-250}; RUN=/run/light-ap
 log() { logger -t light-ap "$*" 2>/dev/null; echo "$(date +%T) light-ap: $*"; }
 role() { cat /run/nexus-role 2>/dev/null || fw_printenv -n operating_mode 2>/dev/null; }
 
@@ -78,7 +78,9 @@ start() {
 		log "hostapd failed: $(tail -1 $RUN/hostapd.log)"; return 1; }
 	for h in $HOSTS; do ip route replace $net.$h/32 dev $IF; done
 	for i in $STA $IF; do echo 1 > /proc/sys/net/ipv4/conf/$i/proxy_arp; done
+	[ -f $RUN/ip_forward.saved ] || cat /proc/sys/net/ipv4/ip_forward > $RUN/ip_forward.saved
 	echo 1 > /proc/sys/net/ipv4/ip_forward
+	echo "$ch" > $RUN/channel
 	dns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
 	first=${HOSTS%% *}; last=${HOSTS##* }
 	{
@@ -98,12 +100,28 @@ stop() {
 	net=$(ip -4 -o addr show $STA | awk '{print $4; exit}'); net=${net%/*}; net=${net%.*}
 	[ -n "$net" ] && for h in $HOSTS; do ip route del $net.$h/32 dev $IF 2>/dev/null; done
 	echo 0 > /proc/sys/net/ipv4/conf/$STA/proxy_arp 2>/dev/null
+	[ -f $RUN/ip_forward.saved ] && cat $RUN/ip_forward.saved > /proc/sys/net/ipv4/ip_forward && rm -f $RUN/ip_forward.saved
 	iw dev $IF del 2>/dev/null
 	rm -f $RUN/*.pid
 	log "stopped"
 }
+# Follows the station: a router channel change (or a dead hostapd) restarts the access point on the
+# station's new channel; checked every 20 s.
+watch() {
+	[ "$(role)" = light ] || [ "${LIGHT_AP_FORCE:-0}" = 1 ] || return 0
+	while sleep 20; do
+		[ -f /mnt/data/light-ap.disable ] && continue
+		ch=$(iw dev $STA info 2>/dev/null | awk '/channel/{print $2; exit}')
+		running=0; [ -f $RUN/hostapd.pid ] && kill -0 "$(cat $RUN/hostapd.pid)" 2>/dev/null && running=1
+		if [ -n "$ch" ] && { [ $running = 0 ] || [ "$ch" != "$(cat $RUN/channel 2>/dev/null)" ]; }; then
+			log "station on channel $ch, access point $( [ $running = 1 ] && echo "on $(cat $RUN/channel)" || echo down): restarting"
+			stop; start
+		fi
+	done
+}
 case "$1" in
 start) start ;;
+watch) start; watch ;;
 stop) stop ;;
 restart) stop; start ;;
 status)

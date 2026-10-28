@@ -2,8 +2,8 @@
 # Light hotspot (light-ap): an access point for the Nexus-Light peer next to the Pluto, light role
 # only. Runs in the background so a slow Wi-Fi association does not hold up the boot.
 case "$1" in
-start) mkdir -p /run/light-ap; ( /usr/sbin/light-ap start >> /run/light-ap/start.log 2>&1 ) & ;;
-stop) /usr/sbin/light-ap stop ;;
-restart) /usr/sbin/light-ap stop; ( /usr/sbin/light-ap start >> /run/light-ap/start.log 2>&1 ) & ;;
+start) mkdir -p /run/light-ap; ( /usr/sbin/light-ap watch >> /run/light-ap/start.log 2>&1 ) & ;;
+stop) for p in $(pidof sh); do case "$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)" in *"light-ap watch"*) kill $p ;; esac; done; /usr/sbin/light-ap stop ;;
+restart) "$0" stop; exec "$0" start ;;
 esac
 exit 0
