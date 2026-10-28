@@ -259,6 +259,8 @@ RTEMS_BSD_DEFINE_NEXUS_DEVICE(ehci, 0, 0, NULL);
 SYSINIT_DRIVER_REFERENCE(usbus, ehci);
 RTEMS_BSD_DRIVER_USB;
 RTEMS_BSD_DRIVER_USB_MASS;
+/* AIC8800 Wi-Fi/BT sticks: leave the driver-CD storage mode before umass claims them */
+SYSINIT_DRIVER_REFERENCE(aicms, uhub);
 SYSINIT_DRIVER_REFERENCE(axe, uhub);
 SYSINIT_DRIVER_REFERENCE(axge, uhub);
 SYSINIT_DRIVER_REFERENCE(ure, uhub);
