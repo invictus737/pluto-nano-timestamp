@@ -165,7 +165,8 @@ static void *http_status(void *arg)
 
 static void start_dhcpcd(void)
 {
-  static const char cfg[] = "clientid nexus-rtos\nbackground\noption domain_name_servers\n";
+  /* fast lease: no ARP collision probe, IPv4 only (no IPv6 router solicitation wait) */
+  static const char cfg[] = "clientid nexus-rtos\nbackground\noption domain_name_servers\nnoarp\nipv4only\nnoipv6rs\n";
   int fd = open("/etc/dhcpcd.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd >= 0) {
     (void)write(fd, cfg, sizeof(cfg) - 1);
