@@ -19,8 +19,9 @@ for d in "${LIBDIRS[@]}"; do LINK="$LINK -C link-arg=-L$d"; done
 # The C side is not referenced from Rust (RTEMS calls Init): pull every object in.
 LINK="$LINK -C link-arg=-Wl,--whole-archive -C link-arg=$APPLIB -C link-arg=-Wl,--no-whole-archive"
 for l in ${NEXUS_EXTRA_WHOLE:-}; do LINK="$LINK -C link-arg=-Wl,--whole-archive -C link-arg=$l -C link-arg=-Wl,--no-whole-archive"; done
-# POSIX rename/fsync semantics for every caller (rtos/app/posix_compat.c)
-LINK="$LINK -C link-arg=-Wl,--wrap=rename -C link-arg=-Wl,--wrap=fsync -C link-arg=-Wl,--wrap=fdatasync"
+# POSIX rename/fsync semantics, directory descriptors for *at() and a station-only exit() for
+# every caller (rtos/app/posix_compat.c)
+for w in rename fsync fdatasync open close exit; do LINK="$LINK -C link-arg=-Wl,--wrap=$w"; done
 LINK="$LINK -C link-arg=-Wl,--start-group"
 for l in ${NEXUS_EXTRA_LIBS:-} -lbsd -lstdc++ -lm -lz; do LINK="$LINK -C link-arg=$l"; done
 LINK="$LINK -C link-arg=-Wl,--end-group -C link-arg=-Wl,-Map,${OUT%.elf}.map"

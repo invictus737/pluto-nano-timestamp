@@ -1,8 +1,10 @@
 /*
  * POSIX *at() calls and flock() for the Rust std library on RTEMS, which has no *at system calls.
- * Paths relative to AT_FDCWD or absolute are served by the plain calls; a real directory file
- * descriptor is not supported (ENOSYS) - nexus2 does not rely on it. flock() always succeeds:
- * there is one program in the image, so advisory locks between processes cannot conflict.
+ * Paths relative to AT_FDCWD or absolute are served by the plain calls. A directory descriptor
+ * works when it was opened with O_DIRECTORY (open/openat are wrapped and remember the path of
+ * such descriptors until close; Rust std's remove_dir_all and nexus2's RF switch store open
+ * directories that way); any other descriptor gives ENOSYS. flock() always succeeds: there is
+ * one program in the image, so advisory locks between processes cannot conflict.
  *
  * rename() and fsync()/fdatasync() are wrapped (nexus2-link.sh: -Wl,--wrap=...) for every caller
  * in the image, Rust std included:
@@ -15,6 +17,9 @@
  * - IMFS and JFFS2 have no fsync handler (rtems_filesystem_default_fsync_or_fdatasync: EINVAL);
  *   their writes are already in RAM / on the NOR flash when write() returns, so for regular files
  *   and directories EINVAL means "nothing to do" and File::sync_all() must not fail on it.
+ * exit() is wrapped as well: newlib exit() ends in rtems_shutdown_executive(), so a nexus2 start
+ * error (std::process::exit, clap) would stop the whole system - shell, SSH and Wi-Fi included.
+ * Called from the thread registered with nexus_exit_guard(), it ends only that thread.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -24,6 +29,8 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -34,20 +41,81 @@
 #define AT_REMOVEDIR 8
 #endif
 
-static int at_ok(int dirfd, const char *path)
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0x200000
+#endif
+
+/* ---- directory descriptors opened with O_DIRECTORY: fd -> absolute path ---- */
+
+#define DIRFD_MAX 256 /* CONFIGURE_MAXIMUM_FILE_DESCRIPTORS */
+static char *dirfd_path[DIRFD_MAX];
+static pthread_mutex_t dirfd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int __real_open(const char *path, int flags, ...);
+int __real_close(int fd);
+
+/* absolute form of path (relative to the current directory when not absolute), or NULL */
+static char *absolute(const char *path)
+{
+  if (path[0] == '/') {
+    return strdup(path);
+  }
+  char cwd[256];
+  if (getcwd(cwd, sizeof(cwd)) == NULL) {
+    return NULL;
+  }
+  size_t n = strlen(cwd) + strlen(path) + 2;
+  char *a = malloc(n);
+  if (a != NULL) {
+    snprintf(a, n, "%s%s%s", cwd, cwd[strlen(cwd) - 1] == '/' ? "" : "/", path);
+  }
+  return a;
+}
+
+static void dirfd_remember(int fd, const char *abs_path)
+{
+  if (fd < 0 || fd >= DIRFD_MAX || abs_path == NULL) {
+    return;
+  }
+  char *c = strdup(abs_path);
+  pthread_mutex_lock(&dirfd_lock);
+  free(dirfd_path[fd]);
+  dirfd_path[fd] = c;
+  pthread_mutex_unlock(&dirfd_lock);
+}
+
+/* path for an *at() call: absolute or AT_FDCWD as given, else joined to the directory of dirfd
+ * (into buf). NULL with errno set when dirfd is unknown. */
+static const char *at_path(int dirfd, const char *path, char *buf, size_t cap)
 {
   if (path == NULL) {
     errno = EFAULT;
-    return 0;
+    return NULL;
   }
   if (path[0] == '/' || dirfd == AT_FDCWD) {
-    return 1;
+    return path;
   }
-  errno = ENOSYS;
-  return 0;
+  const char *res = NULL;
+  pthread_mutex_lock(&dirfd_lock);
+  if (dirfd >= 0 && dirfd < DIRFD_MAX && dirfd_path[dirfd] != NULL) {
+    const char *d = dirfd_path[dirfd];
+    size_t dl = strlen(d);
+    if (path[0] == '\0') {
+      errno = ENOENT;
+    } else if ((size_t)snprintf(buf, cap, "%s%s%s", d, (dl > 0 && d[dl - 1] == '/') ? "" : "/",
+                                path) >= cap) {
+      errno = ENAMETOOLONG;
+    } else {
+      res = buf;
+    }
+  } else {
+    errno = (dirfd >= 0 && dirfd < DIRFD_MAX) ? ENOSYS : EBADF;
+  }
+  pthread_mutex_unlock(&dirfd_lock);
+  return res;
 }
 
-int openat(int dirfd, const char *path, int flags, ...)
+int __wrap_open(const char *path, int flags, ...)
 {
   mode_t mode = 0;
   if (flags & O_CREAT) {
@@ -56,25 +124,63 @@ int openat(int dirfd, const char *path, int flags, ...)
     mode = (mode_t)va_arg(ap, int);
     va_end(ap);
   }
-  return at_ok(dirfd, path) ? open(path, flags, mode) : -1;
+  int fd = __real_open(path, flags, mode);
+  if (fd >= 0 && (flags & O_DIRECTORY) != 0 && path != NULL) {
+    char *a = absolute(path);
+    dirfd_remember(fd, a);
+    free(a);
+  }
+  return fd;
+}
+
+int __wrap_close(int fd)
+{
+  if (fd >= 0 && fd < DIRFD_MAX && dirfd_path[fd] != NULL) {
+    pthread_mutex_lock(&dirfd_lock);
+    free(dirfd_path[fd]);
+    dirfd_path[fd] = NULL;
+    pthread_mutex_unlock(&dirfd_lock);
+  }
+  return __real_close(fd);
+}
+
+int openat(int dirfd, const char *path, int flags, ...)
+{
+  char buf[256];
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = (mode_t)va_arg(ap, int);
+    va_end(ap);
+  }
+  const char *p = at_path(dirfd, path, buf, sizeof(buf));
+  return p != NULL ? __wrap_open(p, flags, mode) : -1;
 }
 
 int unlinkat(int dirfd, const char *path, int flag)
 {
-  if (!at_ok(dirfd, path)) {
+  char buf[256];
+  const char *p = at_path(dirfd, path, buf, sizeof(buf));
+  if (p == NULL) {
     return -1;
   }
-  return (flag & AT_REMOVEDIR) ? rmdir(path) : unlink(path);
+  return (flag & AT_REMOVEDIR) ? rmdir(p) : unlink(p);
 }
 
 int mkdirat(int dirfd, const char *path, mode_t mode)
 {
-  return at_ok(dirfd, path) ? mkdir(path, mode) : -1;
+  char buf[256];
+  const char *p = at_path(dirfd, path, buf, sizeof(buf));
+  return p != NULL ? mkdir(p, mode) : -1;
 }
 
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
 {
-  return (at_ok(olddirfd, oldpath) && at_ok(newdirfd, newpath)) ? rename(oldpath, newpath) : -1;
+  char ob[256], nb[256];
+  const char *o = at_path(olddirfd, oldpath, ob, sizeof(ob));
+  const char *n = o != NULL ? at_path(newdirfd, newpath, nb, sizeof(nb)) : NULL;
+  return n != NULL ? rename(o, n) : -1;
 }
 
 int flock(int fd, int operation)
@@ -158,4 +264,34 @@ int __wrap_fsync(int fd)
 int __wrap_fdatasync(int fd)
 {
   return sync_result(fd, __real_fdatasync(fd));
+}
+
+/* ---- exit() of the station thread ---- */
+
+void __real_exit(int status) __attribute__((noreturn));
+static pthread_t exit_guard_thread;
+static volatile int exit_guard_on;
+static void (*exit_guard_cb)(int status);
+
+/* exit() from the calling thread ends just this thread (cb(status) first); 0 = off */
+void nexus_exit_guard(int on, void (*cb)(int status))
+{
+  exit_guard_cb = cb;
+  exit_guard_thread = pthread_self();
+  exit_guard_on = on;
+}
+
+void __wrap_exit(int status)
+{
+  if (exit_guard_on && pthread_equal(pthread_self(), exit_guard_thread)) {
+    exit_guard_on = 0;
+    fflush(stdout);
+    fflush(stderr);
+    printf("exit(%d) from the station thread: thread ended, system kept running\n", status);
+    if (exit_guard_cb != NULL) {
+      exit_guard_cb(status);
+    }
+    pthread_exit(NULL);
+  }
+  __real_exit(status);
 }
