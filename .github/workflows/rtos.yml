@@ -13,6 +13,7 @@ permissions: { actions: read, contents: read }
 env:
   RTEMS_TOOLS: /opt/rtems/6
   RTEMS_BSP_PREFIX: /opt/rtems/bsp
+  WOLF_PREFIX: /opt/rtems/wolf
 jobs:
   image:
     runs-on: ubuntu-22.04
@@ -58,8 +59,25 @@ jobs:
         id: rust
         continue-on-error: true
         run: rtos/rust-probe/build.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/librust.a
+      - name: wolfSSL + wolfSSH cache
+        id: wolf
+        uses: actions/cache/restore@v4
+        with: { path: '${{ env.WOLF_PREFIX }}', key: 'rtems-6.2-wolfssh-v1-${{ hashFiles(''rtos/ci/wolfssh.sh'', ''rtos/ssh/user_settings.h'', ''rtos/ci/toolchain.sh'') }}' }
+      - name: wolfSSL + wolfSSH for the SSH server (M2e; image builds without SSH if this fails)
+        id: wolfb
+        if: steps.wolf.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: sudo mkdir -p $WOLF_PREFIX && sudo chown runner $WOLF_PREFIX && rtos/ci/wolfssh.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $WOLF_PREFIX
+      - name: Save wolfSSL + wolfSSH now
+        if: steps.wolf.outputs.cache-hit != 'true' && steps.wolfb.outcome == 'success'
+        uses: actions/cache/save@v4
+        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ steps.wolf.outputs.cache-primary-key }}' }
       - name: Image
-        env: { RUST_LIB: '${{ github.workspace }}/librust.a' }
+        env:
+          RUST_LIB: '${{ github.workspace }}/librust.a'
+          # SSH host key (OpenSSH ed25519; empty = ephemeral key per build), read by
+          # rtos/ssh/gen_secrets.py. SSH passwords are the nexus2 dashboard credentials.
+          NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
         run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
       - name: QEMU smoke test (xilinx-zynq-a9, console on UART1)
         continue-on-error: true
