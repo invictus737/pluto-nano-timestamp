@@ -64,7 +64,7 @@ jobs:
       - name: QEMU smoke test (xilinx-zynq-a9, console on UART1)
         continue-on-error: true
         run: |
-          timeout 45 qemu-system-arm -M xilinx-zynq-a9 -m 512M -smp 2 -no-reboot -nographic \
+          timeout 45 qemu-system-arm -M xilinx-zynq-a9 -m 512M -no-reboot -nographic \
             -serial null -serial mon:stdio -kernel out/nexus-rtos.elf </dev/null > out/qemu.log 2>&1 || true
           cat out/qemu.log | head -80
           grep -q "Nexus-BS RTOS" out/qemu.log
