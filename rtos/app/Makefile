@@ -15,6 +15,16 @@ RUST_LIB ?=
 ifneq ($(RUST_LIB),)
 CFLAGS += -DNEXUS_RUST
 endif
+# Optional SSH server (M2e): wolfSSL + wolfSSH static libraries from rtos/ci/wolfssh.sh. Without
+# them ssh_server.c builds a stub (nexus_ssh_start() returns -1) and the image still links.
+# ssh_secrets.h (host key, password hash, authorized keys) is generated into $(B) only.
+WOLF_PREFIX ?= /opt/rtems/wolf
+SSH_DIR := $(abspath $(CURDIR)/../ssh)
+ifneq ($(wildcard $(WOLF_PREFIX)/lib/libwolfssh.a),)
+SSH_CFLAGS := -DNEXUS_SSH -DWOLFSSL_USER_SETTINGS -I$(SSH_DIR) -I$(WOLF_PREFIX)/include -I$(B)
+SSH_LIBS := $(WOLF_PREFIX)/lib/libwolfssh.a $(WOLF_PREFIX)/lib/libwolfssl.a -ltelnetd
+SSH_SECRETS := $(B)/ssh_secrets.h
+endif
 
 all: $(B)/nexus-rtos.bin
 
@@ -24,8 +34,16 @@ $(B)/main.o: main.c | $(B)
 $(B)/platform.o: platform.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(RUST_LIB)
-	$(CC) $(CFLAGS) $^ -o $@ -Wl,--start-group $(RUST_LIB) -lbsd -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
+$(B)/ssh_server.o: ssh_server.c ssh_server.h $(SSH_SECRETS) | $(B)
+	$(CC) $(CFLAGS) $(SSH_CFLAGS) -c $< -o $@
+
+# Secrets come from the environment (NEXUS_SSH_HOSTKEY, NEXUS_SSH_PASSWORD), so regenerate
+# on every build; the file is private to the build directory.
+$(B)/ssh_secrets.h: $(SSH_DIR)/gen_secrets.py $(SSH_DIR)/authorized_keys FORCE | $(B)
+	python3 $(SSH_DIR)/gen_secrets.py --authorized-keys $(SSH_DIR)/authorized_keys --out $@
+
+$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/ssh_server.o $(RUST_LIB)
+	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/ssh_server.o -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
 	$(SIZE) $@
 
 $(B)/nexus-rtos.bin: $(B)/nexus-rtos.elf
@@ -37,4 +55,5 @@ $(B):
 
 clean:
 	rm -rf $(B)
-.PHONY: all clean
+FORCE:
+.PHONY: all clean FORCE
