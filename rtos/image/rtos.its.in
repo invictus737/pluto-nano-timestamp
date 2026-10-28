@@ -33,7 +33,7 @@
 			arch = "arm";
 			os = "linux";
 			compression = "none";
-			load = <@ENTRY@>;
+			load = <@LOAD@>;
 			entry = <@ENTRY@>;
 			hash@1 { algo = "md5"; };
 		};

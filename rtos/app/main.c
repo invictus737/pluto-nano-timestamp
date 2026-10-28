@@ -31,6 +31,7 @@
 #include <rtems/malloc.h>
 #include <rtems/printer.h>
 #include <rtems/shell.h>
+#include <rtems/version.h>
 #include <rtems/score/smpimpl.h>
 
 #include <bsp.h>

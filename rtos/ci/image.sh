@@ -11,17 +11,18 @@ if ! make -C "$HERE/app" RTEMS_TOOLS="$TOOLS" RTEMS_PREFIX="$PREFIX" B="$OUT/app
   rm -rf "$OUT/app"; make -C "$HERE/app" RTEMS_TOOLS="$TOOLS" RTEMS_PREFIX="$PREFIX" B="$OUT/app"
 fi
 ELF=$OUT/app/nexus-rtos.elf; BIN=$OUT/app/nexus-rtos.bin
-# Entry must be the lowest load address of the binary, and the binary must stay compact
-# (an initialised section in the high non-cacheable region would blow it up to ~500 MB).
+# Load at the lowest load address (the vector table), enter at the ELF entry (_start); the
+# binary must stay compact (an initialised section in the high non-cacheable region would
+# blow it up to ~500 MB).
 ENTRY=$(readelf -h "$ELF" | awk '/Entry point/ {print $4}')
-LOWEST=$(readelf -lW "$ELF" | awk '$1=="LOAD" && $6!="0x000000" {print $4}' | sort | head -1)
+LOAD=$(readelf -lW "$ELF" | awk '$1=="LOAD" && $5!="0x00000" {print $3}' | sort | head -1)
 SIZE=$(stat -c %s "$BIN")
-echo "entry $ENTRY lowest LMA $LOWEST binary $SIZE bytes"
-[ $((ENTRY)) -eq $((LOWEST)) ] || { echo "entry is not the lowest load address"; readelf -lW "$ELF"; exit 1; }
+echo "load $LOAD entry $ENTRY binary $SIZE bytes"
+[ $((ENTRY)) -ge $((LOAD)) ] && [ $((ENTRY)) -lt $((LOAD + 0x1000)) ] || { echo "entry not at the start of the image"; readelf -lW "$ELF"; exit 1; }
 [ "$SIZE" -lt $((48 * 1024 * 1024)) ] || { echo "binary too large"; readelf -lW "$ELF"; exit 1; }
 T=$(mktemp -d); unzip -q -o "$XSA" system_top.bit -d "$T"
 dtc -I dts -O dtb -o "$T/stub.dtb" "$HERE/image/stub.dts"
-sed "s/@ENTRY@/$ENTRY/g" "$HERE/image/rtos.its.in" > "$T/rtos.its"
+sed -e "s/@LOAD@/$LOAD/g" -e "s/@ENTRY@/$ENTRY/g" "$HERE/image/rtos.its.in" > "$T/rtos.its"
 cp "$BIN" "$T/"
 (cd "$T" && mkimage -f rtos.its "$OUT/rtos.itb" >/dev/null)
 mkimage -l "$OUT/rtos.itb"
