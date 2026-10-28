@@ -75,7 +75,9 @@ include ../libbsd/aic8800/aicwf.mk
 AR := $(RTEMS_TOOLS)/bin/arm-rtems6-ar
 $(B)/main_n2.o: main.c | $(B)
 	$(CC) $(CFLAGS) -DNEXUS_RUST_MAIN -c $< -o $@
-$(B)/libnexusrtos.a: $(B)/main_n2.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS)
+$(B)/posix_compat.o: posix_compat.c | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/libnexusrtos.a: $(B)/main_n2.o $(B)/posix_compat.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS)
 	rm -f $@ && $(AR) rcs $@ $^
 nexus2lib: $(B)/libnexusrtos.a
 .PHONY: nexus2lib
