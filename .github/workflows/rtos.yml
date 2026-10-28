@@ -31,16 +31,14 @@ jobs:
       - name: Cache keys (kernel inputs, then libbsd inputs; a libbsd change restores the previous tree of the same kernel)
         run: |
           h() { for f in $(git ls-files "$@" | sort); do sha256sum "$f"; done | sha256sum | cut -c1-20; }
-          { echo "K_TC=rtems-6.2-arm-tools-v1-$(h rtos/ci/toolchain.sh)"
-            echo "K_KERNEL=rtems-6.2-pluto-bsp-v2-$(h rtos/ci/toolchain.sh rtos/bsp)-"
+          { echo "K_KERNEL=rtems-6.2-pluto-bsp-v2-$(h rtos/ci/toolchain.sh rtos/bsp)-"
             echo "K_LIBBSD=$(h rtos/ci/bsp.sh rtos/libbsd)"
-            echo "K_WOLF=rtems-6.2-wolfssh-v1-$(h rtos/ci/wolfssh.sh rtos/ssh/user_settings.h rtos/ci/toolchain.sh)"
             echo "K_SDR=rtems-6.2-pluto-sdr-v2-$(h rtos/sdr)"
             echo "K_CARGO=$(h rtos/ci/nexus2-link.sh rtos/ci/rust-toolchain.sh)"; } >> "$GITHUB_ENV"
       - name: Toolchain cache
         id: tc
         uses: actions/cache/restore@v4
-        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ env.K_TC }}' }
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: "rtems-6.2-arm-tools-v1-${{ hashFiles('rtos/ci/toolchain.sh') }}" }
       - name: BSP + libbsd cache (exact, else the previous libbsd tree of this kernel)
         id: bsp
         uses: actions/cache/restore@v4
@@ -67,7 +65,7 @@ jobs:
       - name: Save the toolchain
         if: steps.tc.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
-        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ env.K_TC }}' }
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: "rtems-6.2-arm-tools-v1-${{ hashFiles('rtos/ci/toolchain.sh') }}" }
       - name: RTEMS kernel + libbsd (incremental on a restored tree)
         if: steps.bsp.outputs.cache-hit != 'true'
         run: rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
@@ -82,7 +80,7 @@ jobs:
       - name: wolfSSL + wolfSSH cache
         id: wolf
         uses: actions/cache/restore@v4
-        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ env.K_WOLF }}' }
+        with: { path: '${{ env.WOLF_PREFIX }}', key: "rtems-6.2-wolfssh-v1-${{ hashFiles('rtos/ci/wolfssh.sh', 'rtos/ssh/user_settings.h', 'rtos/ci/toolchain.sh') }}" }
       - name: wolfSSL + wolfSSH (first run only)
         id: wolfb
         if: steps.wolf.outputs.cache-hit != 'true'
@@ -90,7 +88,7 @@ jobs:
       - name: Save wolfSSL + wolfSSH
         if: steps.wolf.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
-        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ env.K_WOLF }}' }
+        with: { path: '${{ env.WOLF_PREFIX }}', key: "rtems-6.2-wolfssh-v1-${{ hashFiles('rtos/ci/wolfssh.sh', 'rtos/ssh/user_settings.h', 'rtos/ci/toolchain.sh') }}" }
       - name: Image (rtos.itb)
         env:
           NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
@@ -117,15 +115,13 @@ jobs:
       - name: Cache keys (kernel inputs, then libbsd inputs; a libbsd change restores the previous tree of the same kernel)
         run: |
           h() { for f in $(git ls-files "$@" | sort); do sha256sum "$f"; done | sha256sum | cut -c1-20; }
-          { echo "K_TC=rtems-6.2-arm-tools-v1-$(h rtos/ci/toolchain.sh)"
-            echo "K_KERNEL=rtems-6.2-pluto-bsp-v2-$(h rtos/ci/toolchain.sh rtos/bsp)-"
+          { echo "K_KERNEL=rtems-6.2-pluto-bsp-v2-$(h rtos/ci/toolchain.sh rtos/bsp)-"
             echo "K_LIBBSD=$(h rtos/ci/bsp.sh rtos/libbsd)"
-            echo "K_WOLF=rtems-6.2-wolfssh-v1-$(h rtos/ci/wolfssh.sh rtos/ssh/user_settings.h rtos/ci/toolchain.sh)"
             echo "K_SDR=rtems-6.2-pluto-sdr-v2-$(h rtos/sdr)"
             echo "K_CARGO=$(h rtos/ci/nexus2-link.sh rtos/ci/rust-toolchain.sh)"; } >> "$GITHUB_ENV"
       - name: Toolchain, BSP, wolf caches (saved by the base job)
         uses: actions/cache/restore@v4
-        with: { path: '${{ env.RTEMS_TOOLS }}', key: '${{ env.K_TC }}', fail-on-cache-miss: true }
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: "rtems-6.2-arm-tools-v1-${{ hashFiles('rtos/ci/toolchain.sh') }}", fail-on-cache-miss: true }
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -134,7 +130,7 @@ jobs:
           key: '${{ env.K_KERNEL }}${{ env.K_LIBBSD }}'
           fail-on-cache-miss: true
       - uses: actions/cache/restore@v4
-        with: { path: '${{ env.WOLF_PREFIX }}', key: '${{ env.K_WOLF }}' }
+        with: { path: '${{ env.WOLF_PREFIX }}', key: "rtems-6.2-wolfssh-v1-${{ hashFiles('rtos/ci/wolfssh.sh', 'rtos/ssh/user_settings.h', 'rtos/ci/toolchain.sh') }}" }
       - name: Host packages
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends u-boot-tools device-tree-compiler > /dev/null
       - name: Bitstream
