@@ -1,0 +1,4 @@
+ugen0.2: <aicsemi Aic MSC> at usbus0
+aic8800: a69c:5721 storage mode, switch command sent
+ugen0.2: <aicsemi Aic MSC> at usbus0 (disconnected)
+ugen0.2: <aicsemi AIC Wlan> at usbus0
