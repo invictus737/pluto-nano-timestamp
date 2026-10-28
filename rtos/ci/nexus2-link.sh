@@ -25,7 +25,12 @@ LINK="$LINK -C link-arg=-Wl,--end-group -C link-arg=-Wl,-Map,${OUT%.elf}.map"
 export RUSTFLAGS="--cfg getrandom_backend=\"custom\" $LINK"
 export CARGO_PROFILE_RELEASE_PANIC=abort
 cd "$SRC"
-cargo +"${RUST_TOOLCHAIN:-nightly-2025-07-01}" build -p nexus2 --release --target armv7-rtems-eabihf \
-  -Zbuild-std=std,panic_abort 2>&1 | tail -40
+# compiler output about the private source goes to a file (draft release), not the public log
+LOG=${OUT%.elf}-link.log
+if ! cargo +"${RUST_TOOLCHAIN:-nightly-2025-07-01}" build -p nexus2 --release --target armv7-rtems-eabihf \
+  -Zbuild-std=std,panic_abort > "$LOG" 2>&1; then
+  echo "nexus2 link failed: $(grep -cE '^error' "$LOG" || true) errors, $(grep -c 'undefined reference' "$LOG" || true) undefined references (log in the draft release)"
+  exit 1
+fi
 cp target/armv7-rtems-eabihf/release/nexus2 "$OUT"
 arm-rtems6-size "$OUT"

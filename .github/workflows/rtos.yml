@@ -9,7 +9,7 @@ on:
   push:
     branches: [Nexus-BS-2.0_RTOS]
     paths: ['rtos/**', '.github/workflows/rtos.yml']
-permissions: { actions: read, contents: read }
+permissions: { actions: read, contents: write }
 env:
   RTEMS_TOOLS: /opt/rtems/6
   RTEMS_BSP_PREFIX: /opt/rtems/bsp
@@ -131,5 +131,16 @@ jobs:
           NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
           NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
         run: rtos/ci/image-nexus2.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr $PWD/nexus xsa/system_top.xsa out
-      - uses: actions/upload-artifact@v4
-        with: { name: nexus-rtos, path: "out/rtos-nexus2.itb\nout/nexus2.map\nout/rtos.itb\nout/nexus-rtos.elf\nout/nexus-rtos.map\nout/SHA256SUMS\nout/qemu.log\nout/nexus2-rtems-check.txt\nout/nexus2-rtems-check.txt.raw\nrtos/rust-probe/build-*.log", if-no-files-found: error }
+      - name: Outputs to a draft release (repository is public; drafts are visible to collaborators only)
+        if: always()
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          TAG=rtos-ci-${{ github.run_number }}
+          FILES=$(ls out/rtos-nexus2.itb out/nexus2.map out/rtos.itb out/nexus-rtos.elf out/nexus-rtos.map out/SHA256SUMS out/qemu.log out/nexus2-rtems-check.txt out/nexus2-rtems-check.txt.raw out/nexus2-link.log rtos/rust-probe/build-*.log 2>/dev/null || true)
+          [ -n "$FILES" ] || { echo "nothing to publish"; exit 0; }
+          gh release create "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            --title "RTOS CI ${{ github.run_number }} (${GITHUB_SHA::7})" --notes "Draft: CI outputs of the Nexus-BS RTOS branch, not a release."
+          # keep only the 5 newest RTOS CI drafts
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,createdAt \
+            --jq '[.[] | select(.isDraft and (.tagName | startswith("rtos-ci-")))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+            while read -r old; do gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes; done

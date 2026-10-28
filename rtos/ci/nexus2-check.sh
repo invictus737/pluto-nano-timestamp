@@ -24,5 +24,7 @@ rc=$?
   echo "== build script / link failures"
   grep -E 'failed to run custom build command|error: could not compile' "$REPORT.raw" | sort -u | head -30
 } > "$REPORT"
-cat "$REPORT"
+# the report holds compiler messages about the private source: it goes to the draft release
+# only; the public log gets the counts
+echo "nexus2 check: exit $rc, $(grep -cE ': error(\[E[0-9]+\])?:' "$REPORT.raw" || true) errors (report in the draft release)"
 exit 0
