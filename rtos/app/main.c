@@ -9,7 +9,9 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <ifaddrs.h>
+#include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -19,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -146,8 +149,15 @@ static void *http_status(void *arg)
   for (;;) {
     int c = accept(s, NULL, NULL);
     if (c < 0) {
+      if (errno != EINTR) {
+        sleep(1); /* EMFILE/ENOBUFS: do not spin at the accept */
+      }
       continue;
     }
+    /* a client that connects and sends nothing must not hold the page forever */
+    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     char req[256];
     (void)read(c, req, sizeof(req)); /* request line ignored: one page */
     int n = status_text(body, sizeof(body));
@@ -163,10 +173,279 @@ static void *http_status(void *arg)
 
 /* ---- network bring-up: interfaces arrive by USB hotplug, dhcpcd follows them ---- */
 
+/*
+ * DNS and NTP servers from DHCP. On RTEMS dhcpcd runs no hook scripts (dhcpcd/script.c: only
+ * rtems_dhcpcd_add_hook() handlers are called), so nothing writes /etc/resolv.conf and the
+ * libbsd resolver would only try 127.0.0.1: every host name lookup (nexus2 networks, SNTP)
+ * failed. The resolver re-reads the file when its mtime changes (res_state.c, every 2 s).
+ */
+#define NET_IFS 4
+static struct {
+  char ifname[16];
+  char dns[128];   /* space separated */
+  char domain[64];
+  char ntp[128];
+} net_if[NET_IFS];
+static pthread_mutex_t net_if_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *env_get(char *const *env, const char *name)
+{
+  size_t n = strlen(name);
+  for (; *env != NULL; ++env) {
+    if (strncmp(*env, name, n) == 0 && (*env)[n] == '=') {
+      return *env + n + 1;
+    }
+  }
+  return NULL;
+}
+
+static void resolv_conf_write_locked(void)
+{
+  char buf[640];
+  size_t o = 0;
+  for (int i = 0; i < NET_IFS && o < sizeof(buf) - 80; ++i) {
+    if (net_if[i].ifname[0] != '\0' && net_if[i].domain[0] != '\0') {
+      o += (size_t)snprintf(buf + o, sizeof(buf) - o, "search %s\n", net_if[i].domain);
+      break;
+    }
+  }
+  for (int i = -1; i < NET_IFS; ++i) {
+    char tmp[128];
+    char *save = NULL;
+    /* -1: [NETWORK] dns of config.txt, ahead of the DHCP servers */
+    const char *cfg = i < 0 ? nexus_config_get("dns") : NULL;
+    snprintf(tmp, sizeof(tmp), "%s", i < 0 ? (cfg != NULL ? cfg : "") : net_if[i].dns);
+    for (char *t = strtok_r(tmp, " ", &save); t != NULL && o < sizeof(buf) - 64;
+         t = strtok_r(NULL, " ", &save)) {
+      o += (size_t)snprintf(buf + o, sizeof(buf) - o, "nameserver %s\n", t);
+    }
+  }
+  if (o == 0) {
+    return; /* keep the last servers while no interface has a lease */
+  }
+  int fd = open("/etc/resolv.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd >= 0) {
+    (void)write(fd, buf, o);
+    close(fd);
+  }
+}
+
+static void dhcpcd_hook_handler(rtems_dhcpcd_hook *hook, char *const *env)
+{
+  (void)hook;
+  const char *ifname = env_get(env, "interface");
+  const char *reason = env_get(env, "reason");
+  if (ifname == NULL || reason == NULL) {
+    return;
+  }
+  int bound = strcmp(reason, "BOUND") == 0 || strcmp(reason, "RENEW") == 0 ||
+              strcmp(reason, "REBIND") == 0 || strcmp(reason, "REBOOT") == 0 ||
+              strcmp(reason, "INFORM") == 0 || strcmp(reason, "STATIC") == 0;
+  int gone = strcmp(reason, "EXPIRE") == 0 || strcmp(reason, "RELEASE") == 0 ||
+             strcmp(reason, "STOP") == 0 || strcmp(reason, "DEPARTED") == 0;
+  if (!bound && !gone) {
+    return;
+  }
+  pthread_mutex_lock(&net_if_lock);
+  int slot = -1;
+  for (int i = 0; i < NET_IFS && slot < 0; ++i) {
+    if (strcmp(net_if[i].ifname, ifname) == 0) {
+      slot = i;
+    }
+  }
+  for (int i = 0; i < NET_IFS && slot < 0 && bound; ++i) {
+    if (net_if[i].ifname[0] == '\0') {
+      slot = i;
+    }
+  }
+  if (slot >= 0) {
+    if (bound) {
+      const char *dns = env_get(env, "new_domain_name_servers");
+      const char *dom = env_get(env, "new_domain_name");
+      const char *ntp = env_get(env, "new_ntp_servers");
+      if (dns == NULL) {
+        dns = env_get(env, "new_routers"); /* home routers answer DNS themselves */
+      }
+      snprintf(net_if[slot].ifname, sizeof(net_if[slot].ifname), "%s", ifname);
+      snprintf(net_if[slot].dns, sizeof(net_if[slot].dns), "%s", dns ? dns : "");
+      snprintf(net_if[slot].domain, sizeof(net_if[slot].domain), "%s", dom ? dom : "");
+      snprintf(net_if[slot].ntp, sizeof(net_if[slot].ntp), "%s", ntp ? ntp : "");
+      printf("net: %s %s, dns %s%s%s\n", ifname, reason, dns ? dns : "none",
+             ntp ? ", ntp " : "", ntp ? ntp : "");
+    } else {
+      memset(&net_if[slot], 0, sizeof(net_if[slot]));
+    }
+    resolv_conf_write_locked();
+  }
+  pthread_mutex_unlock(&net_if_lock);
+}
+
+static rtems_dhcpcd_hook dhcpcd_hook = {.name = "nexus-dns", .handler = dhcpcd_hook_handler};
+
+/*
+ * Wall clock. RTEMS starts at 1970 and nothing else sets it (libbsd has no NTP daemon), so
+ * every TLS certificate (rustls in nexus2) would be "not yet valid". At boot the clock is
+ * raised to the build date (certificates in use were issued before the build, most are still
+ * valid after it); SNTP then sets the real time as soon as an interface has an address.
+ */
+static int64_t days_from_civil(int y, unsigned m, unsigned d)
+{
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void clock_floor_build_date(void)
+{
+  static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char *date = __DATE__; /* "Mmm dd yyyy"; SOURCE_DATE_EPOCH keeps builds reproducible */
+  char mon[4] = {date[0], date[1], date[2], 0};
+  const char *mp = strstr(months, mon);
+  int day = atoi(date + 4), year = atoi(date + 7);
+  struct timespec now;
+  if (mp == NULL || day < 1 || year < 2024) {
+    return;
+  }
+  time_t floor_s = (time_t)(days_from_civil(year, (unsigned)((mp - months) / 3 + 1), (unsigned)day) * 86400);
+  clock_gettime(CLOCK_REALTIME, &now);
+  if (now.tv_sec < floor_s) {
+    struct timespec ts = {.tv_sec = floor_s, .tv_nsec = 0};
+    (void)clock_settime(CLOCK_REALTIME, &ts);
+  }
+}
+
+#define NTP_UNIX_OFFSET 2208988800u
+
+static int sntp_query(const struct sockaddr *sa, socklen_t salen, struct timespec *out)
+{
+  uint8_t pkt[48];
+  struct timespec t1, t4;
+  int s = socket(sa->sa_family, SOCK_DGRAM, 0);
+  if (s < 0) {
+    return -1;
+  }
+  struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  memset(pkt, 0, sizeof(pkt));
+  pkt[0] = 0x23; /* LI 0, version 4, client */
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  /* transmit timestamp = a nonce the server echoes as origin */
+  uint32_t nonce_hi = (uint32_t)t1.tv_nsec ^ 0x5a17c0deu, nonce_lo = (uint32_t)t1.tv_sec * 2654435761u;
+  for (int i = 0; i < 4; ++i) {
+    pkt[40 + i] = (uint8_t)(nonce_hi >> (24 - 8 * i));
+    pkt[44 + i] = (uint8_t)(nonce_lo >> (24 - 8 * i));
+  }
+  int rc = -1;
+  if (sendto(s, pkt, sizeof(pkt), 0, sa, salen) == (ssize_t)sizeof(pkt)) {
+    uint8_t r[68];
+    for (int tries = 0; tries < 3; ++tries) {
+      ssize_t n = recv(s, r, sizeof(r), 0);
+      if (n < 48) {
+        break;
+      }
+      clock_gettime(CLOCK_MONOTONIC, &t4);
+      if ((r[0] & 7) != 4 || r[1] == 0 || r[1] > 15 || memcmp(r + 24, pkt + 40, 8) != 0) {
+        continue; /* not a server answer to this request (or kiss-of-death) */
+      }
+      uint32_t sec = ((uint32_t)r[40] << 24) | ((uint32_t)r[41] << 16) | ((uint32_t)r[42] << 8) | r[43];
+      uint32_t frac = ((uint32_t)r[44] << 24) | ((uint32_t)r[45] << 16) | ((uint32_t)r[46] << 8) | r[47];
+      /* era 0 ends in 2036: values below the offset belong to era 1 */
+      int64_t unix_s = sec >= NTP_UNIX_OFFSET ? (int64_t)sec - NTP_UNIX_OFFSET
+                                              : (int64_t)sec + 4294967296LL - NTP_UNIX_OFFSET;
+      int64_t ns = unix_s * 1000000000LL + (int64_t)(((uint64_t)frac * 1000000000ULL) >> 32);
+      int64_t rtt = ((int64_t)t4.tv_sec - t1.tv_sec) * 1000000000LL + (t4.tv_nsec - t1.tv_nsec);
+      ns += rtt / 2;
+      out->tv_sec = (time_t)(ns / 1000000000LL);
+      out->tv_nsec = (long)(ns % 1000000000LL);
+      rc = 0;
+      break;
+    }
+  }
+  close(s);
+  return rc;
+}
+
+static int sntp_host(const char *host)
+{
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  if (getaddrinfo(host, "123", &hints, &res) != 0 || res == NULL) {
+    return -1;
+  }
+  int rc = -1;
+  for (struct addrinfo *a = res; a != NULL && rc != 0; a = a->ai_next) {
+    struct timespec ts;
+    if (sntp_query(a->ai_addr, a->ai_addrlen, &ts) == 0 && ts.tv_sec > 1700000000) {
+      struct timespec before;
+      clock_gettime(CLOCK_REALTIME, &before);
+      if (clock_settime(CLOCK_REALTIME, &ts) == 0) {
+        char a_s[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &((struct sockaddr_in *)a->ai_addr)->sin_addr, a_s, sizeof(a_s));
+        printf("time: set from %s (%s), step %+.3f s\n", host, a_s,
+               (double)(ts.tv_sec - before.tv_sec) + (ts.tv_nsec - before.tv_nsec) * 1e-9);
+        rc = 0;
+      }
+    }
+  }
+  freeaddrinfo(res);
+  return rc;
+}
+
+static void *sntp_main(void *arg)
+{
+  (void)arg;
+  unsigned backoff = 1;
+  for (;;) {
+    if (t_net_up < 0) {
+      usleep(250000); /* no address yet */
+      continue;
+    }
+    char servers[192];
+    size_t o = 0;
+    const char *cfg = nexus_config_get("ntp_server"); /* optional key, kept by the config store */
+    if (cfg != NULL && cfg[0] != '\0') {
+      o += (size_t)snprintf(servers + o, sizeof(servers) - o, "%s ", cfg);
+    }
+    pthread_mutex_lock(&net_if_lock);
+    for (int i = 0; i < NET_IFS && o < sizeof(servers); ++i) {
+      if (net_if[i].ntp[0] != '\0') {
+        o += (size_t)snprintf(servers + o, sizeof(servers) - o, "%s ", net_if[i].ntp);
+      }
+    }
+    pthread_mutex_unlock(&net_if_lock);
+    if (o < sizeof(servers)) {
+      /* last: a public pool, and an address for when DNS does not answer */
+      snprintf(servers + o, sizeof(servers) - o, "pool.ntp.org time.cloudflare.com 162.159.200.1");
+    }
+    int ok = 0;
+    char *save = NULL;
+    for (char *h = strtok_r(servers, " ", &save); h != NULL && !ok; h = strtok_r(NULL, " ", &save)) {
+      ok = sntp_host(h) == 0;
+    }
+    if (ok) {
+      backoff = 1;
+      sleep(3600);
+    } else {
+      sleep(backoff);
+      backoff = backoff < 64 ? backoff * 2 : 64;
+    }
+  }
+  return NULL;
+}
+
 static void start_dhcpcd(void)
 {
-  /* fast lease: no ARP collision probe, IPv4 only (no IPv6 router solicitation wait) */
-  static const char cfg[] = "clientid nexus-rtos\nbackground\noption domain_name_servers\nnoarp\nipv4only\nnoipv6rs\n";
+  /* fast lease: no ARP collision probe, IPv4 only (no IPv6 router solicitation wait); DNS and
+   * NTP servers reach dhcpcd_hook_handler; the host name goes to the DHCP server */
+  static const char cfg[] = "clientid nexus-rtos\nbackground\nhostname\n"
+                            "option domain_name_servers, domain_name, ntp_servers\n"
+                            "noarp\nipv4only\nnoipv6rs\n";
+  rtems_dhcpcd_add_hook(&dhcpcd_hook);
   int fd = open("/etc/dhcpcd.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd >= 0) {
     (void)write(fd, cfg, sizeof(cfg) - 1);
@@ -181,7 +460,7 @@ static void start_dhcpcd(void)
 static void *net_watch(void *arg)
 {
   (void)arg;
-  for (;;) {
+  while (t_net_up < 0) {
     struct ifaddrs *ifa = NULL;
     if (getifaddrs(&ifa) == 0) {
       for (struct ifaddrs *i = ifa; i != NULL; i = i->ifa_next) {
@@ -195,9 +474,11 @@ static void *net_watch(void *arg)
       }
       freeifaddrs(ifa);
     }
-    sleep(1);
+    if (t_net_up < 0) {
+      usleep(200000);
+    }
   }
-  return NULL;
+  return NULL; /* first address seen: SNTP and the status page have their time stamp */
 }
 
 #ifdef NEXUS_RUST
@@ -293,20 +574,31 @@ static void Init(rtems_task_argument arg)
          (unsigned long long)uart_ref_hz(), pl_done() ? "configured" : "empty");
 
   spawn(heartbeat, 10, 4096);
+  clock_floor_build_date();
 
-  /* /data and the USB config.txt/nexus2.toml drop-in: the media server must listen before
-   * USB attaches a stick at boot */
-  if (nexus_config_init() != 0) {
-    printf("config: init failed, running with defaults\n");
-  }
+  /* the USB config.txt/nexus2.toml drop-in: the media server must listen before USB attaches
+   * a stick at boot; the drop-in itself waits for /data (nexus_config_init below) */
+  nexus_config_early();
 
   rtems_bsd_setlogpriority("info");
   rtems_status_code sc = rtems_bsd_initialize();
   assert(sc == RTEMS_SUCCESSFUL);
   rtems_task_wake_after(2);
   rtems_bsd_ifconfig_lo0();
+  (void)sethostname("pluto", 5);
   start_dhcpcd();
   printf("bsd: up at %.3f s\n", uptime_s());
+
+  /* /data (QSPI JFFS2 mount: polled flash reads) while USB enumerates the Wi-Fi stick */
+  if (nexus_config_init() != 0) {
+    printf("config: init failed, running with defaults\n");
+  }
+  {
+    const char *hn = nexus_config_get("hostname"); /* [NETWORK] hostname, sent with DHCP */
+    if (hn != NULL && hn[0] != '\0' && strlen(hn) <= 63) {
+      (void)sethostname(hn, strlen(hn));
+    }
+  }
 
   /* Wi-Fi: first configured network (config.txt / build default); the driver keeps the
    * station connected across link loss and replug, dhcpcd follows wlan0 */
@@ -327,12 +619,16 @@ static void Init(rtems_task_argument arg)
 #endif
 
   spawn(net_watch, 5, 8192);
+  spawn(sntp_main, 5, 16384);
   spawn(http_status, 5, 16384);
 #ifdef NEXUS_RUST
   spawn(rust_entry, 5, 256 * 1024);
 #endif
 
-  sc = rtems_shell_init("SHLL", 32 * 1024, 1, CONSOLE_DEVICE_NAME, false, true, NULL);
+  /* classic priority 1 would be the most urgent task in the system: a busy shell command (cp,
+   * hexdump, mdump) would preempt libbsd, USB and the radio DMA service threads. 200 = the SSH
+   * shells. */
+  sc = rtems_shell_init("SHLL", 32 * 1024, 200, CONSOLE_DEVICE_NAME, false, true, NULL);
   assert(sc == RTEMS_SUCCESSFUL);
 }
 
@@ -390,7 +686,11 @@ RTEMS_SCHEDULER_EDF_SMP(main);
 #define CONFIGURE_SCHEDULER_ASSIGNMENTS \
   RTEMS_SCHEDULER_ASSIGN(0, RTEMS_SCHEDULER_ASSIGN_PROCESSOR_MANDATORY), \
   RTEMS_SCHEDULER_ASSIGN(0, RTEMS_SCHEDULER_ASSIGN_PROCESSOR_OPTIONAL)
-#define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 64
+/* console 3, libbsd (dhcpcd route/bpf/udp per interface), SSH (3 x 3 pty streams + 3 per
+ * session), HTTP, dosfs/jffs2 files and every nexus2 socket (networks, dashboard and its
+ * WebSocket clients) share this table; 64 was close to exhausted. Code that uses select()
+ * must not see descriptors >= FD_SETSIZE (newlib: 64): the SSH server uses poll(). */
+#define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 256
 #define CONFIGURE_MAXIMUM_USER_EXTENSIONS 1
 #define CONFIGURE_UNLIMITED_OBJECTS
 #define CONFIGURE_UNIFIED_WORK_AREAS
