@@ -6,7 +6,8 @@ set -euo pipefail
 TOOLS=${1:?toolchain}; BSP=${2:?bsp}; SDR=${3:?sdr prefix}; SRC=${4:?nexus source}; XSA=${5:?xsa}; OUT=${6:?out}
 HERE=$(cd "$(dirname "$0")/.." && pwd); mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 WOLF=${WOLF_PREFIX:-/opt/rtems/wolf}; WOLF_LIBS=
-if [ -f "$WOLF/lib/libwolfssh.a" ]; then WOLF_LIBS="$WOLF/lib/libwolfssh.a $WOLF/lib/libwolfssl.a -ltelnetd"; else WOLF=/nonexistent; fi
+if [ -f "$WOLF/lib/libwolfssh.a" ]; then WOLF_LIBS="$WOLF/lib/libwolfssh.a $WOLF/lib/libwolfssl.a -ltelnetd"
+else WOLF=/nonexistent; echo "::warning::station image WITHOUT the SSH server (no wolfSSH in ${WOLF_PREFIX:-/opt/rtems/wolf})"; fi
 [ -f "$SDR/lib/libSoapyPlutoRtems.a" ] && [ -f "$SDR/lib/libSoapySDR.a" ] || { echo "no SoapySDR/Pluto driver libraries in $SDR"; exit 1; }
 rm -rf "$OUT/n2app"
 make -k -C "$HERE/app" RTEMS_TOOLS="$TOOLS" RTEMS_PREFIX="$BSP" B="$OUT/n2app" WOLF_PREFIX="$WOLF" nexus2lib

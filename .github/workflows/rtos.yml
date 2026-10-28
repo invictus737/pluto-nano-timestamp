@@ -124,6 +124,7 @@ jobs:
         continue-on-error: true
         run: rtos/ci/nexus2-check.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/nexus $PWD/out/nexus2-rtems-check.txt
       - name: Station image (nexus2 + native Pluto driver linked into RTEMS)
+        id: n2img
         if: steps.nsrc.outcome == 'success'
         continue-on-error: true
         env:
@@ -144,3 +145,10 @@ jobs:
           gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,createdAt \
             --jq '[.[] | select(.isDraft and (.tagName | startswith("rtos-ci-")))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
             while read -r old; do gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes; done
+      # the station steps continue on error so the draft release still gets the logs; the run
+      # must not look green when the image the board needs was not built
+      - name: Station image result
+        if: always()
+        run: |
+          if [ "${{ steps.nsrc.outcome }}" != "success" ]; then echo "::error::nexus2 source checkout failed: no station image"; exit 1; fi
+          if [ "${{ steps.n2img.outcome }}" != "success" ] || [ ! -f out/rtos-nexus2.itb ]; then echo "::error::station image (rtos-nexus2.itb) not built, see nexus2-link.log in the draft release"; exit 1; fi
