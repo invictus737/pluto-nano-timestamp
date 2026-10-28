@@ -76,9 +76,30 @@ uint32_t zynq_uart_input_clock(void)
   return sane(nexus_uart_ref_hz(), 10000000ULL, 200000000ULL, ZYNQ_CLOCK_UART);
 }
 
+/*
+ * The BSP default sections, except that the non-cacheable DMA pool is Normal non-cacheable
+ * instead of Device memory: libbsd's USB code memcpy()s SCSI commands into DMA frame buffers at
+ * odd offsets, and an unaligned access to Device memory is a data abort (seen on the board with
+ * the AIC8800 storage-mode eject). Normal non-cacheable stays coherent for DMA.
+ */
+#define NEXUS_SECTION(b, e, f) {.begin = (uint32_t)(b), .end = (uint32_t)(e), .flags = (f)}
 BSP_START_DATA_SECTION static const arm_cp15_start_section_config
 nexus_mmu_config_table[] = {
-  ARMV7_CP15_START_DEFAULT_SECTIONS,
+  NEXUS_SECTION(bsp_section_fast_text_begin, bsp_section_fast_text_end, ARMV7_MMU_CODE_CACHED),
+  NEXUS_SECTION(bsp_section_fast_data_begin, bsp_section_fast_data_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_start_begin, bsp_section_start_end, ARMV7_MMU_CODE_CACHED),
+  NEXUS_SECTION(bsp_section_vector_begin, bsp_section_vector_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_text_begin, bsp_section_text_end, ARMV7_MMU_CODE_CACHED),
+  NEXUS_SECTION(bsp_section_rodata_begin, bsp_section_rodata_end, ARMV7_MMU_DATA_READ_ONLY_CACHED),
+  NEXUS_SECTION(bsp_section_data_begin, bsp_section_data_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_bss_begin, bsp_section_bss_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_rtemsstack_begin, bsp_section_rtemsstack_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_noinit_begin, bsp_section_noinit_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_work_begin, bsp_section_work_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_stack_begin, bsp_section_stack_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
+  NEXUS_SECTION(bsp_section_nocache_begin, bsp_section_nocache_end, ARMV7_MMU_DATA_READ_WRITE),
+  NEXUS_SECTION(bsp_section_nocachenoload_begin, bsp_section_nocachenoload_end, ARMV7_MMU_DATA_READ_WRITE),
+  NEXUS_SECTION(bsp_translation_table_base, bsp_translation_table_end, ARMV7_MMU_DATA_READ_WRITE_CACHED),
 #if defined(RTEMS_SMP)
   {.begin = 0xffff0000U, .end = 0xffffffffU, .flags = ARMV7_MMU_DEVICE},
 #endif
@@ -123,3 +144,26 @@ __asm__(
   ".size __aeabi_read_tp, . - __aeabi_read_tp\n"
   ".popsection\n"
 );
+
+/*
+ * On any RTEMS termination (shell shutdown, fatal error) hold the ULPI PHY in reset and release
+ * it: the PHY otherwise keeps the host/VBUS state RTEMS gave it, and U-Boot's DFU gadget is not
+ * seen by the computer after the following soft reset.
+ */
+#define GPIO_MASK_DATA_1_LSW 0xe000a008U
+#define GPIO_DIRM_1 0xe000a244U
+#define GPIO_OEN_1 0xe000a248U
+#define USB_PHY_RESET_BIT (1U << 14) /* MIO 46 */
+
+void nexus_fatal_extension(rtems_fatal_source source, bool always_set_to_false, rtems_fatal_code code)
+{
+  (void)source;
+  (void)always_set_to_false;
+  (void)code;
+  REG32(GPIO_DIRM_1) |= USB_PHY_RESET_BIT;
+  REG32(GPIO_OEN_1) |= USB_PHY_RESET_BIT;
+  REG32(GPIO_MASK_DATA_1_LSW) = ((~USB_PHY_RESET_BIT & 0xffffU) << 16);
+  for (volatile uint32_t i = 0; i < 200000; ++i) {
+  }
+  REG32(GPIO_MASK_DATA_1_LSW) = ((~USB_PHY_RESET_BIT & 0xffffU) << 16) | USB_PHY_RESET_BIT;
+}

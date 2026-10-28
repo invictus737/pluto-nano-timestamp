@@ -314,6 +314,9 @@ RTEMS_SCHEDULER_EDF_SMP(main);
 #define CONFIGURE_INIT_TASK_INITIAL_MODES RTEMS_DEFAULT_MODES
 #define CONFIGURE_INIT_TASK_ATTRIBUTES RTEMS_FLOATING_POINT
 
+void nexus_fatal_extension(rtems_fatal_source source, bool always_set_to_false, rtems_fatal_code code);
+#define CONFIGURE_INITIAL_EXTENSIONS {.fatal = nexus_fatal_extension}
+
 #define CONFIGURE_INIT
 #include <rtems/confdefs.h>
 
