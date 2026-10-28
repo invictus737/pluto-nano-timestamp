@@ -1,0 +1,13 @@
+/*
+ * Minimal device tree for U-Boot's ARM Linux boot path (bootm needs one); RTEMS ignores it.
+ * The model is not "Analog Devices Pluto", so adi_loadvals leaves it alone.
+ */
+/dts-v1/;
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "Nexus-BS RTOS";
+	compatible = "xlnx,zynq-7000";
+	memory@0 { device_type = "memory"; reg = <0x0 0x20000000>; };
+	chosen { };
+};

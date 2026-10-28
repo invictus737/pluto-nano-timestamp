@@ -56,6 +56,7 @@
 #define ZY7_USB_CAPLENGTH		0x0100
 #define ZY7_USB_TXFILLTUNING		0x0164
 #define ZY7_USB_ULPI_VIEWPORT		0x0170
+#define   ULPI_VP_WU			(1U << 31)
 #define   ULPI_VP_RUN			(1U << 30)
 #define   ULPI_VP_RW			(1U << 29)
 #define   ULPI_VP_ADDR(a)		((uint32_t)(a) << 16)
@@ -76,6 +77,21 @@
 #define PHY_RESET_BIT			14
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
+
+#define SLCR_UNLOCK			0xf8000008U
+#define SLCR_UNLOCK_KEY			0xdf0dU
+#define SLCR_USB_RST_CTRL		0xf8000210U
+
+/* U-Boot last ran USB0 as the DFU gadget: reset the controller before host init. */
+static void
+zynq_usb0_controller_reset(void)
+{
+	REG32(SLCR_UNLOCK) = SLCR_UNLOCK_KEY;
+	REG32(SLCR_USB_RST_CTRL) |= 1U;
+	DELAY(10);
+	REG32(SLCR_USB_RST_CTRL) &= ~1U;
+	DELAY(100);
+}
 
 static void
 zynq_ulpi_phy_reset(void)
@@ -103,6 +119,30 @@ zynq_ulpi_write(uint8_t addr, uint8_t val)
 		DELAY(1);
 	}
 	return (0);
+}
+
+static int
+zynq_ulpi_wait(uint32_t bit)
+{
+	int tries = 1000;
+
+	while ((REG32(ZY7_USB0_BASE + ZY7_USB_ULPI_VIEWPORT) & bit) != 0) {
+		if (--tries < 0)
+			return (-1);
+		DELAY(1);
+	}
+	return (0);
+}
+
+static int
+zynq_ulpi_read(uint8_t addr)
+{
+	REG32(ZY7_USB0_BASE + ZY7_USB_ULPI_VIEWPORT) = ULPI_VP_WU;
+	(void)zynq_ulpi_wait(ULPI_VP_WU);
+	REG32(ZY7_USB0_BASE + ZY7_USB_ULPI_VIEWPORT) = ULPI_VP_RUN | ULPI_VP_ADDR(addr);
+	if (zynq_ulpi_wait(ULPI_VP_RUN) != 0)
+		return (-1);
+	return ((REG32(ZY7_USB0_BASE + ZY7_USB_ULPI_VIEWPORT) >> 8) & 0xff);
 }
 
 static void
@@ -165,7 +205,17 @@ zynq_ehci_attach(device_t self)
 	device_set_desc(e->sc_bus.bdev, "EHCI");
 	snprintf(e->sc_vendor, sizeof(e->sc_vendor), "Xilinx");
 
+	zynq_usb0_controller_reset();
 	zynq_ulpi_phy_reset();
+	{
+		/* ULPI vendor/product ID: SMSC/Microchip USB33x0 reads 0424/0007. -1 = PHY not answering. */
+		int v0 = zynq_ulpi_read(0), v1 = zynq_ulpi_read(1);
+		int p0 = zynq_ulpi_read(2), p1 = zynq_ulpi_read(3);
+		device_printf(self, "ULPI PHY vendor %02x%02x product %02x%02x\n",
+		    v1 & 0xff, v0 & 0xff, p1 & 0xff, p0 & 0xff);
+		if (v0 < 0)
+			device_printf(self, "ULPI PHY does not answer (reset polarity?)\n");
+	}
 
 	/* Capability registers start at +0x100 (CAPLENGTH points to the operational ones). */
 	e->sc_io_tag = 0;

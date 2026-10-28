@@ -37,7 +37,7 @@ RAM-boot first through `run dfu_ram`; flashing is a separate, explicit step.
 |---|---|---|
 | M0 | CI: XSA from the v0.39-std run, RTEMS 6.2 toolchain + BSP + libbsd (cached), `rtos.itb` | artifact builds |
 | M1 | Boot: console banner, both cores up, LED, uptime; PL loaded by U-Boot | RAM boot via DFU, banner on UART1 |
-| M2 | USB host EHCI (Zynq glue in libbsd) + USB-Ethernet (axe/axge/ure/cdce), DHCP, HTTP status, shell on UART1 | ping + `curl /status` |
+| M2 | USB host EHCI (Zynq glue in libbsd) + USB-Ethernet (axe/axge/ure incl. the Dell 2.5G RTL8156/8156B, cdce ECM/NCM), DHCP, HTTP status, shell on UART1 | ping + `curl /status` |
 | M2b | USB Wi-Fi from libbsd: rtwn (RTL8188EU/8192CU/8812AU/8821AU), net80211, wpa_supplicant | WPA2 association, DHCP |
 | M2c | AIC8800: storage-mode eject driver (SCSI eject via usb_msc_eject), fullmac Wi-Fi driver ported from aic8800_fdrv to net80211 (model: if_rsu), firmware in the image | D80 + DC sticks associate, DHCP |
 | M2d | AIC8800 BT: HCI over USB (+ BT patch download), BTstack host, A2DP source like the Linux BT Player | A2DP to headphones |

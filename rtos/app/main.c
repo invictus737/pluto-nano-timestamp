@@ -39,38 +39,17 @@
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
 
-/* ---- PS clocks, read back from the SLCR (the FSBL set them, not this image) ---- */
+/* PS clocks read back from the SLCR (platform.c) */
+uint64_t nexus_arm_hz(void);
+uint64_t nexus_uart_ref_hz(void);
+#define arm_hz nexus_arm_hz
+#define uart_ref_hz nexus_uart_ref_hz
 
-#define SLCR_ARM_PLL_CTRL 0xf8000100U
-#define SLCR_DDR_PLL_CTRL 0xf8000104U
-#define SLCR_IO_PLL_CTRL 0xf8000108U
-#define SLCR_ARM_CLK_CTRL 0xf8000120U
-#define SLCR_UART_CLK_CTRL 0xf8000154U
-#define PS_CLK_HZ 33333333ULL
-
-static uint64_t pll_hz(uint32_t ctrl_addr)
+/* PL configured? devcfg INT_STS PCFG_DONE */
+#define DEVCFG_INT_STS 0xf800700cU
+static int pl_done(void)
 {
-  return PS_CLK_HZ * ((REG32(ctrl_addr) >> 12) & 0x7fU);
-}
-
-static uint64_t arm_hz(void)
-{
-  uint32_t c = REG32(SLCR_ARM_CLK_CTRL);
-  uint32_t div = (c >> 8) & 0x3fU;
-  uint32_t src = (c >> 4) & 0x3U;
-  uint64_t pll = src == 2 ? pll_hz(SLCR_DDR_PLL_CTRL)
-               : src == 3 ? pll_hz(SLCR_IO_PLL_CTRL) : pll_hz(SLCR_ARM_PLL_CTRL);
-  return div ? pll / div : 0;
-}
-
-static uint64_t uart_ref_hz(void)
-{
-  uint32_t c = REG32(SLCR_UART_CLK_CTRL);
-  uint32_t div = (c >> 8) & 0x3fU;
-  uint32_t src = (c >> 4) & 0x3U;
-  uint64_t pll = src == 2 ? pll_hz(SLCR_ARM_PLL_CTRL)
-               : src == 3 ? pll_hz(SLCR_DDR_PLL_CTRL) : pll_hz(SLCR_IO_PLL_CTRL);
-  return div ? pll / div : 0;
+  return (REG32(DEVCFG_INT_STS) >> 2) & 1U;
 }
 
 /* ---- heartbeat LED: Nano LED on MIO 15 (GPIO bank 0, bit 15) ---- */
@@ -120,10 +99,11 @@ static int status_text(char *buf, size_t cap)
   n += snprintf(buf + n, cap - n,
                 "Nexus-BS RTOS %s (RTEMS %s) on Pluto Nano\n"
                 "uptime %.3f s, network up at %.3f s\n"
-                "cpus %u, arm %llu Hz, uart ref %llu Hz\n",
+                "cpus %u, arm %llu Hz, uart ref %llu Hz, PL %s\n",
                 NEXUS_RTOS_VERSION, rtems_version(), uptime_s(), t_net_up,
                 rtems_scheduler_get_processor_maximum(),
-                (unsigned long long)arm_hz(), (unsigned long long)uart_ref_hz());
+                (unsigned long long)arm_hz(), (unsigned long long)uart_ref_hz(),
+                pl_done() ? "configured" : "empty");
   if (malloc_info(&heap) == 0) {
     n += snprintf(buf + n, cap - n, "heap free %lu B, largest %lu B, used %lu B\n",
                   (unsigned long)heap.Free.total, (unsigned long)heap.Free.largest,
@@ -232,9 +212,9 @@ static void Init(rtems_task_argument arg)
 {
   (void)arg;
   printf("\n\nNexus-BS RTOS %s (RTEMS %s) Pluto Nano\n", NEXUS_RTOS_VERSION, rtems_version());
-  printf("boot %.3f s, cpus %u, arm %llu Hz, uart ref %llu Hz (BSP %u)\n", uptime_s(),
+  printf("boot %.3f s, cpus %u, arm %llu Hz, uart ref %llu Hz, PL %s\n", uptime_s(),
          rtems_scheduler_get_processor_maximum(), (unsigned long long)arm_hz(),
-         (unsigned long long)uart_ref_hz(), (unsigned)ZYNQ_CLOCK_UART);
+         (unsigned long long)uart_ref_hz(), pl_done() ? "configured" : "empty");
 
   spawn(heartbeat, 10, 4096);
 
@@ -294,6 +274,15 @@ SYSINIT_REFERENCE(rtwn_rtl8192cfwT);
 #define CONFIGURE_APPLICATION_NEEDS_LIBBLOCK
 
 #define CONFIGURE_MAXIMUM_PROCESSORS 2
+/* CPU1 is optional: if the BootROM parking loop is not there, boot on one core. */
+#define CONFIGURE_SCHEDULER_EDF_SMP
+#include <rtems/scheduler.h>
+RTEMS_SCHEDULER_EDF_SMP(main);
+#define CONFIGURE_SCHEDULER_TABLE_ENTRIES \
+  RTEMS_SCHEDULER_TABLE_EDF_SMP(main, rtems_build_name('M', 'A', 'I', 'N'))
+#define CONFIGURE_SCHEDULER_ASSIGNMENTS \
+  RTEMS_SCHEDULER_ASSIGN(0, RTEMS_SCHEDULER_ASSIGN_PROCESSOR_MANDATORY), \
+  RTEMS_SCHEDULER_ASSIGN(0, RTEMS_SCHEDULER_ASSIGN_PROCESSOR_OPTIONAL)
 #define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 64
 #define CONFIGURE_MAXIMUM_USER_EXTENSIONS 1
 #define CONFIGURE_UNLIMITED_OBJECTS

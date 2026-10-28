@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Host packages
-        run: sudo apt-get update -q && sudo apt-get install -y -q build-essential flex bison texinfo unzip zlib1g-dev python3-dev libncurses-dev pkg-config u-boot-tools xz-utils
+        run: sudo apt-get update -q && sudo apt-get install -y -q build-essential flex bison texinfo unzip zlib1g-dev python3-dev libncurses-dev pkg-config u-boot-tools xz-utils device-tree-compiler qemu-system-arm
       - name: Bitstream (xsa from the v0.39-std firmware run)
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
@@ -46,5 +46,12 @@ jobs:
         run: sudo mkdir -p $RTEMS_BSP_PREFIX && sudo chown runner $RTEMS_BSP_PREFIX && rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
       - name: Image
         run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
+      - name: QEMU smoke test (xilinx-zynq-a9, console on UART1)
+        continue-on-error: true
+        run: |
+          timeout 45 qemu-system-arm -M xilinx-zynq-a9 -m 512M -smp 2 -no-reboot -nographic \
+            -serial null -serial mon:stdio -kernel out/nexus-rtos.elf </dev/null > out/qemu.log 2>&1 || true
+          cat out/qemu.log | head -80
+          grep -q "Nexus-BS RTOS" out/qemu.log
       - uses: actions/upload-artifact@v4
-        with: { name: nexus-rtos, path: "out/rtos.itb\nout/nexus-rtos.elf\nout/nexus-rtos.map\nout/SHA256SUMS", if-no-files-found: error }
+        with: { name: nexus-rtos, path: "out/rtos.itb\nout/nexus-rtos.elf\nout/nexus-rtos.map\nout/SHA256SUMS\nout/qemu.log", if-no-files-found: error }

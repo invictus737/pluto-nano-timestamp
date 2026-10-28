@@ -16,7 +16,10 @@ all: $(B)/nexus-rtos.bin
 $(B)/main.o: main.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/nexus-rtos.elf: $(B)/main.o
+$(B)/platform.o: platform.c | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o
 	$(CC) $(CFLAGS) $^ -o $@ -Wl,--start-group -lbsd -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
 	$(SIZE) $@
 
