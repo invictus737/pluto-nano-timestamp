@@ -166,7 +166,11 @@ static int write_atomic(const char *path, const void *data, size_t len, mode_t m
   }
   int rc = write_all(fd, data, len);
   if (rc == 0) {
+    /* RTEMS JFFS2 has no fsync (EINVAL): its NOR writes are synchronous already */
     rc = fsync(fd);
+    if (rc != 0 && errno == EINVAL) {
+      rc = 0;
+    }
   }
   if (close(fd) != 0) {
     rc = -1;
@@ -599,6 +603,9 @@ int nexus_config_export(const char *dir)
   if (fd >= 0) {
     if (rc == 0) {
       rc = fsync(fd);
+      if (rc != 0 && errno == EINVAL) {
+        rc = 0; /* RTEMS JFFS2: no fsync, writes are synchronous */
+      }
     }
     close(fd);
   }
