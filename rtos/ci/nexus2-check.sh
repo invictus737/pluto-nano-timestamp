@@ -10,7 +10,7 @@ export CC_armv7_rtems_eabihf=arm-rtems6-gcc CXX_armv7_rtems_eabihf=arm-rtems6-g+
 export CFLAGS_armv7_rtems_eabihf="$(PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig pkg-config --cflags "$PKG")"
 export CXXFLAGS_armv7_rtems_eabihf="$CFLAGS_armv7_rtems_eabihf"
 cd "$SRC"
-cargo +"${RUST_TOOLCHAIN:-nightly}" check -p nexus2 --release --target armv7-rtems-eabihf \
+cargo +"${RUST_TOOLCHAIN:-nightly-2025-07-01}" check -p nexus2 --release --target armv7-rtems-eabihf \
   -Zbuild-std=std,panic_abort --message-format short > "$REPORT.raw" 2>&1
 rc=$?
 {
