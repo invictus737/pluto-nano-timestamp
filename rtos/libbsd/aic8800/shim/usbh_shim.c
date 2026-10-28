@@ -81,6 +81,7 @@ static struct usbh_urb *g_done_head, *g_done_tail;
 static pthread_mutex_t g_hport_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct usbh_hubport *g_hports[SHIM_MAX_HPORT];
 static rt_bool_t g_started;
+static volatile unsigned g_attach_count;
 
 /* ---- helpers ---- */
 
@@ -774,6 +775,8 @@ static void shim_class_attach(struct aicwf_usbif *usbif, const struct aicwf_usbi
 {
     struct shim_event *event = rt_calloc(1, sizeof(*event));
 
+    g_attach_count++;
+
     if (!event)
     {
         aicwf_usbif_release(usbif);
@@ -810,6 +813,61 @@ static const struct aicwf_usbif_class g_shim_class = {
     .attach = shim_class_attach,
     .detach = shim_class_detach,
 };
+
+unsigned aicwf_usbh_attach_count(void)
+{
+    return g_attach_count;
+}
+
+/* "wifi fwdiag": the interfaces the class drivers hold */
+void aicwf_usbh_dump(void)
+{
+    int i, k;
+
+    pthread_mutex_lock(&g_hport_lock);
+    printf("usb: %u interface attach(es) since start\n", g_attach_count);
+    for (i = 0; i < SHIM_MAX_HPORT; i++)
+    {
+        struct usbh_hubport *hport = g_hports[i];
+
+        if (!hport)
+            continue;
+        printf("usb: %04x:%04x speed %u %s\n", hport->device_desc.idVendor,
+               hport->device_desc.idProduct, hport->speed,
+               hport->connected ? "connected" : "gone");
+        for (k = 0; k < CONFIG_USBHOST_MAX_INTERFACES; k++)
+        {
+            struct usbh_interface *intf = &hport->config.intf[k];
+
+            if (!intf->shim_usbif)
+                continue;
+            printf("usb:   iface %d %02x/%02x/%02x %u ep -> %s%s\n", k,
+                   intf->altsetting[0].intf_desc.bInterfaceClass,
+                   intf->altsetting[0].intf_desc.bInterfaceSubClass,
+                   intf->altsetting[0].intf_desc.bInterfaceProtocol,
+                   intf->altsetting[0].intf_desc.bNumEndpoints,
+                   intf->shim_class ? intf->shim_class->class_driver->driver_name : "-",
+                   intf->shim_connected ? " (connected)" : "");
+        }
+    }
+    pthread_mutex_unlock(&g_hport_lock);
+}
+
+/* "wifi reprobe": re-enumerate the first attached AIC device (re-runs the loader) */
+int aicwf_usbh_reprobe(void)
+{
+    struct aicwf_usbif *usbif = RT_NULL;
+    int i;
+
+    pthread_mutex_lock(&g_hport_lock);
+    for (i = 0; i < SHIM_MAX_HPORT && !usbif; i++)
+    {
+        if (g_hports[i] && g_hports[i]->connected)
+            usbif = shim_any_usbif(g_hports[i]);
+    }
+    pthread_mutex_unlock(&g_hport_lock);
+    return usbif ? aicwf_usbif_reenumerate(usbif) : AICWF_USBIF_ENODEV;
+}
 
 void aicwf_usbh_start(void)
 {

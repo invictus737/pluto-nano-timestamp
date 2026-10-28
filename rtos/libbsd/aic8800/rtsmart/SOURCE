@@ -8,3 +8,14 @@ Not imported: the SDIO transport, the WLAN offload control device and embedded h
 RT-Thread WLAN management/lwIP layers (replaced by the RTEMS/libbsd shim in ../shim).
 Firmware: https://github.com/canmv-k230/aic8800_fw (vendor terms), fetched at build time by
 ../fetch-firmware.sh, never committed.
+
+Local changes (RTEMS port), all inside #ifdef AICWF_RTEMS (defined in ../shim/rtconfig.h):
+  aic8800/aic8800_firmware.c
+    - D80 MCU1 units (bit 25 of 0x40500000 clear): set 0x40100020 bit 0 before any upload
+      (as the Linux legacy-mcu1 loader does), record chip_mcu_id, and load the legacy
+      SDK V3 set from aic8800D80_mcu1/ (shenmintao/aic8800d80, see ../fetch-firmware.sh)
+      with the Linux patch configuration (pairs 0xb4=0xf3010000, 0x170=2); the shim's
+      "wifi fw auto|sdk5|legacy" overrides the choice (aicwf_d80_fw_mode).
+    - upload verify: a file whose size is not a multiple of 4 compares the first word only;
+      on mismatch log a register/region dump; for the legacy D80 set a mismatch is a
+      warning (the Linux loader never reads uploads back).

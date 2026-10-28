@@ -107,6 +107,11 @@ int aicwf_usbif_reenumerate(struct aicwf_usbif *usbif);
 int aicwf_usbif_string(struct aicwf_usbif *usbif, uint8_t index, char *buf, size_t len);
 int aicwf_usbif_connected(struct aicwf_usbif *usbif);
 void aicwf_usbif_release(struct aicwf_usbif *usbif);
+/*
+ * Re-explore every USB bus; with power_cycle, first power-cycle the empty root-hub ports
+ * (recovers a device the controller did not see at boot). Returns ports cycled or < 0.
+ */
+int aicwf_usb_rescan(int power_cycle);
 
 /* ---- Ethernet-style network interface (the station) ---- */
 struct aicwf_ifnet;

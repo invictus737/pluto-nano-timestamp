@@ -26,6 +26,8 @@
 
 /* AIC8800 driver (Kconfig defaults unless noted) */
 #define RT_USING_AIC8800_WIFI
+/* enables the few RTEMS-port changes marked AICWF_RTEMS in rtsmart/aic8800 (see SOURCE) */
+#define AICWF_RTEMS
 #define AIC8800_WIFI_TRANSPORT_USB
 /* the driver's bulk OUT recovery calls usbh_dwc2_reset_endpoint(); usbh_shim.c maps it to
  * the libbsd stall clearing */

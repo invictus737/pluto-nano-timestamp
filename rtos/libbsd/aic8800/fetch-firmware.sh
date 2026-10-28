@@ -2,7 +2,8 @@
 # Fetch the AIC8800 firmware the RTEMS port embeds and turn it into C (aicwf_fw_data.c).
 #
 # usage: rtos/libbsd/aic8800/fetch-firmware.sh <out aicwf_fw_data.c>
-#   AICWF_FW_LOCAL=<checkout of canmv-k230/aic8800_fw> uses it instead of downloading.
+#   AICWF_FW_LOCAL=<checkout of canmv-k230/aic8800_fw> and AICWF_FW_LEGACY_LOCAL=<checkout of
+#   shenmintao/aic8800d80> use local copies instead of downloading.
 #
 # No firmware is committed to this repository. The files come from the firmware
 # repository the RT-Smart driver (rtsmart/SOURCE) is maintained against, at a pinned
@@ -29,6 +30,14 @@
 #     fmacfw_calib_8800dc_u02.bin, fmacfw_calib_8800dc_h_u02.bin        DPD calibration
 #     aic_userconfig_8800dc.txt, aic_userconfig_8800dw.txt              TX power (capped)
 #     aic_powerlimit_8800dc.txt, aic_powerlimit_8800dw.txt              country limits
+#   AIC8800D80 MCU1 units (chip_mcu_id 1, bit 25 of 0x40500000 clear), published as
+#   aic8800D80_mcu1/: the SDK V3 set the Linux image drives them with, from
+#   github.com/shenmintao/aic8800d80 (branch legacy-mcu1) at a pinned commit; the SDK 5.0
+#   files do not load on these units. The driver picks it when it reads mcu=1
+#   (rtsmart/aic8800/aic8800_firmware.c, AICWF_RTEMS):
+#     fw_patch_table_8800d80_u02.bin, fw_adid_8800d80_u02.bin, fw_patch_8800d80_u02.bin,
+#     fmacfw_8800d80_u02.bin
+#   (the runtime keeps the aic8800D80 userconfig/powerlimit, same TX power v3 format).
 # Not fetched: SDIO files, AIC8800/8801 and D80X2 families, RF test, IPC and BLE-scan
 # images, calibmode, U01/U04 images.
 set -euo pipefail
@@ -37,6 +46,18 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=canmv-k230/aic8800_fw
 COMMIT=2a47560abfa473ef7bff32321ef3db94a469d92d
 BASE=https://raw.githubusercontent.com/$REPO/$COMMIT
+
+LEGACY_REPO=shenmintao/aic8800d80
+LEGACY_COMMIT=a9683a456079131a0381ed75fb7a4f5514527b3c
+LEGACY_BASE=https://raw.githubusercontent.com/$LEGACY_REPO/$LEGACY_COMMIT
+
+# path in the legacy repository | published directory | sha256
+LEGACY_FILES="
+fw/aic8800D80/fw_patch_table_8800d80_u02.bin|aic8800D80_mcu1|58c07eb4c79de6e6beff683686495dec152688f7de59816cfbe71a0c664ca7c8
+fw/aic8800D80/fw_adid_8800d80_u02.bin|aic8800D80_mcu1|a526cbd02fcdc495f049f3ad6b5933cb08cd984b16790c716a060d582fee1a56
+fw/aic8800D80/fw_patch_8800d80_u02.bin|aic8800D80_mcu1|3c5fa5bb678b835adbe42cfe0326074cf8aa5c6d3b93d16d2943b63ad4106b72
+fw/aic8800D80/fmacfw_8800d80_u02.bin|aic8800D80_mcu1|1ec680c2b63dcaa0e5d33c5fb6d1857d030f8145c05c385e243760388a61a0da
+"
 
 # path in the repository | sha256
 FILES="
@@ -90,5 +111,21 @@ for entry in $FILES; do
 		exit 1
 	fi
 	LIST+=("$path")
+done
+for entry in $LEGACY_FILES; do
+	path=${entry%%|*}; rest=${entry#*|}; dest=${rest%%|*}; want=${rest##*|}
+	out="legacy/$dest/$(basename "$path")"
+	mkdir -p "$TMP/legacy/$dest"
+	if [ -n "${AICWF_FW_LEGACY_LOCAL:-}" ]; then
+		cp "$AICWF_FW_LEGACY_LOCAL/$path" "$TMP/$out"
+	else
+		curl -sfL --retry 3 -o "$TMP/$out" "$LEGACY_BASE/$path"
+	fi
+	got=$(sha256 "$TMP/$out")
+	if [ "$got" != "$want" ]; then
+		echo "aicwf: sha256 mismatch for $LEGACY_REPO $path: $got (expected $want)" >&2
+		exit 1
+	fi
+	LIST+=("$out")
 done
 python3 -I "$HERE/gen_fwdata.py" --src "$TMP" --out "$OUT" "${LIST[@]}"

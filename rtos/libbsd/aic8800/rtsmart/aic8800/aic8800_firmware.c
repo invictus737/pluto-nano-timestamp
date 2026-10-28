@@ -11,6 +11,18 @@
 
 #include <dfs_posix.h>
 
+#ifdef AICWF_RTEMS
+/* RTEMS port: D80 MCU1 units run the legacy (SDK V3, Linux "legacy-mcu1") firmware set,
+ * published under aic8800D80_mcu1/ (rtos/libbsd/aic8800/fetch-firmware.sh). */
+#define AICWF_D80_MCU1_DIRECTORY "aic8800D80_mcu1"
+extern int aicwf_d80_fw_mode;   /* 0 auto (MCU1 -> legacy), 1 SDK5 only, 2 legacy only */
+static rt_bool_t aicwf_d80_legacy(const struct aic8800_context *context)
+{
+    return aicwf_d80_fw_mode == 2 ||
+           (aicwf_d80_fw_mode == 0 && context && context->chip_mcu_id == 1U);
+}
+#endif
+
 #define DBG_TAG "aic8800.fw"
 #define DBG_LVL AIC8800_DBG_LVL
 #include <rtdbg.h>
@@ -309,6 +321,18 @@ static int aic_firmware_open(const struct aic8800_context *context,
                              enum aic_firmware_family family,
                              const char *name, char path[AIC_FW_PATH_MAX])
 {
+#ifdef AICWF_RTEMS
+    if (family == AIC_FW_FAMILY_D80 && aicwf_d80_legacy(context))
+    {
+        int descriptor = aic8800_firmware_open_file(
+            context, AICWF_D80_MCU1_DIRECTORY, name, path, AIC_FW_PATH_MAX);
+
+        if (descriptor >= 0)
+        {
+            return descriptor;
+        }
+    }
+#endif
     return aic8800_firmware_open_file(
         context, aic_firmware_subdirectory(family), name,
         path, AIC_FW_PATH_MAX);
@@ -1213,11 +1237,44 @@ static rt_err_t aic_firmware_upload(struct aic8800_context *context,
             result = aic_firmware_mem_read(
                 context, address + total - 4U, &target_last);
         }
+#ifdef AICWF_RTEMS
+        /* a file whose size is not a multiple of 4 ends in a word read at an unaligned
+         * address; only the first word is comparable then */
+        if (result == RT_EOK && (total & 3U) != 0U)
+        {
+            target_last = last_word;
+        }
+#endif
         if (result == RT_EOK &&
             (target_first != first_word || target_last != last_word))
         {
             LOG_E("verify %s failed: first=%08x/%08x last=%08x/%08x",
                   name, first_word, target_first, last_word, target_last);
+#ifdef AICWF_RTEMS
+            {
+                /* is DBG_MEM_READ alive at all, and what does the region hold? */
+                rt_uint32_t probe[4] = {0, 0, 0, 0};
+                rt_uint32_t chip = 0;
+                rt_err_t probe_result;
+
+                probe_result = aic_firmware_mem_read(context, 0x40500000, &chip);
+                (void)aic_firmware_mem_read(context, address + 4U, &probe[0]);
+                (void)aic_firmware_mem_read(context, address + 8U, &probe[1]);
+                (void)aic_firmware_mem_read(context, address + total / 2U, &probe[2]);
+                (void)aic_firmware_mem_read(context, 0x40100020, &probe[3]);
+                LOG_E("verify diag: [0x40500000]=%08x (%d) @%08x+4=%08x +8=%08x "
+                      "+%x=%08x [0x40100020]=%08x mcu=%u", chip, probe_result, address,
+                      probe[0], probe[1], total / 2U, probe[2], probe[3],
+                      context->chip_mcu_id);
+            }
+            if (family == AIC_FW_FAMILY_D80 && aicwf_d80_legacy(context))
+            {
+                /* the Linux legacy-mcu1 loader never reads uploads back; carry on and let
+                 * the runtime attach (or its absence) tell */
+                LOG_W("verify %s: continuing as the Linux loader does", name);
+            }
+            else
+#endif
             result = -RT_EIO;
         }
         else if (result == RT_EOK)
@@ -1818,6 +1875,17 @@ static rt_err_t aic_firmware_config_patch_d80(
      * message records concurrently. */
     patch_pairs[1].value = context->transport == AIC8800_TRANSPORT_SDIO ?
                            0x0100000a : 0x00010001;
+#ifdef AICWF_RTEMS
+    if (aicwf_d80_legacy(context) && !always_use_buffer)
+    {
+        /* SDK V3 firmware (Linux legacy-mcu1 patch_tbl_d80): 2.4/5 GHz word as the
+         * Linux loader writes it, RX aggregation counter 2, no user_ext_flags. */
+        patch_pairs[0].value = 0xf3010000;
+        patch_pairs[1].value = 0x00000002;
+        patch_count = 2U;
+        LOG_I("D80 legacy (MCU1) firmware set: legacy patch configuration");
+    }
+#endif
 
     result = aic_firmware_mem_read(context, setting_address, &config_base);
     if (result == RT_EOK)
@@ -1970,6 +2038,29 @@ static rt_err_t aic_firmware_system_config_d80(
               (*chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK,
               ((value >> 25) & 1U) == 0U);
     }
+#ifdef AICWF_RTEMS
+    if (result == RT_EOK)
+    {
+        context->chip_id = *chip_id;
+        context->chip_mcu_id = ((value >> 25) & 1U) == 0U ? 1U : 0U;
+        LOG_I("[0x40500000]=0x%08x; firmware set %s", value,
+              aicwf_d80_legacy(context) ? "legacy SDK V3 (aic8800D80_mcu1)" : "SDK 5.0");
+    }
+    if (result == RT_EOK && context->chip_mcu_id == 1U)
+    {
+        /* Linux system_config_8800d80 (legacy-mcu1): MCU1 units enable the cache at
+         * 0x40100020 bit 0 before anything is uploaded (PORTING.md 3). */
+        rt_uint32_t cache;
+
+        result = aic_firmware_mem_read(context, 0x40100020, &cache);
+        if (result == RT_EOK)
+        {
+            result = aic_firmware_mem_write(context, 0x40100020, cache | 1U);
+        }
+        LOG_I("AIC8800D80 MCU1: [0x40100020]=0x%08x -> 0x%08x (%d)", cache, cache | 1U,
+              result);
+    }
+#endif
     return result;
 }
 

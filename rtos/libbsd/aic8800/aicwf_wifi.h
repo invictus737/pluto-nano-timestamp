@@ -57,6 +57,18 @@ int aicwf_wifi_status(struct aicwf_wifi_status *status);
 /* Wait until connected (1), timeout (0) or error (< 0). */
 int aicwf_wifi_wait_connected(int timeout_ms);
 
+/* ---- diagnostics ---- */
+/* debug-level driver logs on/off (all RT-Smart LOG_D lines) */
+int aicwf_wifi_set_debug(int on);
+/* D80 firmware set: 0 auto (MCU1 units get the legacy SDK V3 set), 1 SDK 5.0, 2 legacy */
+int aicwf_wifi_set_fw_mode(int mode);
+/* print firmware files, firmware set, attached USB interfaces */
+void aicwf_wifi_fwdiag(void);
+/* power-cycle empty root-hub ports and re-explore USB; returns ports cycled */
+int aicwf_wifi_usb_rescan(void);
+/* re-enumerate the attached stick (runs the firmware loader again) */
+int aicwf_wifi_reprobe(void);
+
 #ifdef __cplusplus
 }
 #endif

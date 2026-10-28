@@ -30,6 +30,13 @@
 
 void aicwf_usbh_start(void);
 
+/* D80 firmware set (rtsmart/aic8800/aic8800_firmware.c, AICWF_RTEMS):
+ * 0 auto (MCU1 units get the legacy SDK V3 set), 1 SDK 5.0 only, 2 legacy only */
+int aicwf_d80_fw_mode;
+
+#define WLAN_USB_WATCHDOG_FIRST_MS  5000
+#define WLAN_USB_WATCHDOG_SECOND_MS 15000
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond;
 static pthread_once_t g_cond_once = PTHREAD_ONCE_INIT;
@@ -657,6 +664,66 @@ static void wlan_thread(void *parameter)
 
 /* ---- application API (aicwf_wifi.h) ---- */
 
+/*
+ * At a cold boot with the stick already plugged in, the controller has been seen to miss
+ * it until a replug. If no AIC interface has attached a few seconds after the driver
+ * started, power-cycle the empty root ports and re-explore (twice at most).
+ */
+static void usb_watchdog_thread(void *parameter)
+{
+    int round;
+
+    (void)parameter;
+    for (round = 0; round < 2; round++)
+    {
+        rt_thread_mdelay(round == 0 ? WLAN_USB_WATCHDOG_FIRST_MS :
+                                      WLAN_USB_WATCHDOG_SECOND_MS - WLAN_USB_WATCHDOG_FIRST_MS);
+        if (aicwf_usbh_attach_count() != 0)
+        {
+            return;
+        }
+        LOG_W("no AIC8800 interface %d s after start: power-cycling empty USB ports",
+              round == 0 ? WLAN_USB_WATCHDOG_FIRST_MS / 1000 : WLAN_USB_WATCHDOG_SECOND_MS / 1000);
+        LOG_W("USB rescan: %d port(s) cycled", aicwf_usb_rescan(1));
+    }
+}
+
+int aicwf_wifi_set_debug(int on)
+{
+    rt_shim_log_level = on ? DBG_LOG : -1;
+    return 0;
+}
+
+int aicwf_wifi_set_fw_mode(int mode)
+{
+    if (mode < 0 || mode > 2)
+    {
+        return -RT_EINVAL;
+    }
+    aicwf_d80_fw_mode = mode;
+    return 0;
+}
+
+void aicwf_wifi_fwdiag(void)
+{
+    static const char *const modes[] = { "auto (MCU1 -> legacy SDK V3)", "SDK 5.0", "legacy SDK V3" };
+
+    printf("wifi: D80 firmware set: %s; log level %s\n", modes[aicwf_d80_fw_mode % 3],
+           rt_shim_log_level >= DBG_LOG ? "debug" : "normal");
+    aicwf_fw_dump();
+    aicwf_usbh_dump();
+}
+
+int aicwf_wifi_usb_rescan(void)
+{
+    return aicwf_usb_rescan(1);
+}
+
+int aicwf_wifi_reprobe(void)
+{
+    return aicwf_usbh_reprobe();
+}
+
 int aicwf_wifi_start(void)
 {
     wlan_init_once();
@@ -681,6 +748,11 @@ int aicwf_wifi_start(void)
         return -1;
     }
     aicwf_usbh_start();
+    thread = rt_thread_create("aic-usbw", usb_watchdog_thread, RT_NULL, 8192, 20, 0);
+    if (!thread || rt_thread_startup(thread) != RT_EOK)
+    {
+        LOG_W("USB watchdog thread failed to start");
+    }
     return 0;
 }
 

@@ -9,6 +9,8 @@
  *
  * Shell: wifi status | wifi scan | wifi join <ssid> [passphrase] | wifi leave
  *        | wifi wait [seconds]
+ * Diagnostics: wifi fwdiag | wifi debug on|off | wifi fw auto|sdk5|legacy
+ *        | wifi rescan | wifi reprobe
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,7 +100,39 @@ static int wifi_cmd(int argc, char **argv)
     nexus_wifi_status();
     return up ? 0 : 1;
   }
-  printf("usage: wifi [status | scan | join <ssid> [passphrase] | leave | wait [s]]\n");
+  if (strcmp(argv[1], "fwdiag") == 0) {
+    aicwf_wifi_fwdiag();
+    nexus_wifi_status();
+    return 0;
+  }
+  if (strcmp(argv[1], "debug") == 0 && argc == 3) {
+    aicwf_wifi_set_debug(strcmp(argv[2], "on") == 0);
+    printf("wifi: driver debug log %s\n", strcmp(argv[2], "on") == 0 ? "on" : "off");
+    return 0;
+  }
+  if (strcmp(argv[1], "fw") == 0 && argc == 3) {
+    int mode = strcmp(argv[2], "auto") == 0 ? 0 : strcmp(argv[2], "sdk5") == 0 ? 1 :
+               strcmp(argv[2], "legacy") == 0 ? 2 : -1;
+
+    if (mode < 0 || aicwf_wifi_set_fw_mode(mode) != 0) {
+      printf("wifi: fw auto|sdk5|legacy\n");
+      return 1;
+    }
+    printf("wifi: D80 firmware set %s from the next probe ('wifi reprobe' or replug)\n", argv[2]);
+    return 0;
+  }
+  if (strcmp(argv[1], "rescan") == 0) {
+    printf("wifi: %d empty USB port(s) power-cycled, bus re-explored\n", aicwf_wifi_usb_rescan());
+    return 0;
+  }
+  if (strcmp(argv[1], "reprobe") == 0) {
+    int rc = aicwf_wifi_reprobe();
+
+    printf("wifi: re-enumerate %s (%d)\n", rc == 0 ? "started" : "failed", rc);
+    return rc != 0;
+  }
+  printf("usage: wifi [status | scan | join <ssid> [passphrase] | leave | wait [s]\n"
+         "            | fwdiag | debug on|off | fw auto|sdk5|legacy | rescan | reprobe]\n");
   return 1;
 }
 
@@ -114,7 +148,7 @@ int nexus_wifi_start(const char *ssid, const char *psk)
   }
   if (!shell_registered) {
     shell_registered = 1;
-    rtems_shell_add_cmd("wifi", "network", "wifi status|scan|join <ssid> [psk]|leave|wait [s]",
+    rtems_shell_add_cmd("wifi", "network", "wifi status|scan|join <ssid> [psk]|leave|wait [s]|fwdiag|debug on|off|fw auto|sdk5|legacy|rescan|reprobe",
                         wifi_cmd);
   }
   if (ssid != NULL && ssid[0] != '\0') {

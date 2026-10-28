@@ -8,6 +8,12 @@
 
 /* usbh_shim.c: a class driver's connect() returned success (aic-usbh thread) */
 void aicwf_wlan_attach_done(void);
+/* usbh_shim.c: diagnostics */
+unsigned aicwf_usbh_attach_count(void);
+void aicwf_usbh_dump(void);
+int aicwf_usbh_reprobe(void);
+/* aicwf_fw_files.c: "wifi fwdiag" listing */
+void aicwf_fw_dump(void);
 /* aicwf_fw_files.c: publish the embedded firmware under AIC8800_WIFI_FIRMWARE_PATH */
 int aicwf_fw_install(void);
 

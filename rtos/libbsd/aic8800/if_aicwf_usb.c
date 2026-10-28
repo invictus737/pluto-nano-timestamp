@@ -44,6 +44,16 @@
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdi_util.h>
+#include <dev/usb/usb_core.h>
+#include <dev/usb/usb_process.h>
+#include <dev/usb/usb_device.h>
+#include <dev/usb/usb_request.h>
+#include <dev/usb/usb_hub.h>
+#include <dev/usb/usb_util.h>
+#include <dev/usb/usb_busdma.h>
+#include <dev/usb/usb_transfer.h>
+#include <dev/usb/usb_controller.h>
+#include <dev/usb/usb_bus.h>
 
 #include "aicwf_usbif.h"
 
@@ -429,6 +439,58 @@ aicwf_usbif_register(const struct aicwf_usbif_class *cls)
 	}
 	mtx_unlock(&aicwf_reg_mtx);
 	return (0);
+}
+
+/*
+ * Re-scan every USB bus; with power_cycle, first switch the power of every root-hub port
+ * that has no device attached off and on again (what a replug does). Ports with a device
+ * (a hub, an Ethernet dongle) are never touched. Returns the number of ports cycled.
+ */
+int
+aicwf_usb_rescan(int power_cycle)
+{
+	devclass_t dc = devclass_find("usbus");
+	int unit, max, cycled = 0;
+
+	if (dc == NULL)
+		return (AICWF_USBIF_ENODEV);
+	max = devclass_get_maxunit(dc);
+	for (unit = 0; unit < max; unit++) {
+		device_t dev = devclass_get_device(dc, unit);
+		struct usb_device *root;
+		struct usb_bus *bus;
+		struct usb_hub *hub;
+		uint8_t port, do_unlock;
+
+		if (dev == NULL || !device_is_attached(dev))
+			continue;
+		bus = device_get_ivars(dev);
+		if (bus == NULL || bus->devices == NULL)
+			continue;
+		root = bus->devices[USB_ROOT_HUB_ADDR];
+		if (root == NULL || root->hub == NULL)
+			continue;
+		if (power_cycle) {
+			hub = root->hub;
+			do_unlock = usbd_enum_lock(root);
+			for (port = 0; port < hub->nports; port++) {
+				if (usb_bus_port_get_device(bus, hub->ports + port) != NULL)
+					continue;
+				(void)usbd_req_clear_port_feature(root, NULL, port + 1,
+				    UHF_PORT_POWER);
+				usb_pause_mtx(NULL, hz / 2);
+				(void)usbd_req_set_port_feature(root, NULL, port + 1,
+				    UHF_PORT_POWER);
+				printf("aicwf: %s root port %u power cycled (no device)\n",
+				    device_get_nameunit(dev), port + 1);
+				cycled++;
+			}
+			if (do_unlock)
+				usbd_enum_unlock(root);
+		}
+		usb_needs_explore(bus, 1);
+	}
+	return (cycled);
 }
 
 /* ---- newbus ---- */

@@ -112,3 +112,23 @@ int aicwf_fw_install(void)
           AIC8800_WIFI_FIRMWARE_PATH);
     return 0;
 }
+
+void aicwf_fw_dump(void)
+{
+    size_t i;
+
+    printf("fw: %u files under %s\n", (unsigned)aicwf_fw_file_count, AIC8800_WIFI_FIRMWARE_PATH);
+    for (i = 0; i < aicwf_fw_file_count; i++)
+    {
+        const struct aicwf_fw_file *file = &aicwf_fw_files[i];
+        uint32_t first = 0;
+
+        if (file->size >= 4)
+        {
+            first = (uint32_t)file->data[0] | (uint32_t)file->data[1] << 8 |
+                    (uint32_t)file->data[2] << 16 | (uint32_t)file->data[3] << 24;
+        }
+        printf("fw:   %-48s %7u bytes first word %08x\n", file->path, (unsigned)file->size,
+               (unsigned)first);
+    }
+}

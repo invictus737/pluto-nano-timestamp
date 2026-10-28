@@ -50,16 +50,27 @@ void rt_shim_assert(const char *expr, const char *func, int line)
     }
 }
 
+volatile int rt_shim_log_level = -1;
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void rt_shim_log(int level, const char *tag, const char *fmt, ...)
 {
     static const char letters[] = "EWID";
-    char line[256];
+    char line[300];
+    int n;
     va_list ap;
 
+    n = snprintf(line, sizeof(line), "[%c/%s] ", letters[level < 0 || level > 3 ? 3 : level],
+                 tag);
     va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
+    vsnprintf(line + n, sizeof(line) - (size_t)n - 1, fmt, ap);
     va_end(ap);
-    printf("[%c/%s] %s\n", letters[level < 0 || level > 3 ? 3 : level], tag, line);
+    /* one write per line, serialised, so concurrent threads do not interleave */
+    pthread_mutex_lock(&g_log_lock);
+    fputs(line, stdout);
+    fputs("\n", stdout);
+    fflush(stdout);
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 static pthread_mutex_t g_irq_lock;
