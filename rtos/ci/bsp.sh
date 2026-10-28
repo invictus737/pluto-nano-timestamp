@@ -15,8 +15,10 @@ cp "$HERE/bsp/config.ini" config.ini
 ./waf -j"$(nproc)" | tail -3
 ./waf install | tail -2
 cd ../rtems-libbsd-fb14-$VER
+"$HERE/libbsd/aic8800/fetch-firmware.sh" "$WORK/aicwf_fw_data.c"
 "$HERE/libbsd/apply.sh" "$PWD"
 ./waf configure --prefix="$PREFIX" --rtems="$PREFIX" --rtems-tools="$TOOLS" --rtems-bsps=$BSP --buildset=buildset/pluto.ini | tail -5
 ./waf -j"$(nproc)" | tail -3
 ./waf install | tail -2
+install -D -m 644 "$WORK/aicwf_fw_data.c" "$PREFIX/share/aicwf/aicwf_fw_data.c"
 ls -la "$PREFIX/arm-rtems6/xilinx_zynq_zedboard/lib/libbsd.a" "$PREFIX/lib/pkgconfig/"

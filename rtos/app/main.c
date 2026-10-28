@@ -262,6 +262,8 @@ RTEMS_BSD_DRIVER_USB;
 RTEMS_BSD_DRIVER_USB_MASS;
 /* AIC8800 Wi-Fi/BT sticks: leave the driver-CD storage mode before umass claims them */
 SYSINIT_DRIVER_REFERENCE(aicms, uhub);
+/* AIC8800 Wi-Fi/BT: USB interface and wlan0 ifnet attachment for the RT-Smart driver */
+SYSINIT_DRIVER_REFERENCE(aicwf, uhub);
 SYSINIT_DRIVER_REFERENCE(axe, uhub);
 SYSINIT_DRIVER_REFERENCE(axge, uhub);
 SYSINIT_DRIVER_REFERENCE(ure, uhub);

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Pluto additions to an unpacked rtems-libbsd tree (idempotent).
 
-1. libbsd.py: compile the Zynq EHCI glue and the AIC8800 mode switch (RTEMS-side sources,
-   next to the existing ehci_mpc83xx glue in the always-on "rtems" module).
+1. libbsd.py: compile the Zynq EHCI glue, the AIC8800 mode switch and the AIC8800 USB/ifnet
+   attachment (RTEMS-side sources, next to the existing ehci_mpc83xx glue in the always-on
+   "rtems" module).
 2. usb_msctest: usb_msc_eject_cdb() sends one arbitrary CDB without a data phase (the
    AIC8800 switch commands are not among FreeBSD's fixed eject methods).
 """
@@ -27,7 +28,8 @@ def libbsd_py(s):
     assert s.count(anchor) == 1, "anchor not unique in libbsd.py"
     i = s.index(anchor)
     indent = s[s.rindex("\n", 0, i) + 1:i]
-    for src in ("'sys/dev/usb/aic_modeswitch.c',", "'sys/dev/usb/controller/ehci_zynq.c',"):
+    for src in ("'sys/dev/usb/wlan/if_aicwf_usb.c',", "'sys/dev/usb/aic_modeswitch.c',",
+                "'sys/dev/usb/controller/ehci_zynq.c',"):
         if src not in s:
             s = s.replace(anchor, anchor + "\n" + indent + src)
     return s

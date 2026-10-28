@@ -69,3 +69,4 @@ clean:
 	rm -rf $(B)
 FORCE:
 .PHONY: all clean FORCE
+include ../libbsd/aic8800/aicwf.mk
