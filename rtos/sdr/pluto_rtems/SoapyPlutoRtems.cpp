@@ -722,7 +722,8 @@ void SoapyPlutoRtems::rx_block_hook(void *ctx, const uint8_t *block)
     return;
   uint64_t end = pluto_stamp_get(block) + r->geom.data_samples;
   int64_t now = monotonic_ns();
-  self->anchor_seq_.fetch_add(1, std::memory_order_acq_rel);
+  self->anchor_seq_.fetch_add(1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release); // odd sequence visible before the data
   self->anchor_ticks_ = end;
   self->anchor_ns_ = now;
   self->anchor_seq_.fetch_add(1, std::memory_order_acq_rel);
@@ -740,7 +741,10 @@ bool SoapyPlutoRtems::hw_now_ticks(uint64_t &ticks) const
     s0 = anchor_seq_.load(std::memory_order_acquire);
     a = anchor_ticks_;
     at = anchor_ns_;
-    s1 = anchor_seq_.load(std::memory_order_acquire);
+    // seqlock: the data loads must complete before the second sequence load (an acquire load
+    // only orders what follows it)
+    std::atomic_thread_fence(std::memory_order_acquire);
+    s1 = anchor_seq_.load(std::memory_order_relaxed);
   } while ((s0 & 1u) || s0 != s1);
   int64_t age = monotonic_ns() - at;
   if (age < 0 || age > 100000000) // no block for 100 ms: the stream is not running
