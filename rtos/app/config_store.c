@@ -588,6 +588,7 @@ int nexus_config_station_rollback(void)
     printf("config: no %s.bak to restore\n", STATION_TOML);
     return -1;
   }
+  (void)unlink(STATION_TOML); /* RTEMS JFFS2 rename does not replace an existing file */
   if (rename(STATION_TOML ".bak", STATION_TOML) != 0) {
     printf("config: station rollback failed (errno %d)\n", errno);
     return -1;
