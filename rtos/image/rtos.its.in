@@ -2,31 +2,32 @@
  * Nexus-BS RTOS image for the Pluto Nano. The RTEMS kernel is declared os = "linux": U-Boot's
  * ARM Linux path flushes and disables caches/MMU before the jump (its RTEMS path refuses FIT
  * images and leaves the MMU on). r0..r2 are ignored by RTEMS.
- * config@1: kernel only (default fit_config of the Tezuka env, PL untouched) - first RAM boots.
- * config@2: bitstream + kernel.
+ * config-1: kernel only, PL untouched (first RAM boots); config-2: bitstream + kernel.
+ * Node names without "@" (current mkimage rejects them); bootm is given the config explicitly.
+ * config-2: bitstream + kernel.
  */
 /dts-v1/;
 / {
 	description = "Nexus-BS RTOS (RTEMS) for Pluto Nano";
 	#address-cells = <1>;
 	images {
-		fdt@1 {
+		fdt-1 {
 			description = "stub";
 			data = /incbin/("stub.dtb");
 			type = "flat_dt";
 			arch = "arm";
 			compression = "none";
 		};
-		fpga@1 {
+		fpga-1 {
 			description = "FPGA";
 			data = /incbin/("system_top.bit");
 			type = "fpga";
 			arch = "arm";
 			compression = "none";
 			load = <0xF000000>;
-			hash@1 { algo = "md5"; };
+			hash-1 { algo = "md5"; };
 		};
-		rtems@1 {
+		rtems-1 {
 			description = "Nexus-BS RTOS";
 			data = /incbin/("nexus-rtos.bin");
 			type = "kernel";
@@ -35,21 +36,21 @@
 			compression = "none";
 			load = <@LOAD@>;
 			entry = <@ENTRY@>;
-			hash@1 { algo = "md5"; };
+			hash-1 { algo = "md5"; };
 		};
 	};
 	configurations {
-		default = "config@1";
-		config@1 {
+		default = "config-1";
+		config-1 {
 			description = "Nexus-BS RTOS (PL untouched)";
-			kernel = "rtems@1";
-			fdt = "fdt@1";
+			kernel = "rtems-1";
+			fdt = "fdt-1";
 		};
-		config@2 {
+		config-2 {
 			description = "Nexus-BS RTOS + bitstream";
-			kernel = "rtems@1";
-			fdt = "fdt@1";
-			loadables = "fpga@1";
+			kernel = "rtems-1";
+			fdt = "fdt-1";
+			loadables = "fpga-1";
 		};
 	};
 };

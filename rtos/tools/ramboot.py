@@ -4,10 +4,10 @@
 Needs both USB-C ports on the Mac: the CH340 console (UART1) and the Pluto's data port (DFU).
 Steps: reboot (or wait for a power cycle), stop the Tezuka U-Boot menu (spaces, then ESC to the
 NANO> prompt), `run dfu_ram`, dfu-util download to ${fit_load_address}, Ctrl-C, optional
-nexus_pl_init (config@2 loads the bitstream), `bootm ${fit_load_address}#<config>`, then log the
+nexus_pl_init (config-2 loads the bitstream), `bootm ${fit_load_address}#<config>`, then log the
 console for a while. Everything the console prints goes to the log file.
 
-usage: rtos/tools/ramboot.py rtos.itb [--config config@1] [--tty /dev/cu.usbserial-XXXX]
+usage: rtos/tools/ramboot.py rtos.itb [--config config-1] [--tty /dev/cu.usbserial-XXXX]
                              [--log ramboot.log] [--watch 60]
 """
 import argparse
@@ -21,7 +21,7 @@ import time
 
 ap = argparse.ArgumentParser()
 ap.add_argument("itb")
-ap.add_argument("--config", default="config@1")
+ap.add_argument("--config", default="config-1")
 ap.add_argument("--tty", default=None)
 ap.add_argument("--log", default="ramboot.log")
 ap.add_argument("--watch", type=int, default=60)
@@ -120,7 +120,7 @@ if r.returncode != 0 or "Download done" not in (r.stdout + r.stderr):
 
 send("iminfo ${fit_load_address}\r")
 wait_for(r"NANO>", 10)
-if a.config != "config@1":
+if a.config != "config-1":
     send("run nexus_pl_init\r")
     wait_for(r"NANO>", 5)
 print(f"\n== bootm {a.config}")
