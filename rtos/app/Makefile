@@ -42,8 +42,20 @@ $(B)/ssh_server.o: ssh_server.c ssh_server.h $(SSH_SECRETS) | $(B)
 $(B)/ssh_secrets.h: $(SSH_DIR)/gen_secrets.py $(SSH_DIR)/authorized_keys FORCE | $(B)
 	python3 $(SSH_DIR)/gen_secrets.py --authorized-keys $(SSH_DIR)/authorized_keys --out $@
 
-$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/ssh_server.o $(RUST_LIB)
-	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/ssh_server.o -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
+# Persistent configuration (rtos/config/README.md). The Wi-Fi seed header comes from the
+# environment (NEXUS_WIFI_SSID, NEXUS_WIFI_PSK) into $(B) only.
+CONFIG_OBJS := $(B)/config_store.o $(B)/config_kv.o $(B)/qspi_nor.o
+$(B)/nexus_wifi_defaults.h: FORCE | $(B)
+	@sh $(CURDIR)/../config/gen-wifi-defaults.sh $@
+$(B)/config_store.o: config_store.c config_store.h config_kv.h qspi_nor.h $(B)/nexus_wifi_defaults.h | $(B)
+	$(CC) $(CFLAGS) -I$(B) -c $< -o $@
+$(B)/config_kv.o: config_kv.c config_kv.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/qspi_nor.o: qspi_nor.c qspi_nor.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS) $(RUST_LIB)
+	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/ssh_server.o $(CONFIG_OBJS) -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -ljffs2 -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
 	$(SIZE) $@
 
 $(B)/nexus-rtos.bin: $(B)/nexus-rtos.elf

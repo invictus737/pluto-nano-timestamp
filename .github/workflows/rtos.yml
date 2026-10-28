@@ -78,6 +78,9 @@ jobs:
           # SSH host key (OpenSSH ed25519; empty = ephemeral key per build), read by
           # rtos/ssh/gen_secrets.py. SSH passwords are the nexus2 dashboard credentials.
           NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
+          # first-boot Wi-Fi network when /data/nexus.conf has none (rtos/config/gen-wifi-defaults.sh)
+          NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
+          NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
         run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
       - name: QEMU smoke test (xilinx-zynq-a9, console on UART1)
         continue-on-error: true

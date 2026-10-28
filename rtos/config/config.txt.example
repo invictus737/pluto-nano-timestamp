@@ -1,0 +1,96 @@
+# Nexus-BS RTOS (Pluto Nano): config.txt drop-in, every key with its meaning.
+#
+# Put this file as config.txt on a FAT USB drive (top level, or in a folder named nexus), plug
+# the drive into the Pluto (USB host mode, through the powered hub) at boot or while it runs.
+# The Pluto applies it, stores it in its flash (/data/nexus.conf) and DELETES config.txt from
+# the drive, so passwords do not stay on the stick. The console shows:
+#   config: applied N keys from /media/.../config.txt, file removed
+# The same drive may carry nexus2.toml (the base station configuration, same folders): it is
+# installed as /data/nexus2/nexus2.toml (the previous one kept as nexus2.toml.bak) and removed.
+#
+# Format: same as the Pluto Linux firmware's config.txt. [SECTION] headers, `key = value`, lines
+# starting with # or ; are comments (a # inside a value is part of the value, e.g. in a Wi-Fi
+# password). Upper/lower case of keys and sections does not matter. Windows line ends are fine.
+# Only the keys present are changed; a key with an empty value goes back to its default.
+# A value of ******** (as in an exported config-current.txt) keeps the stored secret.
+# Unknown keys are kept (a warning is printed) for later firmware.
+# Never share a file with real passwords in it.
+
+[NETWORK]
+# host name (DHCP requests carry it)
+hostname = plutosdr
+# USB network gadget (peripheral mode): the Pluto's address, the computer's, the netmask
+ipaddr = 192.168.2.1
+ipaddr_host = 192.168.2.10
+netmask = 255.255.255.0
+# DNS servers for fixed addresses (up to 3, space or comma separated; empty = from DHCP)
+dns =
+
+[WLAN]
+# USB Wi-Fi adapter. Up to five networks, tried by priority: ssid_wlan first, then
+# ssid_wlan1, ssid_wlan2, ssid_wlan3, ssid_wlan4. Passphrase: 8..63 characters or 64 hex digits;
+# empty = open network. An empty ssid_wlanN removes that network (and its passphrase).
+ssid_wlan = MyNetwork
+pwd_wlan = CHANGE_ME_PASSPHRASE
+ssid_wlan1 =
+pwd_wlan1 =
+ssid_wlan2 =
+pwd_wlan2 =
+ssid_wlan3 =
+pwd_wlan3 =
+ssid_wlan4 =
+pwd_wlan4 =
+# empty = DHCP, or a fixed address/prefix, e.g. 192.168.1.50/24 (then gateway_wlan, dns)
+ipaddr_wlan =
+gateway_wlan =
+# regulatory country (ISO 3166 alpha-2), default RO
+country_wlan = RO
+
+[USB_ETHERNET]
+# USB Ethernet adapter: empty = DHCP, or a fixed address (a.b.c.d or a.b.c.d/prefix)
+ipaddr_eth =
+netmask_eth = 255.255.255.0
+gateway_eth =
+
+[SYSTEM]
+# measured frequency of this board's 40 MHz reference in Hz (empty = 40000000 nominal),
+# accepted 39990000..40010000; e.g. 39999331 = -16.725 ppm. Keep [radio] ppm = 0 in nexus2.toml.
+xo_correction =
+# NexusBS role [slave|master|light]: slave = SDR for NexusBS on another computer,
+# master = NexusBS runs on this Pluto, light = NexusBS light mode
+operating_mode = master
+# USB-C role [peripheral|auto|host] at the next boot
+usb_mode = host
+# CPU/DDR clock [standard|495_396|950_600|1100_750]; 1100_750 needs cpu_clock_cooling_confirmed = yes
+cpu_clock = standard
+cpu_clock_cooling_confirmed = no
+# Bluetooth controller [on|off]
+bluetooth = on
+# USB gadget class [rndis|ncm|ecm] and suspend handling [0|1] (Linux firmware, peripheral mode)
+usb_ethernet_mode = rndis
+udc_handle_suspend = 0
+
+[SSH]
+# public keys allowed to log in (OpenSSH one-line format), one authorized_key line per key, up to
+# 8; added to the stored list (remove one with `config unset ssh_authorized_keyN` on the console).
+# The login PASSWORD is not set here: SSH and the dashboard share the [dashboard.auth]
+# username/password of nexus2.toml (defaults admin / nexus); put a nexus2.toml on the drive to
+# change it.
+#authorized_key = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...example operator@laptop
+
+[ACTIONS]
+# 1 = do it once. reset: reboot after applying this file. export: write the current
+# configuration (secrets masked) to the drive as config-current.txt.
+# calibrate, diagnostic_report, dfu: stored as flags for the firmware parts that act on them.
+reset = 0
+export = 0
+calibrate = 0
+diagnostic_report = 0
+dfu = 0
+
+# A short form is also accepted for Wi-Fi:
+# [wifi]
+# ssid = MyNetwork
+# psk = my passphrase
+# ssid1 = Second network
+# psk1 = second passphrase
