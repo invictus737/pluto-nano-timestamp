@@ -36,6 +36,11 @@
 
 #include <bsp.h>
 
+#include "config_store.h"
+#include "ssh_server.h"
+
+int nexus_wifi_start(const char *ssid, const char *psk);
+
 #define NEXUS_RTOS_VERSION "0.1.0-m2"
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
@@ -232,6 +237,12 @@ static void Init(rtems_task_argument arg)
 
   spawn(heartbeat, 10, 4096);
 
+  /* /data and the USB config.txt/nexus2.toml drop-in: the media server must listen before
+   * USB attaches a stick at boot */
+  if (nexus_config_init() != 0) {
+    printf("config: init failed, running with defaults\n");
+  }
+
   rtems_bsd_setlogpriority("info");
   rtems_status_code sc = rtems_bsd_initialize();
   assert(sc == RTEMS_SUCCESSFUL);
@@ -239,6 +250,20 @@ static void Init(rtems_task_argument arg)
   rtems_bsd_ifconfig_lo0();
   start_dhcpcd();
   printf("bsd: up at %.3f s\n", uptime_s());
+
+  /* Wi-Fi: first configured network (config.txt / build default); the driver keeps the
+   * station connected across link loss and replug, dhcpcd follows wlan0 */
+  {
+    const char *ssid = NULL, *psk = NULL;
+    if (nexus_config_wifi(0, &ssid, &psk) != 0 || ssid == NULL || ssid[0] == '\0') {
+      ssid = NULL;
+    }
+    (void)nexus_wifi_start(ssid, (psk != NULL && psk[0] != '\0') ? psk : NULL);
+  }
+  if (nexus_ssh_start() != 0) {
+    printf("ssh: not started\n");
+  }
+  nexus_config_shell_register();
 
   spawn(net_watch, 5, 8192);
   spawn(http_status, 5, 16384);
