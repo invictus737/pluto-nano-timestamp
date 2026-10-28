@@ -14,6 +14,9 @@
 #include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -496,6 +499,51 @@ static void *rust_entry(void *arg)
 
 static void spawn(void *(*fn)(void *), int prio, size_t stack);
 
+/*
+ * `abi`: the C layouts Rust std depends on, next to what the libc crate (0.2.18x, newlib arm,
+ * which std on armv7-rtems-eabihf is built on) assumes. Any "MISMATCH" breaks std (time, file
+ * metadata, socket addresses, poll) and needs a corrected libc before nexus2 can work.
+ */
+static int abi_line(const char *what, long c, long rust)
+{
+  printf("%-28s C %-10ld libc-crate %-10ld %s\n", what, c, rust, c == rust ? "ok" : "MISMATCH");
+  return c != rust;
+}
+
+static int shell_abi(int argc, char **argv)
+{
+  (void)argc;
+  (void)argv;
+  int bad = 0;
+  bad += abi_line("sizeof(time_t)", (long)sizeof(time_t), 4);
+  bad += abi_line("sizeof(struct timespec)", (long)sizeof(struct timespec), 8);
+  bad += abi_line("sizeof(struct timeval)", (long)sizeof(struct timeval), 8);
+  bad += abi_line("sizeof(dev_t)", (long)sizeof(dev_t), 4);
+  bad += abi_line("sizeof(ino_t)", (long)sizeof(ino_t), 4);
+  bad += abi_line("sizeof(nlink_t)", (long)sizeof(nlink_t), 2);
+  bad += abi_line("sizeof(off_t)", (long)sizeof(off_t), 8);
+  bad += abi_line("sizeof(struct stat)", (long)sizeof(struct stat), 80);
+  bad += abi_line("offsetof(stat, st_mode)", (long)offsetof(struct stat, st_mode), 8);
+  bad += abi_line("offsetof(stat, st_uid)", (long)offsetof(struct stat, st_uid), 16);
+  bad += abi_line("offsetof(stat, st_size)", (long)offsetof(struct stat, st_size), 32);
+  bad += abi_line("offsetof(stat, st_mtim)", (long)offsetof(struct stat, st_mtim), 48);
+  bad += abi_line("sizeof(struct sockaddr_in)", (long)sizeof(struct sockaddr_in), 16);
+  bad += abi_line("offsetof(sin_family)", (long)offsetof(struct sockaddr_in, sin_family), 0);
+  bad += abi_line("offsetof(sin_port)", (long)offsetof(struct sockaddr_in, sin_port), 2);
+  bad += abi_line("sizeof(sockaddr_in6)", (long)sizeof(struct sockaddr_in6), 28);
+  bad += abi_line("sizeof(sockaddr_storage)", (long)sizeof(struct sockaddr_storage), 27);
+  bad += abi_line("sizeof(struct pollfd)", (long)sizeof(struct pollfd), 8);
+  bad += abi_line("POLLOUT", POLLOUT, 0x10);
+  bad += abi_line("POLLHUP", POLLHUP, 0x4);
+  bad += abi_line("AF_INET6", AF_INET6, 23);
+  bad += abi_line("TCP_NODELAY", TCP_NODELAY, 8193);
+  bad += abi_line("O_CLOEXEC", O_CLOEXEC, 0x80000);
+  bad += abi_line("O_NONBLOCK", O_NONBLOCK, 16384);
+  bad += abi_line("SO_RCVTIMEO", SO_RCVTIMEO, 0x1006);
+  printf("%d mismatch(es)\n", bad);
+  return bad != 0;
+}
+
 #ifdef NEXUS_RUST_MAIN
 /* ---- nexus2 station: Rust main() in its own thread, radio service threads pinned to CPU1 ---- */
 
@@ -507,17 +555,33 @@ int pluto_rtems_pin_to_cpu(int cpu);
 
 static volatile int nexus2_running;
 
+void nexus_exit_guard(int on, void (*cb)(int status)); /* posix_compat.c */
+
+static void nexus2_exited(int status)
+{
+  nexus2_running = 0;
+  printf("nexus2: exited with %d\n", status);
+}
+
 static void *nexus2_entry(void *arg)
 {
   (void)arg;
+  /* RTEMS starts with an empty environment; nexus2 needs an absolute HOME for its RF state
+   * (live_run.rs rf_state_path) */
+  if (getenv("HOME") == NULL) {
+    (void)setenv("HOME", "/data/nexus2", 1);
+  }
+  (void)mkdir("/data/nexus2", 0755);
+  /* a start error calls exit(): end this thread, not the system */
+  nexus_exit_guard(1, nexus2_exited);
   static char a0[] = "nexus2", a1[] = "--config", a2[] = NEXUS2_CONFIG, a3[] = "run", a4[] = "--live",
               a5[] = "--allow-rf-tx";
   static char *argv[] = {a0, a1, a2, a3, a4, a5, NULL};
   nexus2_running = 1;
   printf("nexus2: starting (%s) at %.3f s\n", NEXUS2_CONFIG, uptime_s());
   int rc = main(6, argv);
-  nexus2_running = 0;
-  printf("nexus2: exited with %d\n", rc);
+  nexus_exit_guard(0, NULL);
+  nexus2_exited(rc);
   return NULL;
 }
 
@@ -613,6 +677,7 @@ static void Init(rtems_task_argument arg)
     printf("ssh: not started\n");
   }
   nexus_config_shell_register();
+  rtems_shell_add_cmd("abi", "misc", "abi: C layouts vs the Rust libc crate", shell_abi);
 #ifdef NEXUS_RUST_MAIN
   rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status: the nexus2 station", shell_nexus);
   nexus2_start();
