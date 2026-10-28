@@ -8,7 +8,7 @@ RUST_LIB=${RUST_LIB:-}; [ -z "$RUST_LIB" ] || [ -f "$RUST_LIB" ] || { echo "no R
 if ! make -C "$HERE/app" RTEMS_TOOLS="$TOOLS" RTEMS_PREFIX="$PREFIX" B="$OUT/app" RUST_LIB="$RUST_LIB"; then
   [ -n "$RUST_LIB" ] || exit 1
   echo "::warning::link with the Rust library failed; image built without it"
-  rm -rf "$OUT/app"; make -C "$HERE/app" RTEMS_TOOLS="$TOOLS" RTEMS_PREFIX="$PREFIX" B="$OUT/app"
+  rm -rf "$OUT/app"; make -C "$HERE/app" RTEMS_TOOLS="$TOOLS" RTEMS_PREFIX="$PREFIX" B="$OUT/app" RUST_LIB=
 fi
 ELF=$OUT/app/nexus-rtos.elf; BIN=$OUT/app/nexus-rtos.bin
 # Load at the lowest load address (the vector table), enter at the ELF entry (_start); the

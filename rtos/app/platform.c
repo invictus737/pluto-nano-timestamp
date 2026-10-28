@@ -103,3 +103,20 @@ BSP_START_TEXT_SECTION void zynq_setup_mmu_and_cache(void)
     RTEMS_ARRAY_SIZE(nexus_mmu_config_table)
   );
 }
+
+/*
+ * ARM EABI thread pointer helper for code that does not read TPIDRURO inline (Rust std on
+ * armv7-rtems-eabihf uses ELF TLS through this call). RTEMS on ARMv7 keeps the thread pointer
+ * in TPIDRURO; the helper may clobber only r0.
+ */
+__asm__(
+  ".syntax unified\n"
+  ".thumb\n"
+  ".global __aeabi_read_tp\n"
+  ".type __aeabi_read_tp, %function\n"
+  ".thumb_func\n"
+  "__aeabi_read_tp:\n"
+  "  mrc p15, 0, r0, c13, c0, 3\n"
+  "  bx lr\n"
+  ".size __aeabi_read_tp, . - __aeabi_read_tp\n"
+);
