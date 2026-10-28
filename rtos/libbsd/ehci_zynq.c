@@ -49,6 +49,7 @@
 
 #include <dev/usb/usb_controller.h>
 #include <dev/usb/usb_bus.h>
+#include <dev/usb/usb_hub.h>
 #include <dev/usb/controller/ehci.h>
 #include <dev/usb/controller/ehcireg.h>
 
@@ -175,6 +176,27 @@ zynq_ehci_probe(device_t self)
 
 static int zynq_ehci_detach(device_t self);
 
+/*
+ * Port-change watchdog. On the board the root-hub status-change interrupt can get lost (seen
+ * after unplugging a high-current device: PORTSC1 showed CCS=1 CSC=1 while USBSTS.PCI stayed 0
+ * and no attach followed). Every 500 ms look at the change bits of PORTSC1 and kick a bus explore
+ * when any is set; explore reads the port itself, so attach/detach no longer depends on the
+ * interrupt. Costs one register read per half second.
+ */
+#define PORTSC_CHANGE_BITS ((1U << 1) | (1U << 3) | (1U << 5)) /* CSC, PEC, OCC */
+static struct callout zynq_ehci_poll;
+static ehci_softc_t *zynq_ehci_sc;
+
+static void
+zynq_ehci_poll_tick(void *arg)
+{
+	(void)arg;
+	if (zynq_ehci_sc != NULL &&
+	    (REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1) & PORTSC_CHANGE_BITS) != 0)
+		usb_needs_explore(&zynq_ehci_sc->sc_bus, 0);
+	callout_reset(&zynq_ehci_poll, hz / 2, zynq_ehci_poll_tick, NULL);
+}
+
 static int
 zynq_ehci_attach(device_t self)
 {
@@ -246,6 +268,10 @@ zynq_ehci_attach(device_t self)
 
 	if (device_probe_and_attach(e->sc_bus.bdev) != 0)
 		goto error;
+
+	zynq_ehci_sc = e;
+	callout_init(&zynq_ehci_poll, 1);
+	callout_reset(&zynq_ehci_poll, hz / 2, zynq_ehci_poll_tick, NULL);
 
 	return (0);
 
