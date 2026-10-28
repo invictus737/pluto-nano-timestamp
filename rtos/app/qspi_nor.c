@@ -77,6 +77,8 @@ static int ready;
 static uint32_t jedec;
 static uint8_t verify_buf[PAGE];
 static uint32_t baud_field = 7;
+static int burst_ok; /* batched reads matched byte-by-byte reads at init */
+static void burst_selftest(void);
 
 static void controller_setup(void)
 {
@@ -112,6 +114,31 @@ static int byte_xfer(uint8_t out, uint8_t *in)
   return 0;
 }
 
+/* Bulk receive: queue up to BURST one-byte dummy entries, then collect their RX entries. The
+ * byte-by-byte path waits for every byte's round trip through the shifter; the JFFS2 mount reads
+ * the whole 896 KiB region that way. TX and RX FIFOs are 63 entries deep. */
+#define BURST 32u
+static int rx_burst(uint8_t *rx, size_t n)
+{
+  while (n) {
+    unsigned k = n > BURST ? BURST : (unsigned)n;
+    for (unsigned i = 0; i < k; ++i) {
+      REG32(QSPI_TXD1) = 0xff;
+    }
+    for (unsigned i = 0; i < k; ++i) {
+      for (unsigned w = 0; (REG32(QSPI_ISR) & ISR_RXNEMPTY) == 0; ++w) {
+        if (w > POLL_LIMIT) {
+          return -1;
+        }
+      }
+      rx[i] = (uint8_t)(REG32(QSPI_RXD) >> 24);
+    }
+    rx += k;
+    n -= k;
+  }
+  return 0;
+}
+
 /* one SPI transaction under one chip select: cmd bytes, tx bytes, then rx_len bytes clocked in */
 static int xfer(const uint8_t *cmd, size_t cmd_len, const uint8_t *tx, size_t tx_len, uint8_t *rx,
                 size_t rx_len)
@@ -124,10 +151,20 @@ static int xfer(const uint8_t *cmd, size_t cmd_len, const uint8_t *tx, size_t tx
   for (size_t i = 0; rc == 0 && i < tx_len; ++i) {
     rc = byte_xfer(tx[i], NULL);
   }
-  for (size_t i = 0; rc == 0 && i < rx_len; ++i) {
-    rc = byte_xfer(0xff, &rx[i]);
+  if (rc == 0 && burst_ok && rx_len > 1) {
+    rc = rx_burst(rx, rx_len);
+  } else {
+    for (size_t i = 0; rc == 0 && i < rx_len; ++i) {
+      rc = byte_xfer(0xff, &rx[i]);
+    }
   }
   REG32(QSPI_CR) |= CR_PCS;
+  if (rc != 0) {
+    /* a stalled transfer may leave entries behind: start the next one with empty FIFOs */
+    while (REG32(QSPI_ISR) & ISR_RXNEMPTY) {
+      (void)REG32(QSPI_RXD);
+    }
+  }
   return rc;
 }
 
@@ -247,6 +284,7 @@ int qspi_nor_init(void)
   if (sr1 & SR1_WIP) {
     (void)wait_ready(3000, 1000);
   }
+  burst_selftest();
   ready = 1;
   pthread_mutex_unlock(&lock);
   return 0;
@@ -255,6 +293,25 @@ int qspi_nor_init(void)
 uint32_t qspi_nor_jedec(void)
 {
   return jedec;
+}
+
+static int read_locked(uint32_t addr, uint8_t *p, size_t len);
+
+/* enable batched reads only when they return exactly what byte-by-byte reads return, on the
+ * U-Boot environment (never blank) and the start of /data */
+static void burst_selftest(void)
+{
+  static uint8_t a[2048], b[2048];
+  static const uint32_t where[] = {QSPI_NOR_ENV_OFF, QSPI_NOR_DATA_OFF};
+  int ok = 1;
+  for (unsigned i = 0; i < 2 && ok; ++i) {
+    burst_ok = 0;
+    ok = read_locked(where[i], a, sizeof(a)) == 0;
+    burst_ok = 1;
+    ok = ok && read_locked(where[i], b, sizeof(b)) == 0 && memcmp(a, b, sizeof(a)) == 0;
+  }
+  burst_ok = ok;
+  printf("qspi: batched reads %s\n", ok ? "on" : "OFF (mismatch or stall: byte mode)");
 }
 
 static int read_locked(uint32_t addr, uint8_t *p, size_t len)
