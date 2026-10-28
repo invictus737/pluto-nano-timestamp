@@ -58,6 +58,8 @@
 #define QSPI_IDR (QSPI_BASE + 0x0c)
 #define QSPI_EN (QSPI_BASE + 0x14)
 #define QSPI_RXD (QSPI_BASE + 0x20)
+#define QSPI_TX_THRES (QSPI_BASE + 0x28)
+#define QSPI_RX_THRES (QSPI_BASE + 0x2c)
 #define QSPI_TXD1 (QSPI_BASE + 0x80)
 #define QSPI_LQSPI_CR (QSPI_BASE + 0xa0)
 #define CR_IFMODE (1U << 31)    /* flash interface mode */
@@ -81,9 +83,15 @@ static void controller_setup(void)
   REG32(QSPI_EN) = 0;
   REG32(QSPI_LQSPI_CR) &= ~(1U << 31); /* linear (XIP) mode off */
   REG32(QSPI_IDR) = 0x7fU;              /* polled: no interrupts */
+  /* U-Boot leaves the RX threshold at 32 entries: RX_NOT_EMPTY would never rise for the
+   * one-byte entries used here */
+  REG32(QSPI_RX_THRES) = 1;
+  REG32(QSPI_TX_THRES) = 1;
   REG32(QSPI_CR) = CR_IFMODE | CR_HOLDB_DR | CR_SSFORCE | CR_PCS | CR_FIFO_32 |
                    (baud_field << CR_BAUD_SHIFT) | CR_MSTREN;
   REG32(QSPI_EN) = 1;
+  printf("qspi: cr %08lx rx_thres %lu\n", (unsigned long)REG32(QSPI_CR),
+         (unsigned long)REG32(QSPI_RX_THRES));
   while (REG32(QSPI_ISR) & ISR_RXNEMPTY) {
     (void)REG32(QSPI_RXD);
   }
