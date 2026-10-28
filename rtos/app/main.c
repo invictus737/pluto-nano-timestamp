@@ -212,6 +212,62 @@ static void *rust_entry(void *arg)
 }
 #endif
 
+static void spawn(void *(*fn)(void *), int prio, size_t stack);
+
+#ifdef NEXUS_RUST_MAIN
+/* ---- nexus2 station: Rust main() in its own thread, radio service threads pinned to CPU1 ---- */
+
+int main(int argc, char **argv); /* nexus2 (Rust) */
+int nexus2_request_stop(void);   /* bins/nexus2/src/rtems_platform.rs */
+int pluto_rtems_pin_to_cpu(int cpu);
+
+#define NEXUS2_CONFIG "/data/nexus2/nexus2.toml"
+
+static volatile int nexus2_running;
+
+static void *nexus2_entry(void *arg)
+{
+  (void)arg;
+  static char a0[] = "nexus2", a1[] = "--config", a2[] = NEXUS2_CONFIG, a3[] = "run", a4[] = "--live",
+              a5[] = "--allow-rf-tx";
+  static char *argv[] = {a0, a1, a2, a3, a4, a5, NULL};
+  nexus2_running = 1;
+  printf("nexus2: starting (%s) at %.3f s\n", NEXUS2_CONFIG, uptime_s());
+  int rc = main(6, argv);
+  nexus2_running = 0;
+  printf("nexus2: exited with %d\n", rc);
+  return NULL;
+}
+
+static void nexus2_start(void)
+{
+  struct stat st;
+  if (nexus2_running) {
+    printf("nexus2: already running\n");
+    return;
+  }
+  if (stat(NEXUS2_CONFIG, &st) != 0) {
+    printf("nexus2: no %s yet: put nexus2.toml on a USB stick (rtos/config/README.md)\n", NEXUS2_CONFIG);
+    return;
+  }
+  /* radio DMA service threads and interrupts on CPU1, network/USB/SSH stay on CPU0 */
+  (void)pluto_rtems_pin_to_cpu(1);
+  spawn(nexus2_entry, 4, 2 * 1024 * 1024);
+}
+
+static int shell_nexus(int argc, char **argv)
+{
+  if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+    printf("nexus2: %s\n", nexus2_request_stop() == 0 ? "stop requested" : "not running");
+  } else if (argc >= 2 && strcmp(argv[1], "start") == 0) {
+    nexus2_start();
+  } else {
+    printf("nexus2: %s\nusage: nexus start|stop|status\n", nexus2_running ? "running" : "stopped");
+  }
+  return 0;
+}
+#endif
+
 static void spawn(void *(*fn)(void *), int prio, size_t stack)
 {
   pthread_attr_t at;
@@ -264,6 +320,10 @@ static void Init(rtems_task_argument arg)
     printf("ssh: not started\n");
   }
   nexus_config_shell_register();
+#ifdef NEXUS_RUST_MAIN
+  rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status: the nexus2 station", shell_nexus);
+  nexus2_start();
+#endif
 
   spawn(net_watch, 5, 8192);
   spawn(http_status, 5, 16384);
@@ -380,6 +440,21 @@ void nexus_fatal_extension(rtems_fatal_source source, bool always_set_to_false, 
 #define CONFIGURE_SHELL_COMMAND_STACKUSE
 #define CONFIGURE_SHELL_COMMAND_PERIODUSE
 #define CONFIGURE_SHELL_COMMAND_MALLOC_INFO
+#define CONFIGURE_SHELL_COMMAND_WKSPACE_INFO
+#define CONFIGURE_SHELL_COMMAND_TOP
+#define CONFIGURE_SHELL_COMMAND_RTEMS
+#define CONFIGURE_SHELL_COMMAND_DF
+#define CONFIGURE_SHELL_COMMAND_MOUNT
+#define CONFIGURE_SHELL_COMMAND_UNMOUNT
+#define CONFIGURE_SHELL_COMMAND_DATE
+#define CONFIGURE_SHELL_COMMAND_ECHO
+#define CONFIGURE_SHELL_COMMAND_PWD
+#define CONFIGURE_SHELL_COMMAND_CD
+#define CONFIGURE_SHELL_COMMAND_MKDIR
+#define CONFIGURE_SHELL_COMMAND_RM
+#define CONFIGURE_SHELL_COMMAND_CP
+#define CONFIGURE_SHELL_COMMAND_MV
+#define CONFIGURE_SHELL_COMMAND_HEXDUMP
 #define CONFIGURE_SHELL_COMMAND_LS
 #define CONFIGURE_SHELL_COMMAND_CAT
 #define CONFIGURE_SHELL_COMMAND_RESET

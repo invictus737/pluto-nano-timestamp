@@ -123,5 +123,13 @@ jobs:
         if: steps.nsrc.outcome == 'success'
         continue-on-error: true
         run: rtos/ci/nexus2-check.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/nexus $PWD/out/nexus2-rtems-check.txt
+      - name: Station image (nexus2 + native Pluto driver linked into RTEMS)
+        if: steps.nsrc.outcome == 'success'
+        continue-on-error: true
+        env:
+          NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
+          NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
+          NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
+        run: rtos/ci/image-nexus2.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr $PWD/nexus xsa/system_top.xsa out
       - uses: actions/upload-artifact@v4
-        with: { name: nexus-rtos, path: "out/rtos.itb\nout/nexus-rtos.elf\nout/nexus-rtos.map\nout/SHA256SUMS\nout/qemu.log\nout/nexus2-rtems-check.txt\nout/nexus2-rtems-check.txt.raw\nrtos/rust-probe/build-*.log", if-no-files-found: error }
+        with: { name: nexus-rtos, path: "out/rtos-nexus2.itb\nout/nexus2.map\nout/rtos.itb\nout/nexus-rtos.elf\nout/nexus-rtos.map\nout/SHA256SUMS\nout/qemu.log\nout/nexus2-rtems-check.txt\nout/nexus2-rtems-check.txt.raw\nrtos/rust-probe/build-*.log", if-no-files-found: error }
