@@ -45,7 +45,7 @@ jobs:
       - name: BSP + libbsd cache
         id: bsp
         uses: actions/cache/restore@v4
-        with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: 'rtems-6.2-pluto-bsp-v1-${{ hashFiles(''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/libbsd/**'', ''rtos/ci/toolchain.sh'') }}' }
+        with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: 'rtems-6.2-pluto-bsp-v1-${{ hashFiles(''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/libbsd/*'', ''rtos/libbsd/aic8800/if_aicwf_usb.c'', ''rtos/libbsd/aic8800/aicwf_usbif.h'', ''rtos/libbsd/aic8800/fetch-firmware.sh'', ''rtos/libbsd/aic8800/gen_fwdata.py'', ''rtos/ci/toolchain.sh'') }}' }
       - name: RTEMS kernel (Pluto BSP) + libbsd with the Zynq EHCI glue
         if: steps.bsp.outputs.cache-hit != 'true'
         run: sudo mkdir -p $RTEMS_BSP_PREFIX && sudo chown runner $RTEMS_BSP_PREFIX && rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
