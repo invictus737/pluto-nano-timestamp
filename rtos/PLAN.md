@@ -54,6 +54,17 @@ RAM-boot first through `run dfu_ram`; flashing is a separate, explicit step.
   from the GPL-2.0 Linux driver and SSH uses wolfSSH/wolfSSL; the licence combination is to be
   revisited before any distribution.
 
+## Board state (2026-10-28)
+
+- QSPI firmware slot 0x200000 holds rtos.itb f02f71bf (CI run 40732765838, 6533A1 bytes), env
+  fit_config=config-2, fit_size=6533A1; U-Boot, env layout, jffs2 (0x120000) and UBI data
+  (0x1A00000) untouched. Reset to RTEMS shell 5.3 s (2 s of it the U-Boot menu delay).
+- Linux restore: backup in Nexus-BS-2.0/.local/pluto-backup-20261028-rtos (README.txt): run dfu_sf,
+  dfu-util -a firmware.dfu -D firmware.bin, setenv fit_config config@1; setenv fit_size BA12D3; saveenv.
+- After an RTEMS soft reset the ULPI PHY keeps host/VBUS state and U-Boot DFU is not seen by the
+  host: run `gpio clear 46; gpio set 46` before dfu_sf/dfu_ram (or power-cycle). To fix in the glue.
+- CPU at stock 666.67 MHz (cpu_clock=standard FSBL since 2026-10-28).
+
 ## Risks
 
 - Rust std on RTEMS is tier 3 and "not fully tested".

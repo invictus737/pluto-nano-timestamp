@@ -1,0 +1,23 @@
+Starting kernel ...
+Nexus-BS RTOS 0.1.0-m2 (RTEMS 6.2.0.8abcb58186ce78c742b5a972d7a7a127082422a5) Pluto Nano
+boot 1.006 s, cpus 2, arm 666666660 Hz, uart ref 99999999 Hz, PL configured
+nexus0: <RTEMS Nexus device>
+ehci0: <Zynq-7000 EHCI> on nexus0
+ehci0: ULPI PHY vendor 0424 product 0007
+ehci0: id 0xe441fa05 caplength 0x40
+usbus0: EHCI version 1.0
+usbus0: stop timeout
+usbus0 on ehci0
+zy7_slcr0: <Zynq-7000 slcr block> on nexus0
+usbus0: 480Mbps High Speed USB v2.0
+info: lo0: link state changed to UP
+bsd: up at 2.164 s
+info: version 6.2.1 starting
+rust: start at 2.171 s
+RTEMS Shell on /dev/console. Use 'help' to list commands.
+SHLL [/] # ugen0.1: <Xilinx EHCI root HUB> at usbus0
+uhub0 on usbus0
+uhub0: <Xilinx EHCI root HUB, class 9/0, rev 2.00/1.00, addr 1> on usbus0
+err: no valid interfaces found
+uhub0: 1 port with 1 removable, self powered
+SHLL [/] # 
