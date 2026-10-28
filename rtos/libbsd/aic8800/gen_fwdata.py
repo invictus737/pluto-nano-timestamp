@@ -28,7 +28,9 @@ def cap_userconfig(data, name):
         out.append(line)
     text = "\n".join(out)
     if not re.search(r"^lvl_", text, re.M):
-        sys.exit("%s: no lvl_ entries" % name)
+        # the plain AIC8800 userconfig has no per-rate power table: nothing to cap
+        print("%s: no lvl_ entries, kept as is" % name, file=sys.stderr)
+        return data
     for m in re.finditer(r"^lvl_[A-Za-z0-9_]+=(-?\d+)", text, re.M):
         if int(m.group(1)) > TXPWR_MAX:
             sys.exit("%s: cap failed" % name)
