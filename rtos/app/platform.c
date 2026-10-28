@@ -110,8 +110,10 @@ BSP_START_TEXT_SECTION void zynq_setup_mmu_and_cache(void)
  * in TPIDRURO; the helper may clobber only r0.
  */
 __asm__(
+  ".pushsection .text.__aeabi_read_tp, \"ax\", %progbits\n"
   ".syntax unified\n"
   ".thumb\n"
+  ".align 2\n"
   ".global __aeabi_read_tp\n"
   ".type __aeabi_read_tp, %function\n"
   ".thumb_func\n"
@@ -119,4 +121,5 @@ __asm__(
   "  mrc p15, 0, r0, c13, c0, 3\n"
   "  bx lr\n"
   ".size __aeabi_read_tp, . - __aeabi_read_tp\n"
+  ".popsection\n"
 );
