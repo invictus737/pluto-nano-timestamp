@@ -177,6 +177,22 @@ static int write_atomic(const char *path, const void *data, size_t len, mode_t m
   }
   if (rc == 0) {
     rc = rename(tmp, path);
+    if (rc != 0 && errno == EEXIST) {
+      /* RTEMS JFFS2 does not rename over an existing file: keep the old one as .bak until
+       * the new one is in place, so an interruption always leaves a valid file */
+      char bak[168];
+      snprintf(bak, sizeof(bak), "%s.bak", path);
+      (void)unlink(bak);
+      rc = rename(path, bak);
+      if (rc == 0) {
+        rc = rename(tmp, path);
+        if (rc == 0) {
+          (void)unlink(bak);
+        } else {
+          (void)rename(bak, path);
+        }
+      }
+    }
   }
   if (rc != 0) {
     unlink(tmp);
