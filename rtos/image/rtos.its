@@ -1,0 +1,39 @@
+/*
+ * Nexus-BS RTOS image for the Pluto Nano: PL bitstream + RTEMS kernel, booted by the Tezuka
+ * U-Boot with `bootm ${fit_load_address}` (from QSPI or after `run dfu_ram`).
+ */
+/dts-v1/;
+/ {
+	description = "Nexus-BS RTOS (RTEMS) for Pluto Nano";
+	#address-cells = <1>;
+	images {
+		fpga@1 {
+			description = "FPGA";
+			data = /incbin/("system_top.bit");
+			type = "fpga";
+			arch = "arm";
+			compression = "none";
+			load = <0xF000000>;
+			hash@1 { algo = "md5"; };
+		};
+		rtems@1 {
+			description = "Nexus-BS RTOS";
+			data = /incbin/("nexus-rtos.bin");
+			type = "kernel";
+			arch = "arm";
+			os = "rtems";
+			compression = "none";
+			load = <0x00100000>;
+			entry = <0x00100000>;
+			hash@1 { algo = "md5"; };
+		};
+	};
+	configurations {
+		default = "config@0";
+		config@0 {
+			description = "Nexus-BS RTOS";
+			kernel = "rtems@1";
+			loadables = "fpga@1";
+		};
+	};
+};

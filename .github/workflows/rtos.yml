@@ -1,0 +1,50 @@
+name: rtos (Nexus-BS RTEMS image, no Linux)
+# Bitstream: the nano-system_top.xsa of the last successful v0.39-std firmware run (same HDL
+# inputs, checked by firmware/xsa-key.sh). Toolchain and BSP+libbsd are cached; the image is
+# rebuilt every run. Output: rtos.itb (FIT: fpga + RTEMS kernel) for `run dfu_ram` + `bootm`.
+on:
+  workflow_dispatch:
+    inputs:
+      xsa_run: { description: 'firmware.yml run id with nano-system_top.xsa (empty = last v0.39-std success)', required: false }
+  push:
+    branches: [Nexus-BS-2.0_RTOS]
+    paths: ['rtos/**', '.github/workflows/rtos.yml']
+permissions: { actions: read, contents: read }
+env:
+  RTEMS_TOOLS: /opt/rtems/6
+  RTEMS_BSP_PREFIX: /opt/rtems/bsp
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q build-essential flex bison texinfo unzip zlib1g-dev python3-dev libncurses-dev pkg-config u-boot-tools xz-utils
+      - name: Bitstream (xsa from the v0.39-std firmware run)
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          RUN='${{ inputs.xsa_run }}'
+          [ -n "$RUN" ] || RUN=$(gh run list -R "$GITHUB_REPOSITORY" -b v0.39-std -w firmware.yml -s success -L 1 --json databaseId --jq '.[0].databaseId')
+          echo "xsa from run $RUN"
+          gh run download "$RUN" -R "$GITHUB_REPOSITORY" -n nano-system_top.xsa -D xsa
+          unzip -l xsa/system_top.xsa | grep -E 'system_top.bit|ps7_init.c'
+          unzip -p xsa/system_top.xsa system.hwh | grep -oE 'PCW_ACT_(APU|UART|USB0)_PERIPHERAL_FREQMHZ" VALUE="[^"]*"'
+      - name: Toolchain cache
+        id: tc
+        uses: actions/cache@v4
+        with: { path: '${{ env.RTEMS_TOOLS }}', key: 'rtems-6.2-arm-tools-v1-${{ hashFiles(''rtos/ci/toolchain.sh'') }}' }
+      - name: RTEMS 6.2 toolchain (source builder, first run only)
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: sudo mkdir -p $RTEMS_TOOLS && sudo chown runner $RTEMS_TOOLS && rtos/ci/toolchain.sh $RTEMS_TOOLS
+      - name: BSP + libbsd cache
+        id: bsp
+        uses: actions/cache@v4
+        with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: 'rtems-6.2-pluto-bsp-v1-${{ hashFiles(''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/libbsd/**'', ''rtos/ci/toolchain.sh'') }}' }
+      - name: RTEMS kernel (Pluto BSP) + libbsd with the Zynq EHCI glue
+        if: steps.bsp.outputs.cache-hit != 'true'
+        run: sudo mkdir -p $RTEMS_BSP_PREFIX && sudo chown runner $RTEMS_BSP_PREFIX && rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
+      - name: Image
+        run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
+      - uses: actions/upload-artifact@v4
+        with: { name: nexus-rtos, path: "out/rtos.itb\nout/nexus-rtos.elf\nout/nexus-rtos.map\nout/SHA256SUMS", if-no-files-found: error }
