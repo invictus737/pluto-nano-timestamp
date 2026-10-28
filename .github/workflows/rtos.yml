@@ -53,6 +53,25 @@ jobs:
         if: steps.bsp.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with: { path: '${{ env.RTEMS_BSP_PREFIX }}', key: '${{ steps.bsp.outputs.cache-primary-key }}' }
+      - name: Native Pluto driver host unit tests (framing, timestamps, DMA ring)
+        run: make -C rtos/sdr/test
+      - name: SoapySDR + native Pluto driver cache
+        id: sdr
+        uses: actions/cache/restore@v4
+        with: { path: /opt/rtems/sdr, key: 'rtems-6.2-pluto-sdr-v1-${{ hashFiles(''rtos/sdr/**'', ''rtos/ci/bsp.sh'', ''rtos/bsp/**'', ''rtos/ci/toolchain.sh'') }}' }
+      - name: SoapySDR 0.8.1 + native Pluto driver (libSoapySDR.a, libSoapyPlutoRtems.a with ADI no-OS)
+        id: sdrb
+        if: steps.sdr.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          sudo mkdir -p /opt/rtems/sdr && sudo chown runner /opt/rtems/sdr
+          rtos/sdr/build-soapysdr.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr
+          rtos/sdr/fetch-noos.sh $RUNNER_TEMP/noos
+          rtos/sdr/build-pluto-driver.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX /opt/rtems/sdr $RUNNER_TEMP/noos /opt/rtems/sdr
+      - name: Save SoapySDR + native Pluto driver now
+        if: steps.sdr.outputs.cache-hit != 'true' && steps.sdrb.outcome == 'success'
+        uses: actions/cache/save@v4
+        with: { path: /opt/rtems/sdr, key: '${{ steps.sdr.outputs.cache-primary-key }}' }
       - name: Rust nightly with rust-src (build-std)
         run: rustup toolchain install nightly --profile minimal --component rust-src && rustc +nightly -V
       - name: Rust std probe (M3, armv7-rtems-eabihf)
