@@ -46,6 +46,7 @@
 #include "ssh_server.h"
 
 int nexus_wifi_start(const char *ssid, const char *psk);
+static void wifi80211_start(const char *ssid, const char *psk);
 
 #define NEXUS_RTOS_VERSION "0.1.0-m2"
 
@@ -629,6 +630,7 @@ static void Init(rtems_task_argument arg)
       ssid = NULL;
     }
     (void)nexus_wifi_start(ssid, (psk != NULL && psk[0] != '\0') ? psk : NULL);
+    wifi80211_start(ssid, (psk != NULL && psk[0] != '\0') ? psk : NULL);
   }
   if (nexus_ssh_start() != 0) {
     printf("ssh: not started\n");
@@ -685,6 +687,98 @@ SYSINIT_MODULE_REFERENCE(wlan_ccmp);
 SYSINIT_REFERENCE(rtwn_rtl8188eufw);
 SYSINIT_REFERENCE(rtwn_rtl8192cfwT);
 #endif
+
+/*
+ * net80211 sticks (rtwn: Realtek RTL8188/8192/8812/8821): the AIC driver brings its own station,
+ * these need wlan0 cloned on the parent device and wpa_supplicant. A thread waits for the first
+ * parent in net.wlan.devices (USB hotplug), then creates wlan0 and starts the supplicant; dhcpcd
+ * already follows every interface. Checked every 200 ms, nothing else to do once running.
+ */
+#include <sys/sysctl.h>
+#include <machine/rtems-bsd-commands.h>
+
+static const char *w80211_ssid, *w80211_psk;
+
+static int w80211_parent(char *dev, size_t cap)
+{
+  char list[128];
+  size_t len = sizeof(list) - 1;
+  if (sysctlbyname("net.wlan.devices", list, &len, NULL, 0) != 0 || len == 0) {
+    return -1;
+  }
+  list[len] = '\0';
+  char *save = NULL;
+  for (char *t = strtok_r(list, " ", &save); t != NULL; t = strtok_r(NULL, " ", &save)) {
+    if (strncmp(t, "aicwf", 5) != 0 && strlen(t) < cap) { /* the AIC driver has its own station */
+      strcpy(dev, t);
+      return 0;
+    }
+  }
+  return -1;
+}
+
+static void w80211_quote(FILE *f, const char *k, const char *v)
+{
+  fprintf(f, "\t%s=\"", k);
+  for (; *v != '\0'; v++) {
+    if (*v == '"' || *v == '\\') {
+      fputc('\\', f);
+    }
+    fputc(*v, f);
+  }
+  fputs("\"\n", f);
+}
+
+static void *w80211_main(void *arg)
+{
+  (void)arg;
+  char dev[32];
+  while (w80211_parent(dev, sizeof(dev)) != 0) {
+    usleep(200000);
+  }
+  printf("wifi: %s (net80211), creating wlan0\n", dev);
+  {
+    char *av[] = {"ifconfig", "wlan0", "create", "wlandev", dev, "up", NULL};
+    optind = 0; /* newlib getopt keeps its state across libbsd programs: 0 = reinitialise */
+    if (rtems_bsd_command_ifconfig(6, av) != 0) {
+      printf("wifi: wlan0 on %s not created\n", dev);
+      return NULL;
+    }
+  }
+  FILE *f = fopen("/etc/wpa_supplicant.conf", "w");
+  if (f == NULL) {
+    return NULL;
+  }
+  fputs("ap_scan=1\nnetwork={\n", f);
+  w80211_quote(f, "ssid", w80211_ssid);
+  if (w80211_psk != NULL) {
+    w80211_quote(f, "psk", w80211_psk);
+  } else {
+    fputs("\tkey_mgmt=NONE\n", f);
+  }
+  fputs("\tscan_ssid=1\n}\n", f);
+  fclose(f);
+  char *wv[] = {"wpa_supplicant", "-s", "-Dbsd", "-iwlan0", "-c", "/etc/wpa_supplicant.conf", NULL};
+  optind = 0;
+  int rc = rtems_bsd_command_wpa_supplicant_fork(6, wv);
+  printf("wifi: wpa_supplicant on wlan0 for \"%s\" %s\n", w80211_ssid, rc == 0 ? "started" : "failed");
+  return NULL;
+}
+
+static void wifi80211_start(const char *ssid, const char *psk)
+{
+#ifdef RTEMS_BSD_MODULE_NET80211
+  if (ssid == NULL) {
+    return;
+  }
+  w80211_ssid = ssid;
+  w80211_psk = psk;
+  spawn(w80211_main, 5, 16384);
+#else
+  (void)ssid;
+  (void)psk;
+#endif
+}
 
 #define RTEMS_BSD_CONFIG_NET_PF_UNIX
 #define RTEMS_BSD_CONFIG_INIT
@@ -745,18 +839,53 @@ void nexus_fatal_extension(rtems_fatal_source source, bool always_set_to_false, 
 #define SHELL_WLANSTATS_COMMAND
 #endif
 
+/*
+ * libbsd programs parse their arguments with newlib's global getopt, whose state survives the
+ * call: the second `ifconfig wlan0 create ...` in a shell session was parsed from the wrong
+ * index. Every libbsd command goes through a wrapper that reinitialises getopt (optind = 0).
+ */
+#define NX_GETOPT_SAFE(ID, ORIG)                                                   \
+  static int nx_sh_##ID(int argc, char **argv)                                    \
+  {                                                                               \
+    optind = 0;                                                                   \
+    return ORIG.command(argc, argv);                                              \
+  }                                                                               \
+  static rtems_shell_cmd_t nx_cmd_##ID = {.name = #ID, .topic = "net", .command = nx_sh_##ID}
+extern rtems_shell_cmd_t rtems_shell_ARP_Command, rtems_shell_PING_Command,
+    rtems_shell_ROUTE_Command, rtems_shell_NETSTAT_Command, rtems_shell_IFCONFIG_Command,
+    rtems_shell_SYSCTL_Command, rtems_shell_VMSTAT_Command;
+NX_GETOPT_SAFE(arp, rtems_shell_ARP_Command);
+NX_GETOPT_SAFE(ping, rtems_shell_PING_Command);
+NX_GETOPT_SAFE(route, rtems_shell_ROUTE_Command);
+NX_GETOPT_SAFE(netstat, rtems_shell_NETSTAT_Command);
+NX_GETOPT_SAFE(ifconfig, rtems_shell_IFCONFIG_Command);
+NX_GETOPT_SAFE(sysctl, rtems_shell_SYSCTL_Command);
+NX_GETOPT_SAFE(vmstat, rtems_shell_VMSTAT_Command);
+#ifdef RTEMS_BSD_MODULE_USR_SBIN_WPA_SUPPLICANT
+extern rtems_shell_cmd_t rtems_shell_WPA_SUPPLICANT_Command;
+NX_GETOPT_SAFE(wpa_supplicant, rtems_shell_WPA_SUPPLICANT_Command);
+#undef SHELL_WPA_SUPPLICANT_COMMAND
+#define SHELL_WPA_SUPPLICANT_COMMAND &nx_cmd_wpa_supplicant,
+#endif
+#ifdef RTEMS_BSD_MODULE_USER_SPACE_WLANSTATS
+extern rtems_shell_cmd_t rtems_shell_WLANSTATS_Command;
+NX_GETOPT_SAFE(wlanstats, rtems_shell_WLANSTATS_Command);
+#undef SHELL_WLANSTATS_COMMAND
+#define SHELL_WLANSTATS_COMMAND &nx_cmd_wlanstats,
+#endif
+
 #define CONFIGURE_SHELL_USER_COMMANDS \
   SHELL_WLANSTATS_COMMAND \
   SHELL_WPA_SUPPLICANT_COMMAND \
   &bsp_interrupt_shell_command, \
-  &rtems_shell_ARP_Command, \
+  &nx_cmd_arp, \
   &rtems_shell_HOSTNAME_Command, \
-  &rtems_shell_PING_Command, \
-  &rtems_shell_ROUTE_Command, \
-  &rtems_shell_NETSTAT_Command, \
-  &rtems_shell_IFCONFIG_Command, \
-  &rtems_shell_SYSCTL_Command, \
-  &rtems_shell_VMSTAT_Command
+  &nx_cmd_ping, \
+  &nx_cmd_route, \
+  &nx_cmd_netstat, \
+  &nx_cmd_ifconfig, \
+  &nx_cmd_sysctl, \
+  &nx_cmd_vmstat
 
 #define CONFIGURE_SHELL_COMMAND_CPUINFO
 #define CONFIGURE_SHELL_COMMAND_CPUUSE
