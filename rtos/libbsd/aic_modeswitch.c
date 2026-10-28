@@ -45,6 +45,7 @@
 
 static const uint8_t cdb_allow_removal[6] = { 0x1e, 0, 0, 0, 0, 0 };
 static const uint8_t cdb_stop_eject[6] = { 0x1b, 0, 0, 0, 0x02, 0 };
+static const uint8_t cdb_test_unit_ready[6] = { 0, 0, 0, 0, 0, 0 };
 static const uint8_t cdb_pandora_f3[16] = { 0xfd, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0xf3 };
 static const uint8_t cdb_pandora_f2[16] = { 0xfd, 0, 0, 0, 0, 0, 0, 0,
@@ -85,9 +86,30 @@ aicms_autoinst(void *arg, struct usb_device *udev, struct usb_attach_arg *uaa)
 			err = usb_msc_eject_cdb(udev, 0, cdb_pandora_f2,
 			    sizeof(cdb_pandora_f2));
 	} else {
-		(void)usb_msc_eject_cdb(udev, 0, cdb_allow_removal,
-		    sizeof(cdb_allow_removal));
-		err = usb_msc_eject_cdb(udev, 0, cdb_stop_eject, sizeof(cdb_stop_eject));
+		/*
+		 * AIC8800DC sticks time out on an eject sent straight after enumeration
+		 * (usb_modeswitch fails the same way on Linux, where the usb-storage route
+		 * succeeds after the medium is ready). Poll TEST UNIT READY and retry the eject
+		 * for up to ~20 s; this runs in the USB explore context, like FreeBSD's u3g ejects.
+		 */
+		int attempt;
+		int start = ticks;
+
+		err = USB_ERR_TIMEOUT;
+		for (attempt = 0; attempt < 10 && (ticks - start) < 20 * hz; ++attempt) {
+			(void)usb_msc_eject_cdb(udev, 0, cdb_test_unit_ready,
+			    sizeof(cdb_test_unit_ready));
+			(void)usb_msc_eject_cdb(udev, 0, cdb_allow_removal,
+			    sizeof(cdb_allow_removal));
+			err = usb_msc_eject_cdb(udev, 0, cdb_stop_eject,
+			    sizeof(cdb_stop_eject));
+			if (err == 0)
+				break;
+			pause("aicms", hz);
+		}
+		if (attempt > 0)
+			printf("aic8800: %04x:%04x eject took %d attempt(s)\n", vid, pid,
+			    attempt + 1);
 	}
 	printf("aic8800: %04x:%04x storage mode, switch command %s\n", vid, pid,
 	    err == 0 ? "sent" : usbd_errstr(err));
