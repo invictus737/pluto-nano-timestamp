@@ -1,0 +1,10 @@
+Imported verbatim (no local changes in this commit) from
+  https://github.com/canmv-k230/rtsmart @ 2c870c85c3cfdab870bdfd1c2fba0fa7c7f4be5f
+    kernel/bsp/maix3/drivers/extdrv/aic8800/          -> aic8800/        (Apache-2.0, see aic8800/LICENSE.Apache-2.0, aic8800/NOTICE)
+    kernel/rt-thread/components/drivers/wlan/*.h      -> wlan/           (Apache-2.0)
+    kernel/rt-thread/components/drivers/wlan/offload/ -> wlan/offload/   (Apache-2.0; third_party/tinycrypt BSD-3-Clause)
+    kernel/bsp/maix3/components/CherryUSB/common/usb_def.h, usb_errno.h -> cherryusb/ (Apache-2.0, see cherryusb/LICENSE)
+Not imported: the SDIO transport, the WLAN offload control device and embedded hostapd, the
+RT-Thread WLAN management/lwIP layers (replaced by the RTEMS/libbsd shim in ../shim).
+Firmware: https://github.com/canmv-k230/aic8800_fw (vendor terms), fetched at build time by
+../fetch-firmware.sh, never committed.

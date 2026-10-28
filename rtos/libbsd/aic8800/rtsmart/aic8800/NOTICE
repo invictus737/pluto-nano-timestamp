@@ -1,0 +1,9 @@
+AIC8800 RT-Smart WLAN offload component
+=======================================
+
+Copyright (c) 2026, Canaan Bright Sight Co., Ltd
+
+The RT-Smart implementation and its protocol declarations are licensed under
+Apache-2.0. The `firmware/` directory is maintained as a separate repository.
+Its files are not covered by this component's Apache-2.0 license and remain
+subject to the applicable vendor terms.
