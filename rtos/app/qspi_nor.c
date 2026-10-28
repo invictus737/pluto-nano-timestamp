@@ -8,8 +8,11 @@
  *   TB (top/bottom protect), which U-Boot's `sf protect lock 0 100000` sets: every erase would
  *   be reported as failed;
  * - zqspi_blank() does not skip the fast-read dummy byte.
- * So only zqspi_init() (interrupt handler + transfer buffer) and zqspi_transfer() are used, with
- * the same buffer conventions as the driver's own static helpers, and the command layer below.
+ * - on the Pluto Nano its interrupt-driven zqspi_transfer() never completes (the QSPI interrupt
+ *   does not arrive): every transfer waited for the driver timeout, the JEDEC id read back as
+ *   000000 and boot lost 10 s.
+ * So the controller is driven here directly in I/O mode, polled, one byte per FIFO entry, with
+ * manual chip select - the way U-Boot's zynq_qspi driver uses it on this board.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -21,8 +24,6 @@
 #include <unistd.h>
 
 #include <rtems.h>
-#include <dev/spi/zynq-qspi-flash.h>
-#include <dev/spi/zynq-qspi-flash-defs.h>
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
 #define SLCR_ARM_PLL_CTRL 0xf8000100U
@@ -50,45 +51,76 @@
 #define PAGE 256u
 #define READ_CHUNK 2048u /* + 5 command bytes + 3 padding < ZQSPI_FLASH_BUFFER_SIZE */
 
-static zqspiflash dev;
+/* Zynq-7000 QSPI controller (TRM ch. 12), I/O mode */
+#define QSPI_BASE 0xe000d000U
+#define QSPI_CR (QSPI_BASE + 0x00)
+#define QSPI_ISR (QSPI_BASE + 0x04)
+#define QSPI_IDR (QSPI_BASE + 0x0c)
+#define QSPI_EN (QSPI_BASE + 0x14)
+#define QSPI_RXD (QSPI_BASE + 0x20)
+#define QSPI_TXD1 (QSPI_BASE + 0x80)
+#define QSPI_LQSPI_CR (QSPI_BASE + 0xa0)
+#define CR_IFMODE (1U << 31)    /* flash interface mode */
+#define CR_HOLDB_DR (1U << 19)  /* drive HOLD#/WP# high */
+#define CR_SSFORCE (1U << 14)   /* manual chip select */
+#define CR_PCS (1U << 10)       /* chip select line, 1 = deasserted */
+#define CR_FIFO_32 (3U << 6)
+#define CR_BAUD_SHIFT 3
+#define CR_MSTREN (1U << 0)
+#define ISR_RXNEMPTY (1U << 4)
+#define POLL_LIMIT 200000u      /* ~ms at most per byte; a stuck controller fails, not hangs */
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int ready;
 static uint32_t jedec;
 static uint8_t verify_buf[PAGE];
+static uint32_t baud_field = 7;
 
-/* one SPI transaction: cmd bytes, then tx bytes, then rx_len bytes clocked in */
+static void controller_setup(void)
+{
+  REG32(QSPI_EN) = 0;
+  REG32(QSPI_LQSPI_CR) &= ~(1U << 31); /* linear (XIP) mode off */
+  REG32(QSPI_IDR) = 0x7fU;              /* polled: no interrupts */
+  REG32(QSPI_CR) = CR_IFMODE | CR_HOLDB_DR | CR_SSFORCE | CR_PCS | CR_FIFO_32 |
+                   (baud_field << CR_BAUD_SHIFT) | CR_MSTREN;
+  REG32(QSPI_EN) = 1;
+  while (REG32(QSPI_ISR) & ISR_RXNEMPTY) {
+    (void)REG32(QSPI_RXD);
+  }
+}
+
+static int byte_xfer(uint8_t out, uint8_t *in)
+{
+  REG32(QSPI_TXD1) = out; /* 1-byte FIFO entry, auto start */
+  for (unsigned i = 0; (REG32(QSPI_ISR) & ISR_RXNEMPTY) == 0; ++i) {
+    if (i > POLL_LIMIT) {
+      return -1;
+    }
+  }
+  uint32_t v = REG32(QSPI_RXD);
+  if (in) {
+    *in = (uint8_t)(v >> 24); /* a 1-byte entry lands in the top byte */
+  }
+  return 0;
+}
+
+/* one SPI transaction under one chip select: cmd bytes, tx bytes, then rx_len bytes clocked in */
 static int xfer(const uint8_t *cmd, size_t cmd_len, const uint8_t *tx, size_t tx_len, uint8_t *rx,
                 size_t rx_len)
 {
-  zqspi_transfer_buffer *b = &dev.buf;
-  size_t len = cmd_len + tx_len + rx_len;
-  if (b->buffer == NULL || len == 0 || len + 4 > b->size) {
-    return -1;
+  int rc = 0;
+  REG32(QSPI_CR) &= ~CR_PCS;
+  for (size_t i = 0; rc == 0 && i < cmd_len; ++i) {
+    rc = byte_xfer(cmd[i], NULL);
   }
-  /* zqspi_transfer_buffer_clear() + _set_length(): right-aligned in whole 32-bit words */
-  b->length = len;
-  b->padding = (4 - (len & 3)) & 3;
-  b->in = b->padding;
-  b->out = b->padding;
-  memcpy(b->buffer + b->in, cmd, cmd_len);
-  b->in += cmd_len;
-  if (tx_len) {
-    memcpy(b->buffer + b->in, tx, tx_len);
-    b->in += tx_len;
+  for (size_t i = 0; rc == 0 && i < tx_len; ++i) {
+    rc = byte_xfer(tx[i], NULL);
   }
-  if (rx_len) {
-    memset(b->buffer + b->in, 0, rx_len);
-    b->in += rx_len;
+  for (size_t i = 0; rc == 0 && i < rx_len; ++i) {
+    rc = byte_xfer(0xff, &rx[i]);
   }
-  b->trans_dir = rx_len ? ZQSPI_FLASH_RX_TRANS : ZQSPI_FLASH_TX_TRANS;
-  b->command_len = (uint32_t)cmd_len;
-  if (zqspi_transfer(b, &dev.initialised) != ZQSPI_FLASH_NO_ERROR) {
-    return -1;
-  }
-  if (rx_len) {
-    memcpy(rx, b->buffer + b->padding + cmd_len + tx_len, rx_len);
-  }
-  return 0;
+  REG32(QSPI_CR) |= CR_PCS;
+  return rc;
 }
 
 static int cmd_only(uint8_t op)
@@ -98,13 +130,7 @@ static int cmd_only(uint8_t op)
 
 static int read_reg(uint8_t op, uint8_t *v)
 {
-  uint8_t two[2];
-  /* two bytes clocked like the driver's zqspi_read_register(); the status repeats */
-  if (xfer(&op, 1, NULL, 0, two, 2) != 0) {
-    return -1;
-  }
-  *v = two[1];
-  return 0;
+  return xfer(&op, 1, NULL, 0, v, 1);
 }
 
 static void addr4(uint8_t *c, uint8_t op, uint32_t a)
@@ -168,9 +194,8 @@ static void set_sclk(void)
     for (n = 0; n < 7 && ref / (2ULL << n) > SCLK_MAX_HZ; ++n) {
     }
   }
-  uint32_t cr = qspi_reg_read(ZQSPI_QSPI_REG_CONFIG);
-  cr = (cr & ~(7U << 3)) | (n << 3);
-  qspi_reg_write(ZQSPI_QSPI_REG_CONFIG, cr);
+  baud_field = n;
+  REG32(QSPI_CR) = (REG32(QSPI_CR) & ~(7U << CR_BAUD_SHIFT)) | (n << CR_BAUD_SHIFT);
   printf("qspi: ref %llu Hz, sclk %llu Hz\n", (unsigned long long)ref,
          (unsigned long long)(ref ? ref / (2ULL << n) : 0));
 }
@@ -188,18 +213,17 @@ int qspi_nor_init(void)
     pthread_mutex_unlock(&lock);
     return -1;
   }
-  zqspi_error e = zqspi_init(&dev);
-  if (e == ZQSPI_FLASH_RTEMS_INTR || dev.buf.buffer == NULL) {
-    printf("qspi: driver init failed (%d)\n", (int)e);
-    pthread_mutex_unlock(&lock);
-    return -1;
+  controller_setup();
+  set_sclk();
+  {
+    uint8_t op = 0x9f, id[3] = {0, 0, 0};
+    if (xfer(&op, 1, NULL, 0, id, 3) != 0) {
+      printf("qspi: controller does not answer, flash not used\n");
+      pthread_mutex_unlock(&lock);
+      return -1;
+    }
+    jedec = ((uint32_t)id[0] << 16) | ((uint32_t)id[1] << 8) | id[2];
   }
-  /* the first RDID ran at the driver's ref/4: slow down and identify again */
-  if (dev.initialised) {
-    set_sclk();
-  }
-  dev.jedec_id = 0;
-  (void)zqspi_readid(&dev, &jedec); /* INVALID_DEVICE for the W25Q256 (not in its table) */
   if ((jedec >> 16) != 0xef || (jedec & 0xff) != 0x19) {
     printf("qspi: unexpected JEDEC id %06lx, flash not used\n", (unsigned long)jedec);
     pthread_mutex_unlock(&lock);
