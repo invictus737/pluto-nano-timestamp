@@ -75,7 +75,7 @@ jobs:
         id: nsrc
         continue-on-error: true
         uses: actions/checkout@v4
-        with: { repository: invictus737/nexus-bs2-src, ref: rtos, path: nexus, ssh-key: '${{ secrets.NEXUS_SRC_KEY }}' }
+        with: { repository: invictus737/nexus-bs2-src, ref: Nexus-BS-2.0_RTOS, path: nexus, ssh-key: '${{ secrets.NEXUS_SRC_KEY }}' }
       - name: nexus2 on RTEMS (type check report)
         if: steps.nsrc.outcome == 'success'
         continue-on-error: true
