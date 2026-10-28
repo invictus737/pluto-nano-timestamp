@@ -48,6 +48,12 @@ RAM-boot first through `run dfu_ram`; flashing is a separate, explicit step.
 | M5b | Station roles kept as in the Linux firmware, same U-Boot env keys (`operating_mode` master/slave/light, `usb_mode` peripheral/auto/host, `xo_correction`): **master** = full nexus2 on the radio, **light** = nexus2 light mode, **slave** = SDR for an external NexusBS: iiod-compatible control (ad9361-phy/cf-ad9361 attributes) + sdr-ip-gadget timestamped streaming so the host's SoapyPlutoSDR (`direct=1,timestamp_every=...`) works unchanged; over IP (USB-Ethernet/Wi-Fi) first, then USB device mode (ChipIdea UDC: CDC-NCM + the existing gadget layout) | each role selected by env and proven: master/light on air, slave probed by SoapySDRUtil from a Pi |
 | M6 | QSPI layout: two image slots A/B (whole RTEMS+nexus2 image, update written to the inactive slot over SFTP/dashboard, hash check, switch, automatic fallback) + JFFS2 data partition (nexus2.toml, calibration, SSH keys, logs); bank 0 restored before any reset; Linux kept for recovery | cold boot to RF in < 3 s, update + rollback proven |
 
+## Decisions
+
+- 2026-10-28 (user): licensing is not a constraint for now. The AIC8800 Wi-Fi/BT driver is ported
+  from the GPL-2.0 Linux driver and SSH uses wolfSSH/wolfSSL; the licence combination is to be
+  revisited before any distribution.
+
 ## Risks
 
 - Rust std on RTEMS is tier 3 and "not fully tested".
