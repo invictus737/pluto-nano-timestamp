@@ -53,11 +53,29 @@ usb_msc_eject_cdb(struct usb_device *udev, uint8_t iface_index,
 	bbb_detach(sc);
 	return (err);
 }
+
+usb_error_t
+usb_msc_cmd_in(struct usb_device *udev, uint8_t iface_index,
+    const void *cdb, size_t cdb_len, void *data, size_t data_len)
+{
+	struct bbb_transfer *sc;
+	usb_error_t err;
+
+	if (cdb_len == 0 || cdb_len > CBWCDBLENGTH || data_len == 0)
+		return (USB_ERR_INVAL);
+	sc = bbb_attach(udev, iface_index, UICLASS_MASS);
+	if (sc == NULL)
+		return (USB_ERR_INVAL);
+	err = bbb_command_start(sc, DIR_IN, 0, data, data_len,
+	    __DECONST(void *, cdb), cdb_len, USB_MS_HZ);
+	bbb_detach(sc);
+	return (err);
+}
 """
 
 
 def msctest_c(s):
-    return s if "usb_msc_eject_cdb" in s else s + EJECT_CDB
+    return s if "usb_msc_cmd_in" in s else s + EJECT_CDB
 
 
 def msctest_h(s):
@@ -66,7 +84,9 @@ def msctest_h(s):
     anchor = "usb_error_t usb_msc_auto_quirk("
     assert s.count(anchor) == 1
     proto = ("usb_error_t usb_msc_eject_cdb(struct usb_device *udev,\n"
-             "\t    uint8_t iface_index, const void *cdb, size_t cdb_len);\n")
+             "\t    uint8_t iface_index, const void *cdb, size_t cdb_len);\n"
+             "usb_error_t usb_msc_cmd_in(struct usb_device *udev, uint8_t iface_index,\n"
+             "\t    const void *cdb, size_t cdb_len, void *data, size_t data_len);\n")
     return s.replace(anchor, proto + anchor)
 
 
