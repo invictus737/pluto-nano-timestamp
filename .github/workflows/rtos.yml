@@ -44,7 +44,14 @@ jobs:
       - name: RTEMS kernel (Pluto BSP) + libbsd with the Zynq EHCI glue
         if: steps.bsp.outputs.cache-hit != 'true'
         run: sudo mkdir -p $RTEMS_BSP_PREFIX && sudo chown runner $RTEMS_BSP_PREFIX && rtos/ci/bsp.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX
+      - name: Rust nightly with rust-src (build-std)
+        run: rustup toolchain install nightly --profile minimal --component rust-src && rustc +nightly -V
+      - name: Rust std probe (M3, armv7-rtems-eabihf)
+        id: rust
+        continue-on-error: true
+        run: rtos/rust-probe/build.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/librust.a
       - name: Image
+        env: { RUST_LIB: '${{ github.workspace }}/librust.a' }
         run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
       - name: QEMU smoke test (xilinx-zynq-a9, console on UART1)
         continue-on-error: true

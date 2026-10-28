@@ -193,6 +193,19 @@ static void *net_watch(void *arg)
   return NULL;
 }
 
+#ifdef NEXUS_RUST
+int nexus_rust_main(void);
+
+static void *rust_entry(void *arg)
+{
+  (void)arg;
+  printf("rust: start at %.3f s\n", uptime_s());
+  int rc = nexus_rust_main();
+  printf("rust: main returned %d at %.3f s\n", rc, uptime_s());
+  return NULL;
+}
+#endif
+
 static void spawn(void *(*fn)(void *), int prio, size_t stack)
 {
   pthread_attr_t at;
@@ -228,6 +241,9 @@ static void Init(rtems_task_argument arg)
 
   spawn(net_watch, 5, 8192);
   spawn(http_status, 5, 16384);
+#ifdef NEXUS_RUST
+  spawn(rust_entry, 5, 256 * 1024);
+#endif
 
   sc = rtems_shell_init("SHLL", 32 * 1024, 1, CONSOLE_DEVICE_NAME, false, true, NULL);
   assert(sc == RTEMS_SUCCESSFUL);

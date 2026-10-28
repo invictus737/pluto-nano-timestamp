@@ -1,0 +1,5 @@
+[build]
+target = "armv7-rtems-eabihf"
+
+[unstable]
+build-std = ["std", "panic_abort"]

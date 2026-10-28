@@ -1,0 +1,16 @@
+[package]
+name = "nexus-rust-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "M3 probe: Rust std (threads, time, UDP/TCP sockets) on RTEMS armv7-rtems-eabihf"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+lto = true
+debug = 1

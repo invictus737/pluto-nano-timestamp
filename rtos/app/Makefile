@@ -10,6 +10,11 @@ SIZE := $(RTEMS_TOOLS)/bin/arm-rtems6-size
 CFLAGS := $(shell PKG_CONFIG_PATH=$(RTEMS_PREFIX)/lib/pkgconfig pkg-config --cflags $(PKG)) -O2 -g -Wall -Wno-unused-result
 LDFLAGS := $(shell PKG_CONFIG_PATH=$(RTEMS_PREFIX)/lib/pkgconfig pkg-config --libs $(PKG))
 B := build
+# Optional Rust static library (M3 probe, later nexus2): adds -DNEXUS_RUST and links it.
+RUST_LIB ?=
+ifneq ($(RUST_LIB),)
+CFLAGS += -DNEXUS_RUST
+endif
 
 all: $(B)/nexus-rtos.bin
 
@@ -19,8 +24,8 @@ $(B)/main.o: main.c | $(B)
 $(B)/platform.o: platform.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o
-	$(CC) $(CFLAGS) $^ -o $@ -Wl,--start-group -lbsd -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
+$(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(RUST_LIB)
+	$(CC) $(CFLAGS) $^ -o $@ -Wl,--start-group $(RUST_LIB) -lbsd -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
 	$(SIZE) $@
 
 $(B)/nexus-rtos.bin: $(B)/nexus-rtos.elf
