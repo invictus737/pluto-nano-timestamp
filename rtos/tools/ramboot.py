@@ -25,6 +25,7 @@ ap.add_argument("--config", default="config-1")
 ap.add_argument("--tty", default=None)
 ap.add_argument("--log", default="ramboot.log")
 ap.add_argument("--watch", type=int, default=60)
+ap.add_argument("--wait-boot", type=int, default=180, help="seconds to wait for U-Boot after asking for a power cycle")
 a = ap.parse_args()
 
 tty = a.tty or next(iter(sorted(glob.glob("/dev/cu.usbserial-*") + glob.glob("/dev/cu.wchusbserial*"))), None)
@@ -94,8 +95,8 @@ else:
     print("\n== no shell prompt (login prompt or silent): power-cycle the Pluto now")
 
 if "NANO>" not in tail:
-    if not wait_for(r"U-Boot 20", 180):
-        sys.exit("\nno U-Boot banner within 180 s")
+    if not wait_for(r"U-Boot 20", a.wait_boot):
+        sys.exit(f"\nno U-Boot banner within {a.wait_boot} s")
     # stop autoboot / menu, then leave the menu with ESC to the NANO> prompt
     wait_for(r"NexusBS|autoboot|Hit any key|menu", 15, every=" ", tick=0.1)
     if not wait_for(r"NANO>", 30, every="\x1b", tick=0.3):
