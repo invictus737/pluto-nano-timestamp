@@ -19,10 +19,10 @@ SRCS="Device.cpp Factory.cpp Registry.cpp Types.cpp NullDevice.cpp Logger.cpp Er
       FactoryC.cpp LoggerC.cpp TimeC.cpp ErrorsC.cpp FormatsC.cpp ConvertersC.cpp"
 mkdir -p "$W/o"
 for f in $SRCS; do
-  arm-rtems6-g++ $CFLAGS -O2 -std=c++14 -DSOAPY_SDR_DLL=0 -I"$S/include" -I"$S/lib" -c "$S/lib/$f" -o "$W/o/${f%.cpp}.o"
+  arm-rtems6-g++ $CFLAGS -O2 -std=gnu++14 -DSOAPY_SDR_DLL=0 -I"$S/include" -I"$S/lib" -c "$S/lib/$f" -o "$W/o/${f%.cpp}.o"
 done
-arm-rtems6-g++ $CFLAGS -O2 -std=c++14 -I"$S/include" -c "$W/Version.cpp" -o "$W/o/Version.o"
-arm-rtems6-g++ $CFLAGS -O2 -std=c++14 -I"$S/include" -c "$HERE/Modules_rtems.cpp" -o "$W/o/Modules.o"
+arm-rtems6-g++ $CFLAGS -O2 -std=gnu++14 -I"$S/include" -c "$W/Version.cpp" -o "$W/o/Version.o"
+arm-rtems6-g++ $CFLAGS -O2 -std=gnu++14 -I"$S/include" -c "$HERE/Modules_rtems.cpp" -o "$W/o/Modules.o"
 mkdir -p "$OUT/lib" "$OUT/include"
 rm -f "$OUT/lib/libSoapySDR.a"; arm-rtems6-ar rcsD "$OUT/lib/libSoapySDR.a" "$W"/o/*.o
 cp -R "$S/include/SoapySDR" "$OUT/include/"

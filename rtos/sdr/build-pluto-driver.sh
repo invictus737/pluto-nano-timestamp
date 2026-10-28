@@ -41,7 +41,7 @@ for f in pluto_framing.c pluto_ring.c pluto_dma.c pluto_rt.c pluto_hw.c platform
   arm-rtems6-gcc $CFLAGS -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE "${INC[@]}" \
     -c "$D/$f" -o "$W/o/${f%.c}.o"
 done
-arm-rtems6-g++ $CFLAGS -O2 -g -std=c++14 -Wall -Wextra -Wno-unused-parameter \
+arm-rtems6-g++ $CFLAGS -O2 -g -std=gnu++14 -Wall -Wextra -Wno-unused-parameter \
   -I"$D" -I"$SOAPY/include" -c "$D/SoapyPlutoRtems.cpp" -o "$W/o/SoapyPlutoRtems.o"
 
 mkdir -p "$OUT/lib" "$OUT/include"

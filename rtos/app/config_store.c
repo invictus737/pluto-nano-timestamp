@@ -188,6 +188,12 @@ static int file_exists(const char *path)
 
 /* ---- JFFS2 over the QSPI nvmfs region ---- */
 
+/* The JFFS2 file system type is registered at run time (no CONFIGURE_FILESYSTEM_JFFS2), so the
+ * configuration confdefs would provide comes from here. */
+const rtems_jffs2_config jffs2_config = {
+  .delayed_write_priority = RTEMS_JFFS2_DELAYED_WRITE_TASK_PRIORITY_DEFAULT,
+};
+
 static int fc_read(rtems_jffs2_flash_control *fc, uint32_t off, unsigned char *buf, size_t n)
 {
   (void)fc;
