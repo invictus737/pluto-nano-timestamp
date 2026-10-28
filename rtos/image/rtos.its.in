@@ -50,7 +50,7 @@
 			description = "Nexus-BS RTOS + bitstream";
 			kernel = "rtems-1";
 			fdt = "fdt-1";
-			loadables = "fpga-1";
+			fpga = "fpga-1";
 		};
 	};
 };
