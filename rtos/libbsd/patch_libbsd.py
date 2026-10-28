@@ -90,7 +90,27 @@ def msctest_h(s):
     return s.replace(anchor, proto + anchor)
 
 
+QUIRK_MARK = "/* AIC8800 driver CD (Pluto RTOS) */"
+
+
+def quirk_c(s):
+    """AIC8800 driver-CD IDs: no MSC auto-quirk probe (its GET_MAX_LUN wedges the DC stick before
+    the mode switch can run) and no umass, as usb-storage US_FL_IGNORE_DEVICE in the v0.39 image."""
+    if QUIRK_MARK in s:
+        return s
+    anchor = "static struct usb_quirk_entry usb_quirks[USB_DEV_QUIRKS_MAX] = {\n"
+    assert s.count(anchor) == 1, "anchor not unique in usb_quirk.c"
+    rows = "\t" + QUIRK_MARK + "\n"
+    for pid in (0x5721, 0x5722, 0x5723, 0x5724, 0x5725, 0x5726, 0x5727, 0x572a, 0x572c, 0x572f):
+        rows += ("\tUSB_QUIRK_VP(0xa69c, 0x%04x, 0x0000, 0xffff, UQ_MSC_IGNORE, UQ_MSC_NO_GETMAXLUN,\n"
+                 "\t    UQ_MSC_NO_INQUIRY, UQ_MSC_NO_TEST_UNIT_READY, UQ_MSC_NO_SYNC_CACHE),\n" % pid)
+    rows += ("\tUSB_QUIRK_VP(0x1111, 0x1111, 0x0000, 0xffff, UQ_MSC_NO_GETMAXLUN, UQ_MSC_NO_INQUIRY,\n"
+             "\t    UQ_MSC_NO_TEST_UNIT_READY, UQ_MSC_NO_SYNC_CACHE),\n")
+    return s.replace(anchor, anchor + rows)
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
+edit("freebsd/sys/dev/usb/quirk/usb_quirk.c", quirk_c)
 print("libbsd patched for the Pluto")

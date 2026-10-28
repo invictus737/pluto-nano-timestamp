@@ -81,8 +81,28 @@ aicms_get_max_lun(struct usb_device *udev, uint8_t ifno)
 	return (usbd_do_request(udev, NULL, &req, &lun));
 }
 
+/*
+ * What works on this board is what the v0.39 Linux image does: usb-storage ignores the stick
+ * (US_FL_IGNORE_DEVICE) and usb_modeswitch sends StandardEject only - two bulk-only CBWs, no class
+ * request. The DC stick does not answer GET_MAX_LUN (control timeout) and is unusable after it,
+ * so the RT-Smart vendor sequence (GET_MAX_LUN, probe, FD..F3/F2) is only the fallback, and only
+ * for sticks that rejected the eject.
+ */
 static usb_error_t
-aicms_switch(struct usb_device *udev, uint8_t ifno, uint16_t vid, uint16_t pid)
+aicms_eject(struct usb_device *udev)
+{
+	usb_error_t err;
+
+	(void)usb_msc_eject_cdb(udev, 0, cdb_allow_removal, sizeof(cdb_allow_removal));
+	err = usb_msc_eject_cdb(udev, 0, cdb_stop_eject, sizeof(cdb_stop_eject));
+	if (err != 0)
+		err = usb_msc_eject_cdb(udev, 0, cdb_stop_eject_immed,
+		    sizeof(cdb_stop_eject_immed));
+	return (err);
+}
+
+static usb_error_t
+aicms_vendor(struct usb_device *udev, uint8_t ifno, uint16_t vid, uint16_t pid)
 {
 	static uint8_t data[512];
 	usb_error_t err;
@@ -105,24 +125,31 @@ aicms_switch(struct usb_device *udev, uint8_t ifno, uint16_t vid, uint16_t pid)
 			(void)usb_msc_cmd_in(udev, 0, read10, sizeof(read10), data, bs);
 	}
 	err = usb_msc_cmd_in(udev, 0, cdb_pandora_f3, sizeof(cdb_pandora_f3), data, 5);
-	if (err == 0) {
+	if (err == 0)
 		err = usb_msc_eject_cdb(udev, 0, cdb_pandora_f2, sizeof(cdb_pandora_f2));
+	if (err == 0) {
+		printf("aic8800: %04x:%04x vendor switch accepted (id %02x%02x%02x%02x%02x)\n",
+		    vid, pid, data[0], data[1], data[2], data[3], data[4]);
+		pause("aicms", hz / 2 > 0 ? hz / 2 : 1); /* settle, then re-enumerate */
+		usbd_start_re_enumerate(udev);
+	}
+	return (err);
+}
+
+static usb_error_t
+aicms_switch(struct usb_device *udev, uint8_t ifno, uint16_t vid, uint16_t pid)
+{
+	usb_error_t err;
+
+	/* 1111:1111 is a shared placeholder ID: never eject a stranger's storage */
+	if (vid != PANDORA_VID) {
+		err = aicms_eject(udev);
 		if (err == 0) {
-			printf("aic8800: %04x:%04x vendor switch accepted (id %02x%02x%02x%02x%02x)\n",
-			    vid, pid, data[0], data[1], data[2], data[3], data[4]);
-			pause("aicms", hz / 2 > 0 ? hz / 2 : 1); /* settle, then re-enumerate */
-			usbd_start_re_enumerate(udev);
+			printf("aic8800: %04x:%04x StandardEject accepted\n", vid, pid);
 			return (0);
 		}
 	}
-	if (vid == PANDORA_VID)
-		return (err); /* 1111:1111 is shared: never eject a stranger's storage */
-	(void)usb_msc_eject_cdb(udev, 0, cdb_allow_removal, sizeof(cdb_allow_removal));
-	err = usb_msc_eject_cdb(udev, 0, cdb_stop_eject, sizeof(cdb_stop_eject));
-	if (err != 0)
-		err = usb_msc_eject_cdb(udev, 0, cdb_stop_eject_immed,
-		    sizeof(cdb_stop_eject_immed));
-	return (err);
+	return (aicms_vendor(udev, ifno, vid, pid));
 }
 
 static int
@@ -155,8 +182,8 @@ aicms_autoinst(void *arg, struct usb_device *udev, struct usb_attach_arg *uaa)
 	err = aicms_switch(udev, iface->idesc->bInterfaceNumber, vid, pid);
 	printf("aic8800: %04x:%04x storage mode, switch command %s\n", vid, pid,
 	    err == 0 ? "sent" : usbd_errstr(err));
-	if (err == 0)
-		uaa->dev_state = UAA_DEV_EJECTING;
+	/* as US_FL_IGNORE_DEVICE on Linux: umass never gets the driver CD */
+	uaa->dev_state = UAA_DEV_EJECTING;
 }
 
 static int

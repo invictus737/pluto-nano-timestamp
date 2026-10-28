@@ -21,7 +21,7 @@ else
   echo "kernel: cached"
 fi
 LB=$WORK/rtems-libbsd-fb14-$VER
-PATCHED="libbsd.py freebsd/sys/dev/usb/usb_msctest.c freebsd/sys/dev/usb/usb_msctest.h"
+PATCHED="libbsd.py freebsd/sys/dev/usb/usb_msctest.c freebsd/sys/dev/usb/usb_msctest.h freebsd/sys/dev/usb/quirk/usb_quirk.c"
 INI_SUM=$(sha256sum "$HERE/libbsd/pluto.ini" | cut -c1-16)
 if [ ! -f "$LB/.pluto-configured" ]; then
   echo "libbsd: fresh tree"
@@ -29,7 +29,11 @@ if [ ! -f "$LB/.pluto-configured" ]; then
   for f in $PATCHED; do mkdir -p "$LB/.pristine/$(dirname "$f")"; cp -p "$LB/$f" "$LB/.pristine/$f"; done
 else
   echo "libbsd: cached tree, incremental build"
-  for f in $PATCHED; do cp "$LB/.pristine/$f" "$LB/$f"; done
+  # a file patched for the first time has no pristine copy yet: it is still unpatched
+  for f in $PATCHED; do
+    if [ -f "$LB/.pristine/$f" ]; then cp "$LB/.pristine/$f" "$LB/$f"
+    else mkdir -p "$LB/.pristine/$(dirname "$f")"; cp -p "$LB/$f" "$LB/.pristine/$f"; fi
+  done
 fi
 "$HERE/libbsd/aic8800/fetch-firmware.sh" "$WORK/aicwf_fw_data.c"
 "$HERE/libbsd/apply.sh" "$LB" >/dev/null
