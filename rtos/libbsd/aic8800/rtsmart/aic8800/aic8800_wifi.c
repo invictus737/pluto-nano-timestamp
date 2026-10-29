@@ -4201,6 +4201,10 @@ static rt_err_t aic_tcp_ack_init(struct aic8800_context *context)
 #endif
 
 #ifdef AICWF_RTEMS
+/* EAPOL runs on its own queue: sys_work also runs periodic firmware commands (temperature,
+ * station loss) that can each wait 5 s for a confirmation and would starve the handshake */
+static struct rt_workqueue *aic_eapol_queue;
+
 static void aic_eapol_work(struct rt_work *work, void *work_data)
 {
     struct aic8800_context *context = work_data;
@@ -4249,7 +4253,10 @@ static void aic_eapol_flush(struct aic8800_context *context)
     {
         return;
     }
-    rt_work_cancel_sync(&context->eapol_work);
+    if (aic_eapol_queue)
+        rt_workqueue_cancel_work_sync(aic_eapol_queue, &context->eapol_work);
+    else
+        rt_work_cancel_sync(&context->eapol_work);
     for (index = 0; index < sizeof(context->eapol_queue) /
                             sizeof(context->eapol_queue[0]); index++)
     {
@@ -4317,7 +4324,8 @@ static rt_bool_t aic_eapol_defer(struct aic8800_context *context,
         LOG_W("EAPOL frame dropped: deferral queue full");
         return RT_TRUE;
     }
-    if (rt_work_submit(&context->eapol_work, 0) != RT_EOK)
+    if ((aic_eapol_queue ? rt_workqueue_submit_work(aic_eapol_queue, &context->eapol_work, 0)
+                         : rt_work_submit(&context->eapol_work, 0)) != RT_EOK)
     {
         LOG_W("EAPOL work submit failed");
     }
@@ -10676,6 +10684,8 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
     context->station_loss_work_initialized = RT_TRUE;
 #ifdef AICWF_RTEMS
     rt_work_init(&context->eapol_work, aic_eapol_work, context);
+    if (!aic_eapol_queue)
+        aic_eapol_queue = rt_workqueue_create("aic-eapol", 8192, RT_SYSTEM_WORKQUEUE_PRIORITY - 1);
     context->eapol_head = 0;
     context->eapol_count = 0;
     context->eapol_work_initialized = RT_TRUE;
