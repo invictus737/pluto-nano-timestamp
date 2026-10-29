@@ -318,7 +318,7 @@ static void *zynq_usb_irq_thread(void *arg)
 {
     struct usbh_bus *bus = arg;
     uint32_t last_alist = 0, stuck_alist = 0, last_port_kick = 0, last_log = 0;
-    uint32_t logged_lost = 0, logged_late = 0;
+    uint32_t logged_lost = 0, logged_late = 0, logged_kicks = 0;
     rtems_interval period = RTEMS_MILLISECONDS_TO_TICKS(NEXUS_USB_POLL_MS);
 
     if (period == 0) {
@@ -363,6 +363,8 @@ static void *zynq_usb_irq_thread(void *arg)
             USBH_IRQHandler(bus->hcd.hcd_id);
         }
         (void)usbh_ehci_iaa_watchdog(bus->hcd.hcd_id);
+        /* a parked asynchronous engine: schedule off/on with the ASS handshake (patches/0006) */
+        (void)usbh_ehci_async_watchdog(bus->hcd.hcd_id);
 
         /* async engine parked on one QH (diagnostic only: ASYNCLISTADDR frozen while busy) */
         {
@@ -394,8 +396,18 @@ static void *zynq_usb_irq_thread(void *arg)
         }
 
         /* IAA watchdog events: one line per 10 s at most (never in the per-transfer path) */
-        if ((st->lost != logged_lost || st->late != logged_late) &&
+        if ((st->lost != logged_lost || st->late != logged_late || st->async_kicks != logged_kicks) &&
             (uint32_t)(now - last_log) >= 10000000U) {
+            if (st->async_kicks != logged_kicks) {
+                printf("usbh: async engine restarted %lu time(s) (never-fetched qTD %lu, doorbell "
+                       "unanswered %lu, no ASS handshake %lu; before the last: USBCMD 0x%08lx "
+                       "USBSTS 0x%08lx ASYNCLISTADDR 0x%08lx)\n",
+                       (unsigned long)st->async_kicks, (unsigned long)st->async_kick_unfetched,
+                       (unsigned long)st->async_kick_iaad, (unsigned long)st->async_kick_no_handshake,
+                       (unsigned long)st->kick_cmd, (unsigned long)st->kick_sts,
+                       (unsigned long)st->kick_async);
+                logged_kicks = st->async_kicks;
+            }
             printf("usbh: IAA watchdog: %lu lost, %lu late of %lu cycles, %lu QHs quarantined "
                    "(%lu released, doorbell stuck %lu) (USBCMD 0x%08lx USBSTS 0x%08lx "
                    "ASYNCLISTADDR 0x%08lx, longest cycle %lu us)\n",
@@ -536,6 +548,11 @@ int nexus_cherryusb_shell(int argc, char **argv)
                (unsigned long)st->stuck_ends, (unsigned long)st->stream_creates,
                (unsigned long)st->stream_appends, (unsigned long)st->stream_teardowns,
                (unsigned long)st->ok_count);
+        printf("async engine restarts %lu (never-fetched qTD %lu, doorbell unanswered %lu, no ASS "
+               "handshake %lu; kick after %u us, 0 = off), bulk NAK reload %u\n",
+               (unsigned long)st->async_kicks, (unsigned long)st->async_kick_unfetched,
+               (unsigned long)st->async_kick_iaad, (unsigned long)st->async_kick_no_handshake,
+               (unsigned)CONFIG_USB_EHCI_ASYNC_KICK_US, (unsigned)CONFIG_USB_EHCI_BULK_RL_HS);
     }
     if (aicwf_cherry_stats) {
         aicwf_cherry_stats();

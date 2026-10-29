@@ -7,9 +7,10 @@
  *    driver's own K230-layout class tables (as the shim did) and runs the matching RT-Smart
  *    connect() on the hub thread, then brings the station up (aicwf_wlan_attach_done()).
  *    Storage-mode sticks go to aicwf_cherry_modeswitch.c.
- *  - URBs: every endpoint has a software queue. Bulk IN URBs of at most 16 KiB stay armed in
- *    the controller as Linux keeps them (aicwf_usb.c: 20 data + 100 message RX URBs): up to
- *    NX_IN_URBS_PER_EP per endpoint, chained on one EHCI stream QH (USBH_EHCI_URB_STREAM, the
+ *  - URBs: every endpoint has a software queue. With NX_IN_URBS_PER_EP > 1 (usb_config.h,
+ *    default 1) bulk IN URBs of at most 16 KiB stay armed in the controller as Linux keeps
+ *    them (aicwf_usb.c: 20 data + 100 message RX URBs): up to NX_IN_URBS_PER_EP per endpoint,
+ *    chained on one EHCI stream QH (USBH_EHCI_URB_STREAM, the
  *    data toggle stays in its overlay). Separate QHs per URB cannot do this safely: each would
  *    carry its own toggle and the device's next packet would be discarded as a repeat by the
  *    other one. Any other transfer has one URB in the controller per endpoint; the next one is
@@ -67,9 +68,9 @@ int aicwf_cherry_modeswitch_connect(struct usbh_hubport *hport, uint8_t intf);
 #define NX_LINE      32U
 #define NX_SYNC_GRACE_MS 2000
 #define NX_START_WAIT_MS 60000
-/* bulk IN URBs kept in the controller per endpoint (EHCI stream QH); at least 4 */
+/* bulk IN URBs kept in the controller per endpoint (usb_config.h; > 1: on an EHCI stream QH) */
 #ifndef NX_IN_URBS_PER_EP
-#define NX_IN_URBS_PER_EP 8
+#define NX_IN_URBS_PER_EP 1
 #endif
 #if NX_IN_URBS_PER_EP < 1
 #error NX_IN_URBS_PER_EP must be at least 1

@@ -79,7 +79,7 @@
  */
 #define CONFIG_USB_EHCI_HCCR_OFFSET     (0x100)
 #define CONFIG_USB_EHCI_FRAME_LIST_SIZE 1024
-/* one QH per URB in flight; aicwf_cherry.c keeps one URB per endpoint in the controller */
+/* one QH per URB in flight (aicwf_cherry.c: one URB per endpoint, or one stream QH per bulk IN) */
 #define CONFIG_USB_EHCI_QH_NUM          24
 #define CONFIG_USB_EHCI_QTD_NUM         96
 #define CONFIG_USB_EHCI_ITD_NUM         4
@@ -98,6 +98,19 @@
 void usb_osal_dma_barrier(void);
 #define CONFIG_USB_EHCI_DMA_WMB()          usb_osal_dma_barrier()
 #define CONFIG_USB_EHCI_IAA_WATCHDOG_US    10000
+/*
+ * NAK count reload of high-speed bulk QHs (patches/0006): 0 as stock CherryUSB and every image
+ * whose Wi-Fi worked (up to rtos-ci-82); 4 is Linux qh_make() (EHCI_TUNE_RL_HS), in the
+ * driver since patches/0005 (build 84) and not proven on this core.
+ */
+#define CONFIG_USB_EHCI_BULK_RL_HS         0
+/*
+ * Asynchronous engine watchdog (patches/0006): a QH whose next qTD stays active but never
+ * fetched, or a doorbell unanswered, for this long restarts the asynchronous schedule (ASE
+ * off/on with the ASS handshake), as the stock usbh_kill_urb() did by accident at every
+ * cancel before patches/0004 and the libbsd stack's poll did. 0 disables it.
+ */
+#define CONFIG_USB_EHCI_ASYNC_KICK_US      20000
 
 #define CONFIG_USB_HS
 
@@ -117,6 +130,12 @@ void usb_osal_dma_barrier(void);
  * value in nexus_cherryusb_irq_prio (POSIX priority, 0 = this default) overrides it.
  */
 #define NEXUS_USB_IRQ_PRIO_FROM_MAX 18
+/*
+ * Bulk IN URBs the AIC adapter keeps in the controller per endpoint (aicwf_cherry.c). 1: one
+ * at a time on a QH of its own, as in every image whose Wi-Fi worked; more chains them on one
+ * EHCI stream QH (patches/0005, build 84, not proven on hardware).
+ */
+#define NX_IN_URBS_PER_EP 1
 /* CPU of every CherryUSB thread (the AIC driver threads run on CPU0 as well, AICWF_THREAD_CPU) */
 #define NEXUS_USB_THREAD_CPU 0
 

@@ -14,6 +14,7 @@
  * progress (no scan result, join event or start) for WLAN_HEAL_STALL_MS while a network is
  * configured. Recoveries are spaced by an exponential backoff (WLAN_HEAL_BACKOFF_MIN_MS up to
  * WLAN_HEAL_BACKOFF_MAX_MS, reset after WLAN_HEAL_STABLE_MS connected); one log line each.
+ * Only while aicwf_self_heal is set (default AICWF_SELF_HEAL_DEFAULT, rtconfig.h: off).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -51,6 +52,12 @@ int aicwf_d80_fw_mode;
 #define WLAN_HEAL_BACKOFF_MIN_MS    30000
 #define WLAN_HEAL_BACKOFF_MAX_MS    300000
 #define WLAN_HEAL_STABLE_MS         300000
+
+#ifndef AICWF_SELF_HEAL_DEFAULT
+#define AICWF_SELF_HEAL_DEFAULT 0
+#endif
+/* self-heal switch (the application may set it before or after aicwf_wifi_start()) */
+int aicwf_self_heal = AICWF_SELF_HEAL_DEFAULT;
 
 /* CherryUSB adapter (rtos/cherryusb/aic/aicwf_cherry.c); absent with the libbsd USB stack */
 unsigned aicwf_usbh_in_silence_ms(void) __attribute__((weak));
@@ -724,6 +731,10 @@ static void heal_thread(void *parameter)
         int streak, result;
 
         rt_thread_mdelay(1000);
+        if (!__atomic_load_n(&aicwf_self_heal, __ATOMIC_RELAXED))
+        {
+            continue;
+        }
         if (aicwf_usbh_attach_count() == 0)
         {
             continue; /* no stick yet: usb_watchdog_thread's business */
@@ -817,9 +828,9 @@ void aicwf_wifi_fwdiag(void)
 {
     static const char *const modes[] = { "auto (MCU1 -> legacy SDK V3)", "SDK 5.0", "legacy SDK V3" };
 
-    printf("wifi: D80 firmware set: %s; log level %s; self-heals %u (firmware command failure "
-           "streak %d)\n", modes[aicwf_d80_fw_mode % 3],
-           rt_shim_log_level >= DBG_LOG ? "debug" : "normal", g_heals,
+    printf("wifi: D80 firmware set: %s; log level %s; self-heal %s, %u done (firmware command "
+           "failure streak %d)\n", modes[aicwf_d80_fw_mode % 3],
+           rt_shim_log_level >= DBG_LOG ? "debug" : "normal", aicwf_self_heal ? "on" : "off", g_heals,
            __atomic_load_n(&g_cmd_fail_streak, __ATOMIC_RELAXED));
     aicwf_fw_dump();
     aicwf_usbh_dump();

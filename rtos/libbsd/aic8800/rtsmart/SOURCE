@@ -32,12 +32,13 @@ Local changes (RTEMS port), all inside #ifdef AICWF_RTEMS (defined in ../shim/rt
     - a bulk OUT on the dedicated message endpoint that failed with a STALL (only) is
       followed by CLEAR_FEATURE(ENDPOINT_HALT) and a host toggle reset (Linux
       usb_clear_halt()); a timeout keeps the toggle (cancel as usb_kill_urb()).
-    - message bulk OUT timeout AIC8800_WIFI_MSG_OUT_TIMEOUT_MS (5 s, Linux CMD_TX_TIMEOUT).
+    - message bulk OUT timeout AIC8800_WIFI_MSG_OUT_TIMEOUT_MS (shim/rtconfig.h, 15 s as the
+      images whose Wi-Fi worked; Linux CMD_TX_TIMEOUT is 5 s).
   aic8800/aic8800_firmware.c
     - firmware block bulk OUT timeout AIC8800_WIFI_MSG_OUT_TIMEOUT_MS.
   aic8800/aic8800_wifi.c (confirmation wait)
-    - AIC8800_WIFI_CFM_TIMEOUT_MS (5 s) except MM_RESET/MM_START/MM_SET_STACK_START/
-      MM_SET_RF_CALIB, which keep AIC8800_WIFI_COMMAND_TIMEOUT_MS (15 s).
+    - AIC8800_WIFI_CFM_TIMEOUT_MS (shim/rtconfig.h, 15 s) except MM_RESET/MM_START/
+      MM_SET_STACK_START/MM_SET_RF_CALIB, which keep AIC8800_WIFI_COMMAND_TIMEOUT_MS (15 s).
   wlan/offload/wlan_offload_supplicant.c
     - each step after EAPOL 3/4 / group 1/2 (GTK, default key, PTK, IGTK, response TX,
       authorize) logs which one failed and its firmware message ID.

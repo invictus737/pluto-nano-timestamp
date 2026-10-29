@@ -1,5 +1,5 @@
 /*
- * Host simulation of the CherryUSB EHCI port as patched for the Pluto Nano (patches/0001-0005):
+ * Host simulation of the CherryUSB EHCI port as patched for the Pluto Nano (patches/0001-0006):
  * Interrupt on Async Advance cycles, IAA watchdog, usbh_kill_urb(), barriers, toggle recovery,
  * quarantine of QHs handed back by a late cycle (no doorbell over a pending one), no sleep in
  * the critical section, error classes, bulk IN streams (chained qTDs on one QH).
@@ -30,6 +30,8 @@ static uint32_t g_iaa_delay_us = 60;
 static uint32_t g_rings, g_answered, g_ring_us, g_echo_writes, g_unbarriered_writes;
 static uint32_t g_ring_snapshot, g_answered_snapshot;
 static uint32_t g_barriers_since_cmd;
+static uint32_t g_ase_change_us;
+static int g_ass_stuck; /* USBSTS.ASS ignores USBCMD.ASE (no handshake) */
 static int g_check_barriers;
 
 static uint32_t ring_mask(void);
@@ -58,11 +60,19 @@ static void sim_usbcmd_write(uint32_t v)
     if (old & EHCI_USBCMD_IAAD) {
         v |= EHCI_USBCMD_IAAD; /* software cannot clear the doorbell */
     }
+    if ((v ^ old) & EHCI_USBCMD_ASEN) {
+        g_ase_change_us = g_now_us;
+    }
     g_regs.usbcmd = v;
 }
 
 static void model_tick(void)
 {
+    /* USBSTS.ASS follows USBCMD.ASE after a few microseconds (EHCI 4.8) */
+    if (!g_ass_stuck && ((g_regs.usbcmd & EHCI_USBCMD_ASEN) != 0) != ((g_regs.usbsts & EHCI_USBSTS_ASS) != 0) &&
+        g_now_us - g_ase_change_us >= 5) {
+        g_regs.usbsts ^= EHCI_USBSTS_ASS;
+    }
     if ((g_regs.usbcmd & EHCI_USBCMD_IAAD) && g_now_us - g_ring_us >= g_iaa_delay_us) {
         if (g_mode == IAA_NORMAL) {
             g_regs.usbcmd &= ~EHCI_USBCMD_IAAD;
@@ -213,6 +223,8 @@ static void sim_reset(void)
     g_rings = g_answered = g_echo_writes = g_unbarriered_writes = 0;
     g_answered_snapshot = g_ring_snapshot = 0;
     g_check_barriers = 0;
+    g_ass_stuck = 0;
+    memset(g_ehci_async_wd, 0, sizeof(g_ehci_async_wd));
     g_usbhost_bus[0].hcd.reg_base = (uintptr_t)&g_regs - CONFIG_USB_EHCI_HCCR_OFFSET;
     g_usbhost_bus[0].hcd.hcd_id = 0;
     g_ehci_hcd[0].hcor_offset = 0;
@@ -624,7 +636,7 @@ static void test_error_classes(void)
     sim_reset();
     CHECK(submit(&a, 0, 64, true) == 0);
     qh = &ehci_qh_pool[0][a.qh_index];
-    CHECK(((qh->hw.epchar & QH_EPCHAR_RL_MASK) >> QH_EPCHAR_RL_SHIFT) == 4); /* EHCI_TUNE_RL_HS */
+    CHECK(((qh->hw.epchar & QH_EPCHAR_RL_MASK) >> QH_EPCHAR_RL_SHIFT) == CONFIG_USB_EHCI_BULK_RL_HS);
     qh->xacterrs = CONFIG_USB_EHCI_XACTERR_RETRIES;
     qtd = EHCI_ADDR2QTD(qh->first_qtd);
     qtd->hw.token = (qtd->hw.token & ~(QTD_TOKEN_STATUS_ACTIVE | QTD_TOKEN_CERR_MASK)) |
@@ -846,6 +858,105 @@ static void test_stream_idle_and_error(void)
     CHECK(all_qh_free() && qtds_in_use() == 0);
 }
 
+/*
+ * Build 84 on the board: a QH linked with its qTD active, overlay never loaded, for 5 s while
+ * the engine sat on another QH. The watchdog restarts the schedule after
+ * CONFIG_USB_EHCI_ASYNC_KICK_US (ASE off, ASS clear, ASYNCLISTADDR = head, ASE on, ASS set)
+ * and leaves the QH linked; nothing happens while the controller fetches.
+ */
+static void test_async_kick_unfetched(void)
+{
+    struct xfer a;
+    struct ehci_qh_hw *qh;
+
+    sim_reset();
+    g_regs.asynclistaddr = 0x1234560;
+    CHECK(submit(&a, 0, 20, true) == 0);
+    qh = &ehci_qh_pool[0][a.qh_index];
+    CHECK(usbh_ehci_async_watchdog(0) == 0);
+    advance(CONFIG_USB_EHCI_ASYNC_KICK_US / 2);
+    CHECK(usbh_ehci_async_watchdog(0) == 0);
+    advance(CONFIG_USB_EHCI_ASYNC_KICK_US / 2 + 100);
+    CHECK(usbh_ehci_async_watchdog(0) == 1);
+    CHECK(g_ehci_iaa_stats[0].async_kicks == 1 && g_ehci_iaa_stats[0].async_kick_unfetched == 1);
+    CHECK(g_ehci_iaa_stats[0].async_kick_no_handshake == 0);
+    CHECK((g_regs.usbcmd & EHCI_USBCMD_ASEN) && (g_regs.usbsts & EHCI_USBSTS_ASS));
+    CHECK(g_regs.asynclistaddr == EHCI_PTR2ADDR(&g_async_qh_head[0]));
+    CHECK(ring_mask() == (1U << a.qh_index) && !a.done && qh->inuse);
+    /* the controller loads the overlay now: no further restart */
+    qh->hw.overlay.token = QTD_TOKEN_STATUS_ACTIVE;
+    advance(CONFIG_USB_EHCI_ASYNC_KICK_US * 2);
+    CHECK(usbh_ehci_async_watchdog(0) == 0);
+    advance(CONFIG_USB_EHCI_ASYNC_KICK_US * 2);
+    CHECK(usbh_ehci_async_watchdog(0) == 0);
+    CHECK(g_ehci_iaa_stats[0].async_kicks == 1);
+    hw_finish(&a, false);
+    isr();
+    advance(100);
+    isr();
+    CHECK(a.done == 1 && a.result == 20 && a.order_ok);
+    /* schedule off: never */
+    sim_reset();
+    CHECK(submit(&a, 0, 20, true) == 0);
+    g_regs.usbcmd &= ~EHCI_USBCMD_ASEN;
+    advance(10);
+    for (int i = 0; i < 4; i++) {
+        advance(CONFIG_USB_EHCI_ASYNC_KICK_US);
+        CHECK(usbh_ehci_async_watchdog(0) == 0);
+    }
+    CHECK(g_ehci_iaa_stats[0].async_kicks == 0);
+}
+
+/*
+ * Doorbell never answered (build 84: "doorbell stuck", QHs quarantined): the restart sees ASS
+ * clear, so the waiting and quarantined QHs are free; they are handed back and released.
+ */
+static void test_async_kick_doorbell(void)
+{
+    struct xfer a, b;
+    int a_qh;
+
+    sim_reset();
+    g_mode = IAA_LOST;
+    CHECK(submit(&a, 0, 64, false) == 0);
+    a_qh = a.qh_index;
+    hw_finish(&a, true);
+    isr();
+    advance(10100);
+    CHECK(usbh_ehci_iaa_watchdog(0) == 1); /* late: quarantined */
+    CHECK(a.done == 1 && ehci_qh_pool[0][a_qh].quarantine && ehci_qh_pool[0][a_qh].inuse);
+    CHECK(submit(&b, 1, 64, false) == 0);
+    hw_finish(&b, false);
+    isr();                                 /* B waits: doorbell still set */
+    CHECK(!b.done);
+    CHECK(usbh_ehci_async_watchdog(0) == 0);
+    advance(CONFIG_USB_EHCI_ASYNC_KICK_US + 100);
+    CHECK(usbh_ehci_async_watchdog(0) == 1);
+    CHECK(g_ehci_iaa_stats[0].async_kick_iaad == 1);
+    CHECK(b.done == 1 && b.result == 64 && b.urb.data_toggle == false);
+    CHECK(!ehci_qh_pool[0][a_qh].quarantine && !ehci_qh_pool[0][a_qh].inuse);
+    CHECK(!ehci_qh_pool[0][b.qh_index].inuse);
+    CHECK(usbh_ehci_iaa_pending(0) == 0);
+    CHECK((g_regs.usbcmd & EHCI_USBCMD_ASEN) && (g_regs.usbsts & EHCI_USBSTS_ASS));
+
+    /* no ASS handshake: nothing is handed back, the schedule is enabled again */
+    sim_reset();
+    g_mode = IAA_LOST;
+    CHECK(submit(&a, 0, 64, false) == 0);
+    a_qh = a.qh_index;
+    hw_finish(&a, true);
+    isr();
+    advance(10100);
+    CHECK(usbh_ehci_iaa_watchdog(0) == 1);
+    g_ass_stuck = 1;
+    CHECK(usbh_ehci_async_watchdog(0) == 0);
+    advance(CONFIG_USB_EHCI_ASYNC_KICK_US + 100);
+    CHECK(usbh_ehci_async_watchdog(0) == 1);
+    CHECK(g_ehci_iaa_stats[0].async_kick_no_handshake >= 1);
+    CHECK(ehci_qh_pool[0][a_qh].quarantine && ehci_qh_pool[0][a_qh].inuse);
+    CHECK(g_regs.usbcmd & EHCI_USBCMD_ASEN);
+}
+
 int main(void)
 {
     test_stale_iaa();
@@ -866,6 +977,8 @@ int main(void)
     test_toggle_from_overlay();
     test_stream();
     test_stream_idle_and_error();
+    test_async_kick_unfetched();
+    test_async_kick_doorbell();
     CHECK(g_sleeps_in_crit == 0);
     printf("ehci_iaa_test: %s (%d failure(s))\n", g_fail ? "FAIL" : "ok", g_fail);
     return g_fail ? 1 : 0;

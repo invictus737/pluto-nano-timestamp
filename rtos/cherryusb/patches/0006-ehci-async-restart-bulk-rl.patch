@@ -1,0 +1,240 @@
+Nexus-BS: asynchronous engine watchdog and a configurable high-speed bulk NAK reload.
+
+- usbh_ehci_async_watchdog() (polled by the glue's interrupt thread, critical section held):
+  a QH on the ring whose overlay is inactive while its next qTD is active, or a doorbell left
+  unanswered, for CONFIG_USB_EHCI_ASYNC_KICK_US restarts the asynchronous schedule: ASE off,
+  wait for ASS clear (EHCI 4.8), hand back the QHs of the running cycle, the waiting and the
+  quarantined ones (the controller is not traversing and holds none, EHCI 4.8.2), point
+  ASYNCLISTADDR at the head, ASE on, wait for ASS. The ChipIdea core parks on a stale QH
+  copy (board build 84, libbsd stack before); the stock usbh_kill_urb() PSE/ASE toggle that
+  patches/0004 removed used to get it out of that by accident.
+- CONFIG_USB_EHCI_BULK_RL_HS: NAK reload of high-speed bulk QHs (default EHCI_TUNE_RL_HS).
+
+diff --git a/port/ehci/usb_hc_ehci.c b/port/ehci/usb_hc_ehci.c
+index 2f12280..d0266ee 100644
+--- a/port/ehci/usb_hc_ehci.c
++++ b/port/ehci/usb_hc_ehci.c
+@@ -58,6 +58,17 @@ volatile uint32_t g_ehci_xacterr_retries;
+ #ifndef CONFIG_USB_EHCI_IAA_SPIN_US
+ #define CONFIG_USB_EHCI_IAA_SPIN_US 500 /* usbh_kill_urb(): poll, then sleep 1 ms per check */
+ #endif
++/*
++ * Nexus-BS: NAK count reload of high-speed bulk QHs. Stock CherryUSB leaves it 0 (NAK counter
++ * not used), Linux qh_make() uses EHCI_TUNE_RL_HS (4).
++ */
++#ifndef CONFIG_USB_EHCI_BULK_RL_HS
++#define CONFIG_USB_EHCI_BULK_RL_HS EHCI_TUNE_RL_HS
++#endif
++/* Nexus-BS: asynchronous engine watchdog (usbh_ehci_async_watchdog()); 0 disables it */
++#ifndef CONFIG_USB_EHCI_ASYNC_KICK_US
++#define CONFIG_USB_EHCI_ASYNC_KICK_US 0
++#endif
+ 
+ struct ehci_iaa_state {
+     bool in_progress;
+@@ -367,8 +378,8 @@ static void ehci_qh_fill(struct ehci_qh_hw *qh,
+ 
+                 epcap |= QH_EPCAPS_MULT(EHCI_TUNE_MULT_HS);
+             } else if (ep_type == USB_ENDPOINT_TYPE_BULK) {
+-                /* Nexus-BS: NAK reload as Linux qh_make() (EHCI_TUNE_RL_HS for bulk and control) */
+-                epchar |= (EHCI_TUNE_RL_HS << QH_EPCHAR_RL_SHIFT);
++                /* Nexus-BS: NAK reload CONFIG_USB_EHCI_BULK_RL_HS (Linux qh_make(): EHCI_TUNE_RL_HS) */
++                epchar |= ((uint32_t)CONFIG_USB_EHCI_BULK_RL_HS << QH_EPCHAR_RL_SHIFT);
+                 epcap |= QH_EPCAPS_MULT(EHCI_TUNE_MULT_HS);
+             } else {
+                 /* only for interrupt ep */
+@@ -1011,6 +1022,168 @@ uint32_t usbh_ehci_iaa_watchdog(uint8_t busid)
+     return 1;
+ }
+ 
++/*
++ * Nexus-BS: asynchronous engine watchdog. The ChipIdea core has been seen parked, with the
++ * libbsd stack (rtos/libbsd/ehci_zynq.c) and with this port: a QH on the ring whose overlay is
++ * inactive while the qTD its next pointer names sits active in memory is never fetched again
++ * (the controller keeps working from a stale copy), or the doorbell stays unanswered. Every
++ * later transfer then times out. The stock usbh_kill_urb() got out of it by accident, turning
++ * PSE/ASE off and on at every cancel (patches/0004 removed that toggle, which had no
++ * handshake). Here, after CONFIG_USB_EHCI_ASYNC_KICK_US of either symptom, the asynchronous
++ * schedule goes off and on with the EHCI 4.8 handshake (USBSTS.ASS). With ASS seen clear the
++ * controller is not traversing the list and holds no asynchronous QH (EHCI 4.8.2), so the QHs
++ * of the running cycle, the waiting and the quarantined ones are handed back as after a real
++ * IAA, and ASYNCLISTADDR is pointed back at the head before the schedule is enabled again.
++ */
++#if CONFIG_USB_EHCI_ASYNC_KICK_US > 0
++struct ehci_async_wd {
++    struct ehci_qh_hw *qh; /* QH last seen with work the controller did not fetch */
++    uint32_t qtd;          /* the qTD its overlay names */
++    uint32_t since_us;
++    bool iaad;             /* doorbell seen set */
++    uint32_t iaad_since_us;
++};
++
++static struct ehci_async_wd g_ehci_async_wd[CONFIG_USBHOST_MAX_BUS];
++
++/* first QH on the ring with an inactive, not halted overlay whose next qTD is active */
++static struct ehci_qh_hw *ehci_async_unfetched(struct usbh_bus *bus, uint32_t *qtd_addr)
++{
++    struct ehci_qh_hw *head = &g_async_qh_head[bus->hcd.hcd_id];
++    struct ehci_qh_hw *qh = EHCI_ADDR2QH(head->hw.hlp);
++    int guard = 0;
++
++    while (qh && qh != head && guard++ <= CONFIG_USB_EHCI_QH_NUM) {
++        uint32_t token, next;
++        struct ehci_qtd_hw *qtd;
++
++#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
++        usb_dcache_invalidate((uintptr_t)&qh->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
++#endif
++        token = qh->hw.overlay.token;
++        next = qh->hw.overlay.next_qtd;
++        qtd = EHCI_ADDR2QTD(next);
++        if (!(token & (QTD_TOKEN_STATUS_ACTIVE | QTD_TOKEN_STATUS_HALTED)) && !(next & QTD_LIST_END) && qtd) {
++#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
++            usb_dcache_invalidate((uintptr_t)&qtd->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
++#endif
++            if (qtd->hw.token & QTD_TOKEN_STATUS_ACTIVE) {
++                *qtd_addr = EHCI_PTR2ADDR(qtd);
++                return qh;
++            }
++        }
++        qh = EHCI_ADDR2QH(qh->hw.hlp);
++    }
++    return NULL;
++}
++
++static bool ehci_wait_ass(struct usbh_bus *bus, bool on, uint32_t us)
++{
++    uint32_t t0 = usb_ehci_time_us();
++
++    while (((EHCI_HCOR->usbsts & EHCI_USBSTS_ASS) != 0) != on) {
++        if ((uint32_t)(usb_ehci_time_us() - t0) > us) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static void ehci_async_restart(struct usbh_bus *bus)
++{
++    struct ehci_iaa_state *s = &g_ehci_iaa[bus->hcd.hcd_id];
++    struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[bus->hcd.hcd_id];
++    bool off;
++
++    st->async_kicks++;
++    st->kick_cmd = EHCI_HCOR->usbcmd;
++    st->kick_sts = EHCI_HCOR->usbsts;
++    st->kick_async = EHCI_HCOR->asynclistaddr;
++    ehci_dma_wmb();
++    EHCI_HCOR->usbcmd = EHCI_HCOR->usbcmd & ~(EHCI_USBCMD_ASEN | EHCI_USBCMD_IAAD);
++    off = ehci_wait_ass(bus, false, 2000);
++    if (off) {
++        /* not traversing: nothing cached; every unlinked and quarantined QH is free */
++        for (uint32_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
++            struct ehci_qh_hw *qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
++
++            if (qh->remove_in_iaad == EHCI_IAA_WAIT) {
++                qh->remove_in_iaad = EHCI_IAA_CYCLE;
++            }
++        }
++        s->in_progress = false;
++        s->busy_valid = false;
++        ehci_release_quarantine(bus, s->seq + 1);
++        EHCI_HCOR->asynclistaddr = EHCI_PTR2ADDR(&g_async_qh_head[bus->hcd.hcd_id]);
++        ehci_dma_wmb();
++    } else {
++        st->async_kick_no_handshake++;
++    }
++    ehci_usbcmd_set(EHCI_USBCMD_ASEN);
++    if (!ehci_wait_ass(bus, true, 2000)) {
++        st->async_kick_no_handshake++;
++    }
++    if (off) {
++        /* completions may submit (and link) again: only after the schedule runs again */
++        ehci_complete_iaa_qhs(bus, false);
++        ehci_start_iaa_cycle(bus);
++    }
++}
++#endif /* CONFIG_USB_EHCI_ASYNC_KICK_US > 0 */
++
++/* critical section held (the glue's interrupt thread polls it); returns 1 after a restart */
++uint32_t usbh_ehci_async_watchdog(uint8_t busid)
++{
++#if CONFIG_USB_EHCI_ASYNC_KICK_US > 0
++    struct usbh_bus *bus = &g_usbhost_bus[busid];
++    struct ehci_async_wd *w = &g_ehci_async_wd[busid];
++    struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[busid];
++    struct ehci_qh_hw *qh;
++    uint32_t cmd = EHCI_HCOR->usbcmd, sts = EHCI_HCOR->usbsts, now = usb_ehci_time_us(), qtd = 0;
++    int reason = 0;
++
++    if (!(cmd & EHCI_USBCMD_RUN) || !(cmd & EHCI_USBCMD_ASEN) || (sts & EHCI_USBSTS_HALTED) ||
++        !(sts & EHCI_USBSTS_ASS)) {
++        w->qh = NULL;
++        w->iaad = false;
++        return 0;
++    }
++    qh = ehci_async_unfetched(bus, &qtd);
++    if (qh == NULL) {
++        w->qh = NULL;
++    } else if (qh != w->qh || qtd != w->qtd) {
++        w->qh = qh;
++        w->qtd = qtd;
++        w->since_us = now;
++    } else if ((uint32_t)(now - w->since_us) >= CONFIG_USB_EHCI_ASYNC_KICK_US) {
++        reason = 1;
++    }
++    if (!(cmd & EHCI_USBCMD_IAAD)) {
++        w->iaad = false;
++    } else if (!w->iaad) {
++        w->iaad = true;
++        w->iaad_since_us = now;
++    } else if ((uint32_t)(now - w->iaad_since_us) >= CONFIG_USB_EHCI_ASYNC_KICK_US) {
++        reason = reason ? reason : 2;
++    }
++    if (reason == 0) {
++        return 0;
++    }
++    if (reason == 1) {
++        st->async_kick_unfetched++;
++    } else {
++        st->async_kick_iaad++;
++    }
++    w->qh = NULL;
++    w->iaad = false;
++    ehci_async_restart(bus);
++    return 1;
++#else
++    (void)busid;
++    return 0;
++#endif
++}
++
+ /*
+  * Thread context, critical section held: drives the IAA cycles by polling until qh has been
+  * handed back (or freed and reused: gen). Bounded by the watchdog: a few microframes
+diff --git a/port/ehci/usb_hc_ehci.h b/port/ehci/usb_hc_ehci.h
+index 973b3aa..4c9a9b2 100644
+--- a/port/ehci/usb_hc_ehci.h
++++ b/port/ehci/usb_hc_ehci.h
+@@ -133,11 +133,21 @@ struct usbh_ehci_iaa_stats {
+     uint32_t last_cmd, last_sts, last_async; /* registers at the last watchdog end */
+     uint32_t ok_count;      /* successful bulk/control completions */
+     uint32_t ok_snap[9];    /* cycles irq polled watchdog lost late iaad_busy quarantined stuck at the last one */
++    uint32_t async_kicks;   /* asynchronous schedule restarted by usbh_ehci_async_watchdog() */
++    uint32_t async_kick_unfetched; /*   of those: an active qTD the controller never fetched */
++    uint32_t async_kick_iaad;      /*   of those: doorbell unanswered */
++    uint32_t async_kick_no_handshake; /* ASS did not follow ASE within 2 ms (off or on) */
++    uint32_t kick_cmd, kick_sts, kick_async; /* registers before the last restart */
+ };
+ extern struct usbh_ehci_iaa_stats g_ehci_iaa_stats[CONFIG_USBHOST_MAX_BUS];
+ uint32_t usbh_ehci_iaa_pending(uint8_t busid);
+ /* critical section held; ends a cycle older than CONFIG_USB_EHCI_IAA_WATCHDOG_US, returns 1 */
+ uint32_t usbh_ehci_iaa_watchdog(uint8_t busid);
++/*
++ * critical section held; restarts a parked asynchronous engine (CONFIG_USB_EHCI_ASYNC_KICK_US,
++ * 0 = off), returns 1 when it did
++ */
++uint32_t usbh_ehci_async_watchdog(uint8_t busid);
+ /* microsecond clock (wraps), provided by the port glue */
+ uint32_t usb_ehci_time_us(void);
+ extern volatile uint32_t g_ehci_xacterr_retries;

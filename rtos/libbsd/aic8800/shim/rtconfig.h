@@ -43,11 +43,15 @@
 /* confirmation wait of the slow firmware commands only (RF calibration, firmware/stack start,
  * reset: late CFMs were seen above 5 s) and of the ROM-stage firmware download */
 #define AIC8800_WIFI_COMMAND_TIMEOUT_MS         15000
-/* every other confirmation: Linux RWNX_80211_CMD_TIMEOUT_MS is 4 s */
-#define AIC8800_WIFI_CFM_TIMEOUT_MS             5000
-/* a message bulk OUT (command, firmware block): Linux aicwf_txrxif.h CMD_TX_TIMEOUT, then
- * usb_kill_urb() without touching the endpoint */
-#define AIC8800_WIFI_MSG_OUT_TIMEOUT_MS         5000
+/* every other confirmation. 15 s as every image whose Wi-Fi worked (2a292e2: CFMs later than
+ * 5 s were seen); Linux RWNX_80211_CMD_TIMEOUT_MS (4 s) was tried in build 84 only */
+#define AIC8800_WIFI_CFM_TIMEOUT_MS             15000
+/* a message bulk OUT (command, firmware block), then cancelled without touching the endpoint
+ * (Linux usb_kill_urb()). 15 s as the working images; Linux CMD_TX_TIMEOUT is 5 s */
+#define AIC8800_WIFI_MSG_OUT_TIMEOUT_MS         15000
+/* station self-heal (wlan_dev_shim.c, aicwf_self_heal): off by default. Unproven: in build 84 it
+ * re-enumerated a stick whose controller was parked and the port never enumerated again. */
+#define AICWF_SELF_HEAL_DEFAULT                 0
 #define AIC8800_WIFI_MGMT_CONFIRM_TIMEOUT_MS    1000
 #define AIC8800_WIFI_TX_BUFFER_SIZE             2048
 #define AIC8800_WIFI_RX_REORDER_FLOWS           128
