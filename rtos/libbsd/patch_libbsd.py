@@ -168,7 +168,7 @@ def ehci_c(s):
         return s
     return s + """
 """ + POLL_MARK + """
-unsigned ehci_zynq_ring_repairs;
+unsigned ehci_zynq_ring_repairs;\nstatic unsigned ehci_zynq_unlinked_n;
 
 /*
  * The async ring as the controller walks it must match the software list (head -> next ... ->
@@ -218,6 +218,32 @@ ehci_zynq_async_check(ehci_softc_t *sc)
 		q->qh_link = head->qh_self;
 		usb_pc_cpu_flush(q->page_cache);
 		ehci_zynq_ring_repairs++;
+	}
+	/* every pending control/bulk transfer must have its QH on the list */
+	{
+		struct usb_xfer *xfer;
+		TAILQ_FOREACH(xfer, &sc->sc_bus.intr_q.head, wait_entry) {
+			const struct usb_pipe_methods *m = xfer->endpoint->methods;
+			ehci_qh_t *qh;
+			int on;
+			if (m != &ehci_device_ctrl_methods && m != &ehci_device_bulk_methods)
+				continue;
+			qh = xfer->qh_start[xfer->flags_int.curr_dma_set];
+			if (qh == NULL)
+				continue;
+			for (on = 0, z = head; z != NULL && !on; z = z->next)
+				on = (z == qh);
+			if (!on) {
+				if (ehci_zynq_unlinked_n++ < 20)
+					printf("ehci: pending xfer addr %d ep 0x%02x has its QH off the list "
+					    "(prev %p next %p), relinked\\n", xfer->address, xfer->endpointno,
+					    qh->prev, qh->next);
+				qh->prev = NULL;
+				qh->next = NULL;
+				EHCI_APPEND_QH(qh, sc->sc_async_p_last);
+				ehci_zynq_ring_repairs++;
+			}
+		}
 	}
 }
 
