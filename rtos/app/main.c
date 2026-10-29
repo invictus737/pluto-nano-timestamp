@@ -236,8 +236,9 @@ static void resolv_conf_write_locked(void)
       o += (size_t)snprintf(buf + o, sizeof(buf) - o, "nameserver %s\n", t);
     }
   }
-  if (o == 0) {
-    return; /* keep the last servers while no interface has a lease */
+  /* public resolvers after the configured and DHCP ones (a router without DNS still resolves) */
+  if (o < sizeof(buf) - 64) {
+    o += (size_t)snprintf(buf + o, sizeof(buf) - o, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
   }
   /* 2 s per server and 2 rounds (default 5 s x 2): a server behind a lost link costs less */
   if (o < sizeof(buf) - 32) {

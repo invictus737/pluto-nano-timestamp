@@ -1015,6 +1015,13 @@ int nexus_config_init(void)
   config_ready = 1;
   pthread_cond_broadcast(&ready_cv);
   pthread_mutex_unlock(&ready_mtx);
+  /* /data/inbox: the same drop-in as a USB drive (config.txt applied then removed, nexus2.toml
+   * installed), for images without USB storage (CherryUSB host): upload with SFTP, reboot or
+   * run `config inbox` */
+  if (data_ok) {
+    (void)mkdir(NEXUS_DATA_DIR "/inbox", 0755);
+    process_drive(NEXUS_DATA_DIR "/inbox");
+  }
   return data_ok ? 0 : -1;
 }
 
@@ -1121,6 +1128,7 @@ static const char usage[] =
   "config get KEY | set KEY VALUE... | unset KEY\n"
   "config wifi list | add SSID PSK|- | del SLOT|SSID   (slot 0 = highest priority)\n"
   "config apply FILE                apply a config.txt (file kept)\n"
+  "config inbox                     apply /data/inbox (config.txt, nexus2.toml; files removed)\n"
   "config export [DIR]              DIR/config-current.txt (default: the USB drive)\n"
   "config station rollback          nexus2.toml.bak -> nexus2.toml\n"
   "config format yes                erase /data and rewrite the configuration\n";
@@ -1164,6 +1172,10 @@ static int shell_config(int argc, char **argv)
     if (strcmp(argv[2], "del") == 0 && argc == 4) {
       return wifi_del(argv[3]);
     }
+  }
+  if (strcmp(c, "inbox") == 0 && argc == 2) {
+    process_drive(NEXUS_DATA_DIR "/inbox");
+    return 0;
   }
   if (strcmp(c, "apply") == 0 && argc == 3) {
     return apply_config_file(argv[2], 0, NULL, NULL) == 0 ? 0 : 1;
