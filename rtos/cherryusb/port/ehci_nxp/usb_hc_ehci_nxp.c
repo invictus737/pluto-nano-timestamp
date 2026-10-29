@@ -207,13 +207,16 @@ static void ehci_start_async(struct usbh_bus *bus)
     uint32_t t0 = usb_ehci_time_us();
     bool ok = true;
 
-    if (op_rd(bus, EHCI_NXP_USBSTS) & EHCI_USBSTS_ASS) {
-        return;
+    if ((op_rd(bus, EHCI_NXP_USBCMD) & EHCI_USBCMD_ASEN) && (op_rd(bus, EHCI_NXP_USBSTS) & EHCI_USBSTS_ASS)) {
+        return; /* running */
     }
     if (!ehci_hc_halted(bus)) {
         ok = ehci_wait_sync(bus, EHCI_USBSTS_ASS, EHCI_USBCMD_ASEN, t0);
     }
-    op_wr(bus, EHCI_NXP_ASYNCLIST, LINK_ADDR(QH_LINK(hcd_of(bus)->async_head)));
+    /* the list base only while the schedule is off (a missed stop handshake keeps the old one) */
+    if (!(op_rd(bus, EHCI_NXP_USBSTS) & EHCI_USBSTS_ASS)) {
+        op_wr(bus, EHCI_NXP_ASYNCLIST, LINK_ADDR(QH_LINK(hcd_of(bus)->async_head)));
+    }
     ehci_dma_wmb();
     usbcmd_update(bus, 0, EHCI_USBCMD_ASEN);
     if (!ehci_hc_halted(bus)) {
@@ -243,13 +246,16 @@ static void ehci_start_periodic(struct usbh_bus *bus)
     uint32_t t0 = usb_ehci_time_us();
     bool ok = true;
 
-    if (op_rd(bus, EHCI_NXP_USBSTS) & EHCI_USBSTS_PSS) {
-        return;
+    if ((op_rd(bus, EHCI_NXP_USBCMD) & EHCI_USBCMD_PSEN) && (op_rd(bus, EHCI_NXP_USBSTS) & EHCI_USBSTS_PSS)) {
+        return; /* running */
     }
     if (!ehci_hc_halted(bus)) {
         ok = ehci_wait_sync(bus, EHCI_USBSTS_PSS, EHCI_USBCMD_PSEN, t0);
     }
-    op_wr(bus, EHCI_NXP_PERIODICLIST, (uint32_t)usb_ramaddr2phyaddr((uintptr_t)hcd_of(bus)->framelist));
+    /* the list base only while the schedule is off (a missed stop handshake keeps the old one) */
+    if (!(op_rd(bus, EHCI_NXP_USBSTS) & EHCI_USBSTS_PSS)) {
+        op_wr(bus, EHCI_NXP_PERIODICLIST, (uint32_t)usb_ramaddr2phyaddr((uintptr_t)hcd_of(bus)->framelist));
+    }
     ehci_dma_wmb();
     usbcmd_update(bus, 0, EHCI_USBCMD_PSEN);
     if (!ehci_hc_halted(bus)) {
