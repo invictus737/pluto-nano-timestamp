@@ -11,7 +11,7 @@
  *     usb_txfill sets it live), PORTSC PTS = ULPI only when it is not (write-1-to-clear bits
  *     never written back), asynchronous park mode off (Linux ehci-hcd park=0);
  *   once the controller runs (nexus_cherryusb_start): ULPI OTG control "set" register 0x0B =
- *     0x66 (DP/DM pull-downs, DrvVbus, DrvVbusExternal), so the PHY powers the port.
+ *     0x26 (DP/DM pull-downs, DrvVbus; as Linux phy-ulpi drv-vbus), so the PHY powers the port.
  * Before the stack starts, stale cache lines over the non-cacheable areas are discarded.
  *
  * Interrupt: the hard handler (GIC SPI 53, routed to NEXUS_USB_THREAD_CPU) only masks the
@@ -82,9 +82,10 @@
 #define USBSTS_IAA             (1U << 5)
 #define USBSTS_HCH             (1U << 12)
 
-/* ULPI OTG Control (set alias 0x0b): DP/DM pull-downs (host), DrvVbus, DrvVbusExternal */
+/* ULPI OTG Control (set alias 0x0b): DP/DM pull-downs (host) and DrvVbus, the value Linux (phy-ulpi,
+ * "drv-vbus") leaves on this board; DrvVbusExternal (0x40) is not set */
 #define ULPI_OTG_CTRL_SET      0x0b
-#define ULPI_OTG_HOST_VBUS     0x66
+#define ULPI_OTG_HOST_VBUS     0x26 /* as Linux phy-ulpi with drv-vbus: pull-downs + DrvVbus, no DrvVbusExternal */
 
 /* PS GPIO bank 1 (MIO 32..53); MIO 46 is bit 14 */
 #define ZY7_GPIO_MASK_DATA_1_LSW 0xe000a008U
