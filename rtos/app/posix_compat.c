@@ -312,8 +312,9 @@ void __wrap_exit(int status)
  *
  * - "light" (default): CPU0 at the station base priority (nexus_station_base_prio). nexus2's
  *   radio threads then move themselves (rf-front rt_thread.rs, NEXUS2_RTEMS_LAYOUT=light): the
- *   DSP/protocol roles to CPU1, the SDR stream I/O roles to CPU0 above the network stack. The
- *   Pluto driver's DMA service threads and interrupts go to CPU0 as well (main.c).
+ *   DSP/protocol roles and the SDR stream I/O to CPU1 (NEXUS2_RTEMS_IO_CPU=0 puts the I/O on
+ *   CPU0 for an A/B); the Pluto driver's DMA service threads and interrupts go to CPU1 as well
+ *   (main.c), so CPU0 serves USB, Wi-Fi and the network stack alone.
  * - "cpu1": the previous layout, every station thread on CPU1 with the inherited priority;
  *   CPU0 left to USB, Wi-Fi and the network stack.
  * - "float": no pinning, priorities only (scheduling A/B).

@@ -596,13 +596,14 @@ static void nexus2_start(void)
   if (layout >= 0 && !nexus_layout_override) {
     nexus_station_layout = layout;
   }
-  /* the Pluto driver's DMA service threads and interrupts: with the SDR stream I/O on CPU0
-   * (light, the Nexus-Light pattern: the I/O core takes every interrupt), with the station on
-   * CPU1 (cpu1); float leaves them unpinned */
+  /* the Pluto driver's DMA service threads and interrupts go to CPU1 with the station (light and
+   * cpu1): CPU0 serves USB/Wi-Fi alone. With the radio DMA on CPU0 the ChipIdea EHCI interrupts
+   * (IAA in particular) were delayed and Wi-Fi commands failed; the DMA feeds the deadline core
+   * anyway. float leaves them unpinned */
   if (nexus_station_layout == NEXUS_LAYOUT_FLOAT) {
     pluto_rtems_set_thread_attr_hook(NULL, NULL);
   } else {
-    (void)pluto_rtems_pin_to_cpu(nexus_station_layout == NEXUS_LAYOUT_CPU1 ? 1 : 0);
+    (void)pluto_rtems_pin_to_cpu(1);
   }
   printf("nexus2: layout %s\n", nexus_station_layout_name(nexus_station_layout));
   nexus_load_logger_start();

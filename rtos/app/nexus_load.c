@@ -308,7 +308,7 @@ extern char **environ;
 static int env_switch(const char *kv)
 {
   return (strncmp(kv, "NEXUS2_", 7) == 0 && strncmp(kv, "NEXUS2_RTEMS_", 13) != 0) ||
-         strncmp(kv, "RUST_LOG=", 9) == 0;
+         strncmp(kv, "NEXUS2_RTEMS_IO_CPU=", 20) == 0 || strncmp(kv, "RUST_LOG=", 9) == 0;
 }
 
 /* NAME=VALUE sets, NAME= unsets; 0 ok */
