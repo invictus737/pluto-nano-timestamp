@@ -445,3 +445,117 @@ int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   }
   return rc;
 }
+
+/* ---- console log ring ----
+ * write() is wrapped (nexus2-link.sh): what any thread writes to the console descriptors 1 and 2
+ * (nexus2 tracing, printf, libbsd/AIC driver messages) is also kept in a 256 KiB RAM ring, so a
+ * headless station can be diagnosed over SSH with `log` without the serial console. Shell
+ * sessions write to their pty descriptor and are not recorded. */
+#define NEXUS_LOG_RING (256u * 1024u)
+static char log_ring[NEXUS_LOG_RING];
+static size_t log_head;  /* next write position */
+static int log_full;     /* the ring has wrapped */
+static pthread_mutex_t log_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+ssize_t __real_write(int fd, const void *buf, size_t n);
+
+ssize_t __wrap_write(int fd, const void *buf, size_t n)
+{
+  if ((fd == 1 || fd == 2) && n > 0 && buf != NULL) {
+    const char *p = buf;
+    size_t len = n > NEXUS_LOG_RING ? NEXUS_LOG_RING : n;
+    p += n - len;
+    pthread_mutex_lock(&log_mtx);
+    while (len > 0) {
+      size_t chunk = NEXUS_LOG_RING - log_head;
+      if (chunk > len) {
+        chunk = len;
+      }
+      memcpy(log_ring + log_head, p, chunk);
+      log_head += chunk;
+      if (log_head == NEXUS_LOG_RING) {
+        log_head = 0;
+        log_full = 1;
+      }
+      p += chunk;
+      len -= chunk;
+    }
+    pthread_mutex_unlock(&log_mtx);
+  }
+  return __real_write(fd, buf, n);
+}
+
+/* copy of the ring, oldest byte first; caller frees */
+static char *log_snapshot(size_t *out_len)
+{
+  pthread_mutex_lock(&log_mtx);
+  size_t len = log_full ? NEXUS_LOG_RING : log_head;
+  char *c = malloc(len + 1);
+  if (c != NULL) {
+    if (log_full) {
+      memcpy(c, log_ring + log_head, NEXUS_LOG_RING - log_head);
+      memcpy(c + (NEXUS_LOG_RING - log_head), log_ring, log_head);
+    } else {
+      memcpy(c, log_ring, len);
+    }
+    c[len] = '\0';
+  }
+  pthread_mutex_unlock(&log_mtx);
+  *out_len = c != NULL ? len : 0;
+  return c;
+}
+
+int nexus_log_shell(int argc, char **argv)
+{
+  if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+    pthread_mutex_lock(&log_mtx);
+    log_head = 0;
+    log_full = 0;
+    pthread_mutex_unlock(&log_mtx);
+    return 0;
+  }
+  size_t len;
+  char *c = log_snapshot(&len);
+  if (c == NULL) {
+    printf("log: no memory\n");
+    return 1;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    if (c[i] == '\0') {
+      c[i] = ' ';
+    }
+  }
+  if (argc >= 3 && strcmp(argv[1], "find") == 0) {
+    /* every line containing any of the words */
+    char *line = c;
+    while (line != NULL && *line != '\0') {
+      char *nl = strchr(line, '\n');
+      if (nl != NULL) {
+        *nl = '\0';
+      }
+      for (int a = 2; a < argc; ++a) {
+        if (strstr(line, argv[a]) != NULL) {
+          printf("%s\n", line);
+          break;
+        }
+      }
+      line = nl != NULL ? nl + 1 : NULL;
+    }
+  } else {
+    size_t want = 8192;
+    if (argc >= 2) {
+      long v = strtol(argv[1], NULL, 0);
+      if (v <= 0) {
+        printf("usage: log [bytes] | log find <word>... | log clear\n");
+        free(c);
+        return 1;
+      }
+      want = (size_t)v;
+    }
+    const char *start = len > want ? c + (len - want) : c;
+    fwrite(start, 1, strlen(start), stdout);
+    fflush(stdout);
+  }
+  free(c);
+  return 0;
+}

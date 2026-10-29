@@ -26,6 +26,8 @@ void nexus_load_logger_start(void);
 /* `nexus env`: NEXUS2_* switches for the next start, /data/nexus2/nexus2.env */
 int nexus_env_shell(int argc, char **argv);
 void nexus_env_load_file(void);
+/* console log ring (posix_compat.c): stdout/stderr of every thread, readable over SSH */
+int nexus_log_shell(int argc, char **argv);
 
 /* nexus2 (Rust, rf-front stage_timing.rs); weak: absent in images without nexus2 */
 size_t nexus2_stage_report(char *buf, size_t cap, int reset) __attribute__((weak));

@@ -448,7 +448,7 @@ int nexus_uboot_env_set(const char *const *kv_pairs, int n)
     goto out;
   }
   for (int i = 0; i < n; ++i) {
-    if (kv_set(&env, kv_pairs[2 * i], kv_pairs[2 * i + 1]) != 0) {
+    if (kv_set(&env, kv_pairs[2 * i], kv_pairs[2 * i + 1]) < 0) { /* 1 = changed */
       printf("config: U-Boot environment: cannot set %s\n", kv_pairs[2 * i]);
       goto out;
     }

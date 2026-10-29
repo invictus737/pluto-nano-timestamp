@@ -798,6 +798,7 @@ static void Init(rtems_task_argument arg)
   /* ---- end Bluetooth ---- */
 #ifdef NEXUS_RUST_MAIN
   rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status|layout|env|load|stages: the nexus2 station", shell_nexus);
+  rtems_shell_add_cmd("log", "misc", "log [bytes] | log find <word>... | log clear: console log ring", nexus_log_shell);
   nexus2_start();
 #endif
 
