@@ -247,7 +247,7 @@ static int tr_open(void)
   struct sched_param sp = {.sched_priority = reader_prio};
   pthread_attr_init(&at);
   pthread_attr_setstacksize(&at, 16 * 1024);
-#ifndef __APPLE__
+#ifdef __rtems__ /* host test runs: default scheduling */
   pthread_attr_setinheritsched(&at, PTHREAD_EXPLICIT_SCHED);
   pthread_attr_setschedpolicy(&at, SCHED_FIFO);
   pthread_attr_setschedparam(&at, &sp);

@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -1559,7 +1560,7 @@ static int spawn(void *(*fn)(void *), int prio, size_t stack)
   pthread_attr_init(&at);
   pthread_attr_setstacksize(&at, stack);
   pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-#ifndef __APPLE__
+#ifdef __rtems__ /* host test runs: default scheduling */
   pthread_attr_setinheritsched(&at, PTHREAD_EXPLICIT_SCHED);
   pthread_attr_setschedpolicy(&at, SCHED_FIFO);
   pthread_attr_setschedparam(&at, &sp);

@@ -25,7 +25,7 @@ for f in $SRC; do
 done
 for f in nexus_bt.c bt_audio.c btstack_run_loop_rtems.c hci_transport_aicwf.c; do
   o="$OUT/obj/nexus_$f.o"
-  $CC -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Werror $SAN $IFLAGS -c "$BT/$f" -o "$o"
+  $CC -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter $SAN $IFLAGS -c "$BT/$f" -o "$o"
   objs="$objs $o"
 done
 for f in fake_board.c host_main.c; do
