@@ -192,6 +192,28 @@ int ehci_zynq_poll(ehci_softc_t *sc); /* ehci.c (Pluto patch) */
 static unsigned zynq_ehci_rescued, zynq_ehci_ticks;
 
 /*
+ * ChipIdea (Zynq USB) host: a completed qTD with IOC sets USBSTS.UAI (async) or UPI (periodic),
+ * and on this controller not always the standard USBINT, so the stock EHCI handler (which only
+ * looks at the six standard bits) misses completions and the transfers time out. UAIE/UPIE are
+ * enabled after ehci_init; this handler acknowledges those two bits and completes the finished
+ * transfers, then lets the stock handler do the rest.
+ */
+#define ZY7_USBSTS_UAI (1U << 18)
+#define ZY7_USBSTS_UPI (1U << 19)
+static void
+zynq_ehci_intr(void *arg)
+{
+	ehci_softc_t *e = arg;
+	uint32_t sts = REG32(ZY7_USB0_BASE + 0x144) & (ZY7_USBSTS_UAI | ZY7_USBSTS_UPI);
+
+	if (sts != 0)
+		REG32(ZY7_USB0_BASE + 0x144) = sts; /* write 1 to clear */
+	ehci_interrupt(e);
+	if (sts != 0)
+		(void)ehci_zynq_poll(e);
+}
+
+/*
  * Every 10 ms: completed transfers whose interrupt never arrived are finished here (counted and
  * reported every 10 s), and pending port changes kick an explore.
  */
@@ -269,7 +291,7 @@ zynq_ehci_attach(device_t self)
 
 	sc = rtems_interrupt_server_handler_install(RTEMS_INTERRUPT_SERVER_DEFAULT,
 	    ZYNQ_IRQ_USB_0, "USB0", RTEMS_INTERRUPT_UNIQUE,
-	    (rtems_interrupt_handler)ehci_interrupt, e);
+	    zynq_ehci_intr, e);
 	BSD_ASSERT_SC(sc);
 
 	ue = ehci_init(e);
@@ -277,6 +299,9 @@ zynq_ehci_attach(device_t self)
 		device_printf(self, "ehci_init failed: %d\n", (int)ue);
 		goto error;
 	}
+	/* ChipIdea: transfer completions also (and sometimes only) arrive as UAI/UPI */
+	e->sc_eintrs |= ZY7_USBSTS_UAI | ZY7_USBSTS_UPI;
+	EOWRITE4(e, EHCI_USBINTR, e->sc_eintrs);
 
 	/* Host mode is set now: let the PHY drive VBUS and enable the host pull-downs. */
 	if (zynq_ulpi_write(ULPI_OTG_CTRL_SET, ULPI_OTG_HOST_VBUS) != 0)
