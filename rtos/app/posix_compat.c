@@ -24,6 +24,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#define _GNU_SOURCE /* pthread_*affinity_np, CPU_SET */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -294,4 +295,50 @@ void __wrap_exit(int status)
     pthread_exit(NULL);
   }
   __real_exit(status);
+}
+
+
+/*
+ * CPU placement of the station (Pluto RTOS): RTEMS pthread_create does not inherit the creator's
+ * affinity (the attribute's set applies, all CPUs by default), so nexus2's own threads would
+ * spread onto CPU0, where the USB host, the Wi-Fi driver and the network stack run, and starve
+ * them (seen: the AIC8800 missing its RF calibration confirmation while nexus2 ran). Every
+ * thread created by a thread that is pinned to CPU1 alone is created pinned to CPU1 as well.
+ */
+#include <pthread.h>
+#include <sched.h>
+int __real_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                          void *(*start)(void *), void *arg);
+
+static int on_cpu1_only(void)
+{
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (pthread_getaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+    return 0;
+  }
+  return CPU_ISSET(1, &set) && !CPU_ISSET(0, &set);
+}
+
+int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                          void *(*start)(void *), void *arg)
+{
+  if (!on_cpu1_only()) {
+    return __real_pthread_create(thread, attr, start, arg);
+  }
+  pthread_attr_t a;
+  if (attr != NULL) {
+    a = *attr;
+  } else if (pthread_attr_init(&a) != 0) {
+    return __real_pthread_create(thread, attr, start, arg);
+  }
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(1, &set);
+  (void)pthread_attr_setaffinity_np(&a, sizeof(set), &set);
+  int rc = __real_pthread_create(thread, &a, start, arg);
+  if (attr == NULL) {
+    (void)pthread_attr_destroy(&a);
+  }
+  return rc;
 }

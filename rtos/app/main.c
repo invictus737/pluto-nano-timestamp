@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#define _GNU_SOURCE /* pthread_*affinity_np, CPU_SET */
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
@@ -543,6 +544,15 @@ static void *nexus2_entry(void *arg)
     (void)setenv("HOME", "/data/nexus2", 1);
   }
   (void)mkdir("/data/nexus2", 0755);
+  /* the whole station on CPU1 (posix_compat.c pins every thread it creates there too); CPU0
+   * keeps USB, Wi-Fi and the network stack. Rust then leaves placement alone. */
+  {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(1, &one);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(one), &one);
+    (void)setenv("NEXUS2_RTEMS_PIN", "0", 1);
+  }
   /* a start error calls exit(): end this thread, not the system */
   nexus_exit_guard(1, nexus2_exited);
   static char a0[] = "nexus2", a1[] = "--config", a2[] = NEXUS2_CONFIG, a3[] = "run", a4[] = "--live",
