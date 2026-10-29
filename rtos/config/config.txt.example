@@ -66,6 +66,8 @@ cpu_clock = standard
 cpu_clock_cooling_confirmed = no
 # Bluetooth controller [on|off]
 bluetooth = on
+# nexus2 thread placement [light|cpu1|float], applied at the next station start
+nexus_layout = light
 # USB gadget class [rndis|ncm|ecm] and suspend handling [0|1] (Linux firmware, peripheral mode)
 usb_ethernet_mode = rndis
 udc_handle_suspend = 0

@@ -46,6 +46,7 @@
 
 #include "config_store.h"
 #include "netcmd.h"
+#include "nexus_station.h"
 void nexus_fwupdate_register(void);
 #include "ssh_server.h"
 /* ---- Bluetooth (rtos/bt) ---- */
@@ -523,10 +524,12 @@ int nexus_shell_abi(int argc, char **argv); /* abi.c */
 int main(int argc, char **argv); /* nexus2 (Rust) */
 int nexus2_request_stop(void);   /* bins/nexus2/src/rtems_platform.rs */
 int pluto_rtems_pin_to_cpu(int cpu);
+void pluto_rtems_set_thread_attr_hook(void (*hook)(pthread_attr_t *attr, const char *name, void *arg), void *arg);
 
 #define NEXUS2_CONFIG "/data/nexus2/nexus2.toml"
 
 static volatile int nexus2_running;
+static int nexus_layout_override; /* `nexus layout` wins over [SYSTEM] nexus_layout until reboot */
 
 void nexus_exit_guard(int on, void (*cb)(int status)); /* posix_compat.c */
 
@@ -545,14 +548,25 @@ static void *nexus2_entry(void *arg)
     (void)setenv("HOME", "/data/nexus2", 1);
   }
   (void)mkdir("/data/nexus2", 0755);
-  /* the whole station on CPU1 (posix_compat.c pins every thread it creates there too); CPU0
-   * keeps USB, Wi-Fi and the network stack. Rust then leaves placement alone. */
-  {
+  /* placement (posix_compat.c): this thread and every thread it creates belong to the station.
+   * light: start-up, network, dashboard and config on CPU0 at a low priority; nexus2's radio
+   * threads move themselves (rf-front rt_thread.rs reads NEXUS2_RTEMS_LAYOUT): DSP/protocol to
+   * CPU1, SDR stream I/O to CPU0 above the network stack. cpu1: the whole station on CPU1, CPU0
+   * left to USB, Wi-Fi and the network stack (the previous layout). float: priorities only. */
+  nexus_station_mark_self();
+  if (nexus_station_layout != NEXUS_LAYOUT_FLOAT) {
     cpu_set_t one;
     CPU_ZERO(&one);
-    CPU_SET(1, &one);
+    CPU_SET(nexus_station_layout == NEXUS_LAYOUT_CPU1 ? 1 : 0, &one);
     (void)pthread_setaffinity_np(pthread_self(), sizeof(one), &one);
-    (void)setenv("NEXUS2_RTEMS_PIN", "0", 1);
+  }
+  nexus_env_load_file(); /* saved NEXUS2_* switches (`nexus env save`) */
+  (void)setenv("NEXUS2_RTEMS_LAYOUT", nexus_station_layout_name(nexus_station_layout), 1);
+  (void)setenv("NEXUS2_RTEMS_PIN", nexus_station_layout == NEXUS_LAYOUT_LIGHT ? "1" : "0", 1);
+  {
+    char prio[12];
+    snprintf(prio, sizeof(prio), "%d", nexus_station_base_prio);
+    (void)setenv("NEXUS2_RTEMS_BASE_PRIO", prio, 1);
   }
   /* a start error calls exit(): end this thread, not the system */
   nexus_exit_guard(1, nexus2_exited);
@@ -578,9 +592,21 @@ static void nexus2_start(void)
     printf("nexus2: no %s yet: put nexus2.toml on a USB stick (rtos/config/README.md)\n", NEXUS2_CONFIG);
     return;
   }
-  /* radio DMA service threads and interrupts on CPU1, network/USB/SSH stay on CPU0 */
-  (void)pluto_rtems_pin_to_cpu(1);
-  spawn(nexus2_entry, 4, 2 * 1024 * 1024);
+  int layout = nexus_station_layout_parse(nexus_config_get("nexus_layout"));
+  if (layout >= 0 && !nexus_layout_override) {
+    nexus_station_layout = layout;
+  }
+  /* the Pluto driver's DMA service threads and interrupts: with the SDR stream I/O on CPU0
+   * (light, the Nexus-Light pattern: the I/O core takes every interrupt), with the station on
+   * CPU1 (cpu1); float leaves them unpinned */
+  if (nexus_station_layout == NEXUS_LAYOUT_FLOAT) {
+    pluto_rtems_set_thread_attr_hook(NULL, NULL);
+  } else {
+    (void)pluto_rtems_pin_to_cpu(nexus_station_layout == NEXUS_LAYOUT_CPU1 ? 1 : 0);
+  }
+  printf("nexus2: layout %s\n", nexus_station_layout_name(nexus_station_layout));
+  nexus_load_logger_start();
+  spawn(nexus2_entry, nexus_station_base_prio, 2 * 1024 * 1024);
 }
 
 static int shell_nexus(int argc, char **argv)
@@ -589,8 +615,31 @@ static int shell_nexus(int argc, char **argv)
     printf("nexus2: %s\n", nexus2_request_stop() == 0 ? "stop requested" : "not running");
   } else if (argc >= 2 && strcmp(argv[1], "start") == 0) {
     nexus2_start();
+  } else if (argc >= 2 && (strcmp(argv[1], "load") == 0 || strcmp(argv[1], "stages") == 0)) {
+    return nexus_load_shell(argc, argv);
+  } else if (argc >= 2 && strcmp(argv[1], "env") == 0) {
+    return nexus_env_shell(argc, argv);
+  } else if (argc >= 2 && strcmp(argv[1], "layout") == 0) {
+    if (argc >= 3) {
+      int l = nexus_station_layout_parse(argv[2]);
+      if (l < 0) {
+        printf("nexus layout: light|cpu1|float\n");
+        return 1;
+      }
+      nexus_station_layout = l;
+      nexus_layout_override = 1;
+    }
+    printf("nexus2: layout %s%s\n", nexus_station_layout_name(nexus_station_layout),
+           nexus2_running ? " (applies at the next start)" : "");
   } else {
-    printf("nexus2: %s\nusage: nexus start|stop|status\n", nexus2_running ? "running" : "stopped");
+    printf("nexus2: %s, layout %s\n"
+           "usage: nexus start|stop|status\n"
+           "       nexus layout [light|cpu1|float]   placement for the next start (not stored)\n"
+           "       nexus load [seconds]              per-thread CPU %% and CPU0/CPU1 idle\n"
+           "       nexus load log <seconds|0>        summary line period in the log (60)\n"
+           "       nexus stages [reset]              nexus2 per-stage timing\n"
+           "       nexus env [K=V|pluto|save|clear]  NEXUS2_* switches for the next start\n",
+           nexus2_running ? "running" : "stopped", nexus_station_layout_name(nexus_station_layout));
   }
   return 0;
 }
@@ -748,7 +797,7 @@ static void Init(rtems_task_argument arg)
   nexus_bt_start();
   /* ---- end Bluetooth ---- */
 #ifdef NEXUS_RUST_MAIN
-  rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status: the nexus2 station", shell_nexus);
+  rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status|layout|env|load|stages: the nexus2 station", shell_nexus);
   nexus2_start();
 #endif
 
@@ -849,6 +898,8 @@ RTEMS_SCHEDULER_EDF_SMP(main);
  * must not see descriptors >= FD_SETSIZE (newlib: 64): the SSH server uses poll(). */
 #define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 256
 #define CONFIGURE_MAXIMUM_USER_EXTENSIONS 1
+/* pthread_setname_np names (nexus2's std threads, `nexus load`): 16 truncated most of them */
+#define CONFIGURE_MAXIMUM_THREAD_NAME_SIZE 32
 #define CONFIGURE_UNLIMITED_OBJECTS
 #define CONFIGURE_UNIFIED_WORK_AREAS
 #define CONFIGURE_STACK_CHECKER_ENABLED

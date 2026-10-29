@@ -353,6 +353,12 @@ static int v_cpu_clock(char *v)
   return in_list(v, l);
 }
 
+static int v_layout(char *v)
+{
+  static const char *const l[] = {"light", "cpu1", "float", NULL};
+  return in_list(v, l);
+}
+
 static int v_yesno(char *v)
 {
   static const char *const l[] = {"yes", "no", NULL};
@@ -431,6 +437,8 @@ static const keydef_t keys[] = {
   {"cpu_clock", "SYSTEM", CFG_F_UBOOT, v_cpu_clock},
   {"cpu_clock_cooling_confirmed", "SYSTEM", CFG_F_UBOOT, v_yesno},
   {"bluetooth", "SYSTEM", CFG_F_UBOOT, v_onoff},
+  /* station thread placement (rtos/app/posix_compat.c), read at each `nexus start` */
+  {"nexus_layout", "SYSTEM", 0, v_layout},
 };
 #define NKEYS (sizeof(keys) / sizeof(keys[0]))
 

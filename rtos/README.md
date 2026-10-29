@@ -84,6 +84,29 @@ deleted from the stick (secrets are never printed). Format and all keys:
   nexus2.toml (default user `admin`, password `nexus`; change it). Public keys from
   `ssh/authorized_keys` are accepted as well.
 
+## Station placement and load
+
+The station follows the Nexus-Light layout by default (`[SYSTEM] nexus_layout = light`):
+CPU1 runs only the deadline path (RX analysis, drive loop with the modems, TETRA protocol
+tick, TX synthesis, one SCHED_FIFO priority), CPU0 runs the SDR stream I/O (RX/TX workers
+and the Pluto DMA threads and interrupts, above the network stack) and, at a low priority,
+everything else (Brew/TLS, network clients, dashboard, config). `cpu1` is the previous layout
+(whole station on CPU1), `float` keeps priorities without pinning.
+
+Shell (UART or SSH):
+
+| Command | What it does |
+|---|---|
+| `nexus layout [light\|cpu1\|float]` | layout for the next `nexus start` (not stored) |
+| `nexus env [K=V\|pluto\|save\|clear]` | NEXUS2_* switches for the next start; `pluto` = the Linux Pluto set; `save` keeps them in /data/nexus2/nexus2.env |
+| `nexus load [s]` | per-thread CPU % over s seconds (default 5), CPU0/CPU1 busy and idle |
+| `nexus load log <s\|0>` | period of the one-line `load ...` summary in the log (default 60 s) |
+| `nexus stages [reset]` | nexus2 per-stage timing: count, mean/p99/max us, budget, over-budget, us/s |
+
+Budget: the deadline core (CPU1) at most about 50 % busy, CPU0 at least 40 % idle, no
+`TX late block skipped`, `over` counts at 0 for `rx.analysis`, `tx.synthesis`, `drive.turn`
+and `tetra.tick`.
+
 ## Recovery
 
 U-Boot, its DFU mode and the Linux backup are untouched. To go back to Linux, restore the backup

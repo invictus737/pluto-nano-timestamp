@@ -35,6 +35,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "nexus_station.h"
+
 #ifndef AT_FDCWD
 #define AT_FDCWD -2
 #endif
@@ -299,44 +301,145 @@ void __wrap_exit(int status)
 
 
 /*
- * CPU placement of the station (Pluto RTOS): RTEMS pthread_create does not inherit the creator's
- * affinity (the attribute's set applies, all CPUs by default), so nexus2's own threads would
- * spread onto CPU0, where the USB host, the Wi-Fi driver and the network stack run, and starve
- * them (seen: the AIC8800 missing its RF calibration confirmation while nexus2 ran). Every
- * thread created by a thread that is pinned to CPU1 alone is created pinned to CPU1 as well.
+ * CPU placement of the station (Pluto RTOS), the Nexus-Light pattern: one core for the deadline
+ * path, the other for everything that waits on I/O.
+ *
+ * RTEMS pthread_create does not inherit the creator's affinity (the attribute's set applies, all
+ * CPUs by default) and, with the default PTHREAD_INHERIT_SCHED, a thread created by a radio
+ * thread would inherit its real-time priority. Every thread created by a station thread (the
+ * nexus2 entry thread marks itself with nexus_station_mark_self(), its descendants inherit the
+ * mark through a start trampoline) is therefore placed here by layout, before it runs:
+ *
+ * - "light" (default): CPU0 at the station base priority (nexus_station_base_prio). nexus2's
+ *   radio threads then move themselves (rf-front rt_thread.rs, NEXUS2_RTEMS_LAYOUT=light): the
+ *   DSP/protocol roles to CPU1, the SDR stream I/O roles to CPU0 above the network stack. The
+ *   Pluto driver's DMA service threads and interrupts go to CPU0 as well (main.c).
+ * - "cpu1": the previous layout, every station thread on CPU1 with the inherited priority;
+ *   CPU0 left to USB, Wi-Fi and the network stack.
+ * - "float": no pinning, priorities only (scheduling A/B).
+ *
+ * An attribute that already names a single CPU (the Pluto driver's hook) or asks for explicit
+ * scheduling keeps those settings. Threads created outside the station are never touched.
  */
 #include <pthread.h>
 #include <sched.h>
+
+int nexus_station_layout = NEXUS_LAYOUT_LIGHT;
+int nexus_station_base_prio = 4; /* POSIX SCHED_FIFO; low: below libbsd, shell and SSH */
+
+static __thread int station_thread;
+
+const char *nexus_station_layout_name(int layout)
+{
+  return layout == NEXUS_LAYOUT_CPU1 ? "cpu1" : layout == NEXUS_LAYOUT_FLOAT ? "float" : "light";
+}
+
+/* -1 when v is not a layout name */
+int nexus_station_layout_parse(const char *v)
+{
+  if (v == NULL || strcmp(v, "light") == 0) {
+    return NEXUS_LAYOUT_LIGHT;
+  }
+  if (strcmp(v, "cpu1") == 0) {
+    return NEXUS_LAYOUT_CPU1;
+  }
+  if (strcmp(v, "float") == 0) {
+    return NEXUS_LAYOUT_FLOAT;
+  }
+  return -1;
+}
+
+void nexus_station_mark_self(void)
+{
+  station_thread = 1;
+}
+
 int __real_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg);
 
-static int on_cpu1_only(void)
+struct station_start {
+  void *(*start)(void *);
+  void *arg;
+};
+
+static void *station_trampoline(void *p)
 {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (pthread_getaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
-    return 0;
+  struct station_start s = *(struct station_start *)p;
+  free(p);
+  station_thread = 1;
+  return s.start(s.arg);
+}
+
+/* the attribute's set names exactly one CPU */
+static int single_cpu(const cpu_set_t *set)
+{
+  int n = 0;
+  for (int cpu = 0; cpu < CPU_SETSIZE && n < 2; ++cpu) {
+    n += CPU_ISSET(cpu, set) ? 1 : 0;
   }
-  return CPU_ISSET(1, &set) && !CPU_ISSET(0, &set);
+  return n == 1;
 }
 
 int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg)
 {
-  if (!on_cpu1_only()) {
+  if (!station_thread || nexus_station_layout == NEXUS_LAYOUT_FLOAT) {
+    if (station_thread) {
+      struct station_start *s = malloc(sizeof(*s));
+      if (s != NULL) {
+        s->start = start;
+        s->arg = arg;
+        int rc = __real_pthread_create(thread, attr, station_trampoline, s);
+        if (rc != 0) {
+          free(s);
+        }
+        return rc;
+      }
+    }
     return __real_pthread_create(thread, attr, start, arg);
   }
   pthread_attr_t a;
   if (attr != NULL) {
     a = *attr;
+    /* the copy must own its CPU set: the original points into the caller's attribute */
+    if (attr->affinityset != NULL && attr->affinitysetsize == sizeof(a.affinitysetpreallocated)) {
+      a.affinitysetpreallocated = *attr->affinityset;
+      a.affinityset = &a.affinitysetpreallocated;
+    }
   } else if (pthread_attr_init(&a) != 0) {
     return __real_pthread_create(thread, attr, start, arg);
   }
   cpu_set_t set;
   CPU_ZERO(&set);
-  CPU_SET(1, &set);
-  (void)pthread_attr_setaffinity_np(&a, sizeof(set), &set);
-  int rc = __real_pthread_create(thread, &a, start, arg);
+  int explicit_cpu = pthread_attr_getaffinity_np(&a, sizeof(set), &set) == 0 && single_cpu(&set);
+  if (!explicit_cpu) {
+    CPU_ZERO(&set);
+    CPU_SET(nexus_station_layout == NEXUS_LAYOUT_CPU1 ? 1 : 0, &set);
+    (void)pthread_attr_setaffinity_np(&a, sizeof(set), &set);
+  }
+  int inherit = PTHREAD_INHERIT_SCHED;
+  (void)pthread_attr_getinheritsched(&a, &inherit);
+  if (nexus_station_layout == NEXUS_LAYOUT_LIGHT && inherit == PTHREAD_INHERIT_SCHED) {
+    /* never inherit a radio thread's real-time priority on the I/O core */
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = nexus_station_base_prio;
+    (void)pthread_attr_setinheritsched(&a, PTHREAD_EXPLICIT_SCHED);
+    (void)pthread_attr_setschedpolicy(&a, SCHED_FIFO);
+    (void)pthread_attr_setschedparam(&a, &sp);
+  }
+  struct station_start *s = malloc(sizeof(*s));
+  int rc;
+  if (s != NULL) {
+    s->start = start;
+    s->arg = arg;
+    rc = __real_pthread_create(thread, &a, station_trampoline, s);
+    if (rc != 0) {
+      free(s);
+    }
+  } else {
+    rc = __real_pthread_create(thread, &a, start, arg);
+  }
   if (attr == NULL) {
     (void)pthread_attr_destroy(&a);
   }

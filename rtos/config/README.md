@@ -78,6 +78,7 @@ Sections and keys (canonical names = the Linux U-Boot env names):
 | SYSTEM | cpu_clock | standard, 495_396, 950_600, 1100_750 | yes |
 | SYSTEM | cpu_clock_cooling_confirmed | yes, no | yes |
 | SYSTEM | bluetooth | on, off | yes |
+| SYSTEM | nexus_layout | light (default: CPU1 = DSP/protocol, CPU0 = SDR I/O, network, dashboard), cpu1 (whole station on CPU1), float (priorities only) | |
 | SYSTEM | usb_ethernet_mode, udc_handle_suspend | rndis/ncm/ecm, 0/1 | yes |
 | SSH | authorized_key | OpenSSH public key line, repeatable (<= 8 stored) | |
 | ACTIONS | reset, export | 1 = once (reboot after apply / write config-current.txt) | |
