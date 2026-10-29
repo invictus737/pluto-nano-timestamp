@@ -93,9 +93,21 @@
 #ifndef CONFIG_USB_EHCI_NXP_XFER_NUM
 #define CONFIG_USB_EHCI_NXP_XFER_NUM 64
 #endif
-/* schedule handshake bound (NXP waits forever); a miss is counted and the edit goes on */
+/*
+ * Schedule handshake bound (NXP waits forever). A miss is counted and nothing is edited: the
+ * cancel or close is deferred and retried by ehci_nxp_service() (interrupt handler and the
+ * glue's poll through usbh_ehci_async_watchdog()), each retry waiting at most
+ * CONFIG_USB_EHCI_NXP_RETRY_US.
+ */
 #ifndef CONFIG_USB_EHCI_NXP_HANDSHAKE_US
-#define CONFIG_USB_EHCI_NXP_HANDSHAKE_US 5000
+#define CONFIG_USB_EHCI_NXP_HANDSHAKE_US 100000
+#endif
+#ifndef CONFIG_USB_EHCI_NXP_RETRY_US
+#define CONFIG_USB_EHCI_NXP_RETRY_US 1000
+#endif
+/* a synchronous URB whose cancel is deferred: its submitter waits this long, then abandons it */
+#ifndef CONFIG_USB_EHCI_NXP_ORPHAN_MS
+#define CONFIG_USB_EHCI_NXP_ORPHAN_MS 5000
 #endif
 
 struct ehci_nxp_pipe;
@@ -129,6 +141,10 @@ struct ehci_nxp_xfer {
     uint8_t sync;
     uint8_t done;                 /* synchronous: completed, waiting for its submitter */
     uint8_t nqtd;
+    uint8_t in;                   /* IN endpoint (data stage IN for control) */
+    uint8_t cancel_pending;       /* cancel deferred: schedule handshake missed */
+    uint8_t orphan;               /* synchronous submitter gave up: no URB to hand back */
+    uint32_t seq;                 /* incremented at every allocation */
 };
 
 struct ehci_nxp_pipe {
@@ -140,6 +156,8 @@ struct ehci_nxp_pipe {
     uint8_t closing;
     uint8_t xacterrs;             /* in-place restarts of the current qTD (Linux QH_XACTERR_MAX) */
     uint8_t reset_toggle;         /* CLEAR_FEATURE(ENDPOINT_HALT) seen while busy: DATA0 when idle */
+    uint8_t close_pending;        /* close deferred: schedule handshake missed */
+    int close_result;
     uint16_t period;              /* frames between two frame list entries (periodic) */
     uint16_t uframe_interval;     /* NXP uframeInterval: frame list order */
     uint32_t epchar, epcap;
@@ -159,6 +177,9 @@ struct ehci_nxp_stats {
     uint32_t no_qtd, no_xfer, no_pipe;
     uint32_t ep_updates;          /* endpoint characteristics rewritten in place (EP0 address/mps) */
     uint32_t toggle_sets;         /* idle pipe toggle changed (URB data_toggle, CLEAR_FEATURE(HALT)) */
+    uint32_t deferred;            /* cancels/closes deferred by a missed handshake */
+    uint32_t cancel_races;        /* cancelled transfers the controller finished before it stopped */
+    uint32_t orphans;             /* synchronous transfers abandoned by their submitter */
     uint32_t max_handshake_us;
 };
 
@@ -175,6 +196,10 @@ struct ehci_nxp_hcd {
     uint8_t n_ports;
     bool ppc;
     bool running;
+    uint8_t sched_depth[2];       /* nested stops of the async [0] / periodic [1] schedule */
+    uint8_t sched_stuck[2];       /* enable bit cleared, status not yet 0 */
+    uint8_t pending;              /* deferred work for ehci_nxp_service() */
+    uint32_t xfer_seq;
     struct ehci_nxp_stats stats;
 };
 
@@ -188,6 +213,8 @@ extern uint32_t g_framelist[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_FRAME_LIST_S
 struct ehci_nxp_pipe *ehci_nxp_pipe_find(struct usbh_bus *bus, struct usbh_hubport *hport, uint8_t ep_addr, uint8_t type);
 void ehci_nxp_close_hport(struct usbh_bus *bus, struct usbh_hubport *hport);
 void ehci_nxp_scan(struct usbh_bus *bus);
+/* deferred cancels/closes and a stuck schedule stop; critical section held */
+void ehci_nxp_service(struct usbh_bus *bus);
 
 /* glue (port/usb_glue_zynq.c) */
 extern uint8_t usbh_get_port_speed(struct usbh_bus *bus, const uint8_t port);
@@ -213,9 +240,9 @@ struct usbh_ehci_iaa_stats {
     uint32_t kick_cmd, kick_sts, kick_async;
 };
 extern struct usbh_ehci_iaa_stats g_ehci_iaa_stats[CONFIG_USBHOST_MAX_BUS];
-uint32_t usbh_ehci_iaa_pending(uint8_t busid);   /* always 0 */
+uint32_t usbh_ehci_iaa_pending(uint8_t busid);   /* 1 while deferred work waits (glue polls every 2 ms) */
 uint32_t usbh_ehci_iaa_watchdog(uint8_t busid);  /* always 0 */
-uint32_t usbh_ehci_async_watchdog(uint8_t busid); /* always 0 */
+uint32_t usbh_ehci_async_watchdog(uint8_t busid); /* runs ehci_nxp_service(), 1 if work was pending */
 extern volatile uint32_t g_ehci_xacterr_retries;
 
 /*
