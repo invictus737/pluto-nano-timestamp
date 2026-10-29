@@ -38,8 +38,15 @@
 #     fw_patch_table_8800d80_u02.bin, fw_adid_8800d80_u02.bin, fw_patch_8800d80_u02.bin,
 #     fmacfw_8800d80_u02.bin
 #   (the runtime keeps the aic8800D80 userconfig/powerlimit, same TX power v3 format).
+#   AIC8800DC/DW U01 (ROM sub-revision 0): the Linux fdrv loads the plain
+#   fmacfw_patch_8800dc.bin (aicwf_compat_8800dc.c, RWNX_MAC_PATCH_NAME2_8800DC). Neither
+#   this repository nor radxa-pkg/aic8800 publishes it, so it is never downloaded:
+#   AICWF_FW_DC_U01=<file> embeds a vendor copy as usb/aic8800DC/fmacfw_patch_8800dc.bin
+#   (no pinned sha256; its sha256 is printed). Without it a U01 stick fails attach with a
+#   log line naming the missing file.
 # Not fetched: SDIO files, AIC8800/8801 and D80X2 families, RF test, IPC and BLE-scan
-# images, calibmode, U01/U04 images.
+# images, calibmode, D80 U01/U04 images, DC Bluetooth patches (the DC stick in use has no
+# Bluetooth).
 set -euo pipefail
 OUT=${1:?output .c file}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -128,4 +135,10 @@ for entry in $LEGACY_FILES; do
 	fi
 	LIST+=("$out")
 done
+if [ -n "${AICWF_FW_DC_U01:-}" ]; then
+	path=usb/aic8800DC/fmacfw_patch_8800dc.bin
+	cp "$AICWF_FW_DC_U01" "$TMP/$path"
+	echo "aicwf: embedding unpinned DC U01 $path sha256 $(sha256 "$TMP/$path")" >&2
+	LIST+=("$path")
+fi
 python3 -I "$HERE/gen_fwdata.py" --src "$TMP" --out "$OUT" "${LIST[@]}"

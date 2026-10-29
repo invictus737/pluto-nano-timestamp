@@ -2438,7 +2438,7 @@ static rt_err_t aic_firmware_probe_dc_revision(
     }
     context->chip_sub_id = (rt_uint8_t)value;
     context->chip_revision_valid = RT_TRUE;
-    LOG_I("DC/DW silicon: chip=0x%02x sub=%u mcu=%u%s",
+    LOG_D("DC/DW silicon: chip=0x%02x sub=%u mcu=%u%s",
           context->chip_id, context->chip_sub_id, context->chip_mcu_id,
           (context->chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK ?
           " H" : "");
@@ -2452,24 +2452,58 @@ static rt_bool_t aic_firmware_dc_is_h(
            (context->chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK;
 }
 
+/* Firmware set by ROM sub-revision (word 0x20), as the Linux fdrv
+ * (aicwf_compat_8800dc.c: aicwf_plat_patch_load_8800dc,
+ * aicwf_patch_config_8800dc, aicwf_plat_calib_load_8800dc): sub 0 is U01
+ * (plain fmacfw_patch_8800dc.bin, in-driver jump table, no patch table and no
+ * calibration), sub 1 the U02 set, sub 2 the "H" U02 set.  The H silicon
+ * flag (chip ID bits 7:6) selects only the PMIC and TX-gain tables there. */
 static const char *aic_firmware_dc_patch_name(
     const struct aic8800_context *context)
 {
-    if (aic_firmware_dc_is_h(context))
+    switch (context->chip_sub_id)
     {
+    case 0U:
+        return "fmacfw_patch_8800dc.bin";
+    case 1U:
+        return "fmacfw_patch_8800dc_u02.bin";
+    case 2U:
         return "fmacfw_patch_8800dc_h_u02.bin";
+    default:
+        return RT_NULL;
     }
-    return "fmacfw_patch_8800dc_u02.bin";
 }
 
 static const char *aic_firmware_dc_patch_table_name(
     const struct aic8800_context *context)
 {
-    if (aic_firmware_dc_is_h(context))
+    return context->chip_sub_id == 2U ?
+           "fmacfw_patch_tbl_8800dc_h_u02.bin" :
+           "fmacfw_patch_tbl_8800dc_u02.bin";
+}
+
+static const char *aic_firmware_dc_calib_name(
+    const struct aic8800_context *context)
+{
+    return context->chip_sub_id == 2U ?
+           "fmacfw_calib_8800dc_h_u02.bin" :
+           "fmacfw_calib_8800dc_u02.bin";
+}
+
+static const char *aic_firmware_dc_set_name(
+    const struct aic8800_context *context)
+{
+    switch (context->chip_sub_id)
     {
-        return "fmacfw_patch_tbl_8800dc_h_u02.bin";
+    case 0U:
+        return "U01";
+    case 1U:
+        return "U02";
+    case 2U:
+        return "H U02";
+    default:
+        return "unsupported";
     }
-    return "fmacfw_patch_tbl_8800dc_u02.bin";
 }
 
 static rt_err_t aic_firmware_dc_write_words(
@@ -2614,6 +2648,13 @@ static rt_err_t aic_firmware_dc_system_config(
         {0x70001000U, 0x00500001U, 0x00100001U},
         {0x70001028U, 0x0000003cU, 0x00000004U},
     };
+    /* U01 low-temperature PMIC sequence, applied after the common table */
+    static const struct aic_firmware_mask_pair masked_config_u01[] =
+    {
+        {0x70001000U, 0x00010000U, 0x00010000U},
+        {0x70001028U, 0x00000040U, 0x00000040U},
+        {0x70001000U, 0x00010000U, 0x00000000U},
+    };
     const struct aic_firmware_mask_pair *selected_config;
     rt_size_t selected_count;
     rt_uint32_t value;
@@ -2699,6 +2740,23 @@ static rt_err_t aic_firmware_dc_system_config(
             return result;
         }
     }
+    if (context->chip_sub_id == 0U)
+    {
+        for (index = 0; index < sizeof(masked_config_u01) /
+                                sizeof(masked_config_u01[0]); index++)
+        {
+            result = aic_firmware_mem_mask_write(
+                context, masked_config_u01[index].address,
+                masked_config_u01[index].mask,
+                masked_config_u01[index].value);
+            if (result != RT_EOK)
+            {
+                LOG_E("DC U01 system mask write 0x%08x failed: %d",
+                      masked_config_u01[index].address, result);
+                return result;
+            }
+        }
+    }
     return RT_EOK;
 }
 
@@ -2758,7 +2816,7 @@ static rt_err_t aic_firmware_dc_apply_patch_table(
             goto exit;
         }
     }
-    if (aic_firmware_dc_is_h(context))
+    if (context->chip_sub_id == 2U)
     {
         rt_uint32_t value;
 
@@ -2796,13 +2854,68 @@ static rt_err_t aic_firmware_dc_apply_patch_table(
             LOG_I("DC H patch has no variable-group header");
         }
     }
-    LOG_I("applied DC%s U02 patch table (%u bytes)",
-          aic_firmware_dc_is_h(context) ? " H" : "",
-          (unsigned int)table_length);
+    LOG_I("applied DC %s patch table (%u bytes)",
+          aic_firmware_dc_set_name(context), (unsigned int)table_length);
 
 exit:
     rt_free(table);
     return result;
+}
+
+/* U01 has no patch-table file: the Linux fdrv writes the jump table at the
+ * address held in cfg_base + 4 (entry index * 4) and two function pointers
+ * (aicwf_compat_8800dc.c: jump_tbl, patch_tbl_func). */
+static rt_err_t aic_firmware_dc_u01_jump_table(
+    struct aic8800_context *context)
+{
+    static const struct aic_firmware_pair jump_table[] =
+    {
+        {296U, 0x00180001U},
+        {137U, 0x00180011U},
+        {303U, 0x001810f9U},
+        {168U, 0x0018186dU},
+        {308U, 0x00181bbdU},
+        {288U, 0x001820c1U},
+    };
+    static const struct aic_firmware_pair patch_functions[] =
+    {
+        {0x00110054U, 0x0018186dU},
+        {0x0011005cU, 0x0018186dU},
+    };
+    rt_uint32_t jump_address;
+    rt_size_t index;
+    rt_err_t result;
+
+    result = aic_firmware_mem_read(
+        context, AIC_DC_CONFIG_BASE + 4U, &jump_address);
+    if (result != RT_EOK || !jump_address)
+    {
+        LOG_E("DC U01 jump-table pointer unavailable: %d", result);
+        return result == RT_EOK ? -RT_EIO : result;
+    }
+    for (index = 0; index < sizeof(jump_table) / sizeof(jump_table[0]);
+         index++)
+    {
+        result = aic_firmware_mem_write(
+            context, jump_address + jump_table[index].address * 4U,
+            jump_table[index].value);
+        if (result != RT_EOK)
+        {
+            LOG_E("DC U01 jump-table entry %u failed: %d",
+                  jump_table[index].address, result);
+            return result;
+        }
+    }
+    result = aic_firmware_write_pairs(
+        context, patch_functions,
+        sizeof(patch_functions) / sizeof(patch_functions[0]));
+    if (result != RT_EOK)
+    {
+        LOG_E("DC U01 patch functions failed: %d", result);
+        return result;
+    }
+    LOG_I("applied DC U01 jump table at 0x%08x", jump_address);
+    return RT_EOK;
 }
 
 static rt_err_t aic_firmware_dc_patch_config(
@@ -2917,6 +3030,10 @@ static rt_err_t aic_firmware_dc_patch_config(
         LOG_E("DC runtime table upload failed: %d", result);
         return result;
     }
+    if (context->chip_sub_id == 0U)
+    {
+        return aic_firmware_dc_u01_jump_table(context);
+    }
     return aic_firmware_dc_apply_patch_table(context);
 }
 
@@ -2993,17 +3110,15 @@ static rt_err_t aic_firmware_dc_calibrate(
         LOG_I("DC DPD result already valid");
         return RT_EOK;
     }
-    calibration_name = aic_firmware_dc_is_h(context) ?
-                       "fmacfw_calib_8800dc_h_u02.bin" :
-                       "fmacfw_calib_8800dc_u02.bin";
+    calibration_name = aic_firmware_dc_calib_name(context);
     result = aic_firmware_upload(
         context, AIC_FW_FAMILY_DC, calibration_name, AIC_DC_CALIB_ADDRESS);
     if (result != RT_EOK)
     {
         return result;
     }
-    LOG_I("running DC%s U02 DPD calibration",
-          aic_firmware_dc_is_h(context) ? " H" : "");
+    LOG_I("running DC %s DPD calibration",
+          aic_firmware_dc_set_name(context));
     result = aic_firmware_start_app_confirmed(
         context, AIC_DC_CALIB_ENTRY, AIC_START_APP_FUNCTION);
     if (result != RT_EOK)
@@ -3061,14 +3176,30 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
         return result;
     }
     high_id = aic_firmware_dc_is_h(context);
-    if (!((context->chip_sub_id == 1U && !high_id) ||
-          (context->chip_sub_id == 2U && high_id)))
+    patch_name = aic_firmware_dc_patch_name(context);
+    LOG_I("AIC8800%s attach: chip=0x%02x%s sub-revision=%u (%s) mcu=%u, "
+          "firmware %s/%s",
+          context->product_id == AIC8800_USB_PID_AIC8800DW ? "DW" : "DC",
+          context->chip_id, high_id ? " H" : "", context->chip_sub_id,
+          aic_firmware_dc_set_name(context), context->chip_mcu_id,
+          aic_firmware_subdirectory(AIC_FW_FAMILY_DC),
+          patch_name ? patch_name : "-");
+    if (!patch_name)
     {
-        LOG_E("unsupported DC/DW ROM patch revision: chip=0x%02x sub=%u",
-              context->chip_id, context->chip_sub_id);
+        LOG_E("unsupported DC/DW ROM sub-revision %u (Linux knows 0..2)",
+              context->chip_sub_id);
         return -RT_ENOSYS;
     }
-    patch_name = aic_firmware_dc_patch_name(context);
+    if (!aic_firmware_file_available(context, AIC_FW_FAMILY_DC, patch_name))
+    {
+        LOG_E("DC %s firmware %s/%s/%s is not embedded%s",
+              aic_firmware_dc_set_name(context), AIC8800_WIFI_FIRMWARE_PATH,
+              aic_firmware_subdirectory(AIC_FW_FAMILY_DC), patch_name,
+              context->chip_sub_id == 0U ?
+              " (not published upstream; see fetch-firmware.sh AICWF_FW_DC_U01)" :
+              "");
+        return -RT_ENOENT;
+    }
     result = aic_firmware_dc_system_config(context);
     if (result == RT_EOK)
     {
@@ -3079,7 +3210,7 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
     {
         result = aic_firmware_dc_patch_config(context);
     }
-    if (result == RT_EOK)
+    if (result == RT_EOK && context->chip_sub_id >= 1U)
     {
         result = aic_firmware_dc_prepare_calibration(context);
     }
@@ -3114,10 +3245,11 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
     }
     if (result != RT_EOK)
     {
-        LOG_E("DC U02 runtime preparation failed: %d", result);
+        LOG_E("DC %s runtime preparation failed: %d",
+              aic_firmware_dc_set_name(context), result);
         return result;
     }
-    LOG_I("DC%s U02 ROM patch ready", high_id ? " H" : "");
+    LOG_I("DC %s ROM patch ready", aic_firmware_dc_set_name(context));
     return RT_EOK;
 }
 
@@ -3133,6 +3265,12 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
         return -RT_EINVAL;
     }
     *attach_runtime = RT_TRUE;
+    /* silicon identity is per device: never carry it over from a previous
+     * (possibly other-family) device into this probe */
+    context->chip_id = 0;
+    context->chip_sub_id = 0;
+    context->chip_mcu_id = 0;
+    context->chip_revision_valid = RT_FALSE;
     family = aic_firmware_family_from_product(
         context->vendor_id, context->product_id);
     runtime = aic_firmware_product_is_runtime(context->product_id);
@@ -3144,6 +3282,18 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
         {
             return -RT_ENOSYS;
         }
+        /* DC has no boot->runtime re-enumeration.  A D80 transition left
+         * pending by an unplug during its download (disconnect keeps it while
+         * firmware_transition is set) must not survive into this device, nor
+         * be matched by a later, unrelated D80 runtime. */
+        if (g_transition_family != AIC_FW_FAMILY_NONE ||
+            g_firmware_state != AIC_FW_STATE_COLD)
+        {
+            LOG_I("dropping stale firmware transition (state=%d family=%d)",
+                  (int)g_firmware_state, (int)g_transition_family);
+        }
+        g_firmware_state = AIC_FW_STATE_COLD;
+        g_transition_family = AIC_FW_FAMILY_NONE;
         result = aic_firmware_prepare_dc_runtime(context);
         if (result != RT_EOK)
         {

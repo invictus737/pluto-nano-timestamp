@@ -45,3 +45,13 @@ Local changes (RTEMS port), all inside #ifdef AICWF_RTEMS (defined in ../shim/rt
     - upload verify: a file whose size is not a multiple of 4 compares the first word only;
       on mismatch log a register/region dump; for the legacy D80 set a mismatch is a
       warning (the Linux loader never reads uploads back).
+  aic8800/aic8800_firmware.c (DC/DW parity with the Linux fdrv, radxa-pkg/aic8800
+  src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_compat_8800dc.c)
+    - ROM sub-revision 0 (U01) is supported as Linux does it: fmacfw_patch_8800dc.bin,
+      the syscfg_tbl_masked_8800dc_u01 PMIC writes after the common table, the in-driver
+      jump_tbl (at the pointer in cfg_base+4) and patch_tbl_func instead of a patch table,
+      no DPD calibration. Files, patch table, calibration and the patch-variable flag
+      follow chip_sub_id (1 U02, 2 H U02) as Linux; the H chip-ID bits select only the
+      PMIC and TX-gain tables. One attach line logs DC/DW, chip, H, sub-revision, set.
+    - a DC attach drops a firmware transition left pending by a D80 unplugged during
+      its download; each probe clears the per-device chip_id/sub/mcu fields.
