@@ -65,7 +65,7 @@
 #define AIC8800_WIFI_TX_WATCHDOG_MS             1000
 #define AIC8800_WIFI_RX_RECOVERY_ERRORS         64
 #define AIC8800_WIFI_BLE
-#define AIC8800_BT_HCI_RX_BUFFER_SIZE           8192
+#define AIC8800_BT_HCI_RX_BUFFER_SIZE           32768           /* Kconfig 8192: a dropped event stalls the host */
 #define AIC8800_BT_USB_RX_BUFFER_SIZE           4096
 #define AIC8800_BT_RX_THREAD_STACK_SIZE         8192            /* Kconfig 4096 */
 #define AIC8800_BT_RX_THREAD_PRIORITY           15

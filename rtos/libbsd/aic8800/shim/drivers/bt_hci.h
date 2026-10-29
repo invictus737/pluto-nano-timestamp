@@ -54,7 +54,8 @@ struct rt_bt_hci_device
     struct rt_shim_wait rx_wait;
     struct rt_mutex tx_lock;
     struct rt_bt_hci_stats stats;
-    rt_uint8_t opened;
+    rt_uint8_t opened;   /* host side (aicwf_bt_open) */
+    rt_uint8_t link_up;  /* USB interface bound (driver connect/disconnect) */
 };
 
 rt_err_t rt_bt_hci_register(struct rt_bt_hci_device *hci, const char *name,
@@ -72,6 +73,11 @@ rt_err_t rt_bt_hci_receive(struct rt_bt_hci_device *hci, rt_uint8_t packet_type,
 void rt_bt_hci_flush(struct rt_bt_hci_device *hci);
 rt_size_t rt_bt_hci_rx_length(struct rt_bt_hci_device *hci);
 void rt_bt_hci_get_stats(struct rt_bt_hci_device *hci, struct rt_bt_hci_stats *stats);
+/* driver: USB interface bound (1) or gone (0); going down fails the host's reads */
+void rt_bt_hci_link(struct rt_bt_hci_device *hci, rt_bool_t up);
+/* driver: the controller was reset under the host (firmware/patch stage ran again): the host's
+ * reads fail until it closes and reopens */
+void rt_bt_hci_reset_notify(struct rt_bt_hci_device *hci);
 
 #ifdef __cplusplus
 }

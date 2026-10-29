@@ -853,6 +853,24 @@ void aicwf_usbh_dump(void)
     pthread_mutex_unlock(&g_hport_lock);
 }
 
+int aicwf_usbh_first_id(rt_uint16_t *vid, rt_uint16_t *pid)
+{
+    int i, found = 0;
+
+    pthread_mutex_lock(&g_hport_lock);
+    for (i = 0; i < SHIM_MAX_HPORT && !found; i++)
+    {
+        if (g_hports[i] && g_hports[i]->connected)
+        {
+            *vid = g_hports[i]->device_desc.idVendor;
+            *pid = g_hports[i]->device_desc.idProduct;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_hport_lock);
+    return found;
+}
+
 /* "wifi reprobe": re-enumerate the first attached AIC device (re-runs the loader) */
 int aicwf_usbh_reprobe(void)
 {

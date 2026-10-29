@@ -9,6 +9,7 @@
 #include <drivers/bt_hci.h>
 
 #include "aicwf_bt.h"
+#include "aicwf_shim.h"
 
 #define DBG_TAG "aicwf.bt"
 #define DBG_LVL DBG_INFO
@@ -39,6 +40,7 @@ rt_err_t rt_bt_hci_register(struct rt_bt_hci_device *hci, const char *name,
     rt_mutex_init(&hci->tx_lock, "hci-tx", RT_IPC_FLAG_PRIO);
     memset(&hci->stats, 0, sizeof(hci->stats));
     hci->opened = 0;
+    hci->link_up = 0;
     g_hci = hci;
     return RT_EOK;
 }
@@ -138,6 +140,40 @@ void rt_bt_hci_get_stats(struct rt_bt_hci_device *hci, struct rt_bt_hci_stats *s
     }
 }
 
+/* host reads fail (and wake up) until it reopens; link_up < 0 = leave unchanged */
+static void hci_host_down(struct rt_bt_hci_device *hci, int link_up)
+{
+    if (!hci || !hci->rx_wait.ready)
+    {
+        return;
+    }
+    pthread_mutex_lock(&hci->rx_wait.lock);
+    if (link_up >= 0)
+    {
+        hci->link_up = (rt_uint8_t)link_up;
+    }
+    if (link_up != 1)
+    {
+        hci->opened = 0;
+    }
+    pthread_cond_broadcast(&hci->rx_wait.cond);
+    pthread_mutex_unlock(&hci->rx_wait.lock);
+}
+
+void rt_bt_hci_link(struct rt_bt_hci_device *hci, rt_bool_t up)
+{
+    hci_host_down(hci, up ? 1 : 0);
+}
+
+void rt_bt_hci_reset_notify(struct rt_bt_hci_device *hci)
+{
+    if (hci && hci->opened)
+    {
+        LOG_W("controller reset under the host: reopen required");
+        hci_host_down(hci, -1);
+    }
+}
+
 /* ---- aicwf_bt.h ---- */
 
 int aicwf_bt_open(void)
@@ -148,26 +184,27 @@ int aicwf_bt_open(void)
     {
         return -RT_EIO;
     }
-    if (g_hci->opened)
-    {
-        return 0;
-    }
+    /* always ask the driver (its open is idempotent): after a USB replug or a controller
+     * reset it is closed or restarted while a stale host flag would say open */
     rt_bt_hci_flush(g_hci);
     result = g_hci->ops->open(g_hci);
-    if (result == RT_EOK)
-    {
-        g_hci->opened = 1;
-    }
+    pthread_mutex_lock(&g_hci->rx_wait.lock);
+    g_hci->opened = result == RT_EOK;
+    pthread_mutex_unlock(&g_hci->rx_wait.lock);
     return result;
 }
 
 int aicwf_bt_close(void)
 {
-    if (!g_hci || !g_hci->opened)
+    if (!g_hci)
     {
         return 0;
     }
+    pthread_mutex_lock(&g_hci->rx_wait.lock);
     g_hci->opened = 0;
+    pthread_cond_broadcast(&g_hci->rx_wait.cond);
+    pthread_mutex_unlock(&g_hci->rx_wait.lock);
+    /* also after a reset notification or a disconnect: the driver's close is idempotent */
     return g_hci->ops->close ? g_hci->ops->close(g_hci) : 0;
 }
 
@@ -191,7 +228,12 @@ int aicwf_bt_read(uint8_t *buffer, size_t length, int timeout_ms)
     }
     rt_shim_deadline(&deadline, timeout_ms > 0 ? timeout_ms : 0);
     pthread_mutex_lock(&g_hci->rx_wait.lock);
-    while (g_hci->rx_count == 0 && timeout_ms > 0)
+    if (!g_hci->opened)
+    {
+        pthread_mutex_unlock(&g_hci->rx_wait.lock);
+        return -RT_EIO; /* closed, unplugged or reset: the host must reopen */
+    }
+    while (g_hci->rx_count == 0 && timeout_ms > 0 && g_hci->opened)
     {
         if (pthread_cond_timedwait(&g_hci->rx_wait.cond, &g_hci->rx_wait.lock, &deadline) ==
             ETIMEDOUT)
@@ -207,4 +249,51 @@ int aicwf_bt_read(uint8_t *buffer, size_t length, int timeout_ms)
     }
     pthread_mutex_unlock(&g_hci->rx_wait.lock);
     return (int)n;
+}
+
+int aicwf_bt_present(void)
+{
+    rt_uint16_t vid = 0, pid = 0;
+
+    if (g_hci && g_hci->link_up)
+    {
+        return AICWF_BT_READY;
+    }
+    if (!aicwf_usbh_first_id(&vid, &pid))
+    {
+        return AICWF_BT_NO_DEVICE;
+    }
+    /* the DC variant's runtime identity has no Bluetooth function */
+    return pid == 0x88dc ? AICWF_BT_UNSUPPORTED : AICWF_BT_STARTING;
+}
+
+int aicwf_bt_stats(struct aicwf_bt_stats *st)
+{
+    struct rt_bt_hci_stats s;
+    rt_uint16_t vid = 0, pid = 0;
+
+    if (!st)
+    {
+        return -RT_EINVAL;
+    }
+    memset(st, 0, sizeof(*st));
+    if (aicwf_usbh_first_id(&vid, &pid))
+    {
+        st->vid = vid;
+        st->pid = pid;
+    }
+    if (!g_hci)
+    {
+        return -RT_EIO;
+    }
+    pthread_mutex_lock(&g_hci->rx_wait.lock); /* rx counters are updated under this lock */
+    s = g_hci->stats;
+    pthread_mutex_unlock(&g_hci->rx_wait.lock);
+    st->rx_packets = s.rx_packets;
+    st->rx_bytes = s.rx_bytes;
+    st->rx_dropped = s.rx_dropped;
+    st->tx_packets = s.tx_packets;
+    st->tx_bytes = s.tx_bytes;
+    st->tx_errors = s.tx_errors;
+    return 0;
 }

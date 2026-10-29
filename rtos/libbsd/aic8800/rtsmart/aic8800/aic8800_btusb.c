@@ -697,6 +697,7 @@ static int aic_btusb_connect(struct usbh_hubport *hport, rt_uint8_t intf)
         goto fail;
     }
     context->connected = RT_TRUE;
+    rt_bt_hci_link(&context->hci, RT_TRUE);
     hport->config.intf[intf].priv = context;
     rt_snprintf(hport->config.intf[intf].devname,
                 CONFIG_USBHOST_DEV_NAMELEN, "aic-bt");
@@ -739,6 +740,7 @@ static int aic_btusb_disconnect(struct usbh_hubport *hport, rt_uint8_t intf)
     product_id = context->product_id;
     context->opened = RT_FALSE;
     context->connected = RT_FALSE;
+    rt_bt_hci_link(&context->hci, RT_FALSE); /* fail the host's reads now */
     usbh_kill_urb(&context->tx_urb);
     aic_btusb_stop_rx(context);
     rt_bt_hci_flush(&context->hci);
@@ -791,6 +793,16 @@ AIC_BTUSB_CLASS_INFO(g_aic_btusb_88dd,
 AIC_BTUSB_CLASS_INFO(g_aic_btusb_8d91,
                      AIC8800_USB_VENDOR_ID_V2,
                      AIC8800_USB_PID_AIC8800D81X2);
+
+/* The Wi-Fi attach work ran the runtime firmware stage (patch table, btmode) again: a host
+ * stack that had the controller open lost its state and must reset it. */
+void aic8800_btusb_firmware_ready(void)
+{
+    if (g_aic_btusb.registered)
+    {
+        rt_bt_hci_reset_notify(&g_aic_btusb.hci);
+    }
+}
 
 rt_err_t aic8800_btusb_driver_init(void)
 {

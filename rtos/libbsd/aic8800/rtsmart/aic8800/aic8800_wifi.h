@@ -1106,6 +1106,7 @@ rt_err_t aic8800_sdio_pump_command(
 
 #if defined(AIC8800_WIFI_TRANSPORT_USB) && defined(AIC8800_WIFI_BLE)
 rt_err_t aic8800_btusb_driver_init(void);
+void aic8800_btusb_firmware_ready(void);
 #endif
 
 #endif /* __AIC8800_WIFI_H__ */

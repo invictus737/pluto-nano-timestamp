@@ -3917,6 +3917,12 @@ static void aic8800_usb_attach_work(struct rt_work *work, void *work_data)
         result = -RT_EIO;
         goto done;
     }
+#ifdef AIC8800_WIFI_BLE
+    if (attach_runtime)
+    {
+        aic8800_btusb_firmware_ready();
+    }
+#endif
     if (!attach_runtime)
     {
         context->firmware_transition = RT_TRUE;

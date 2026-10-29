@@ -12,6 +12,8 @@ void aicwf_wlan_attach_done(void);
 unsigned aicwf_usbh_attach_count(void);
 void aicwf_usbh_dump(void);
 int aicwf_usbh_reprobe(void);
+/* VID:PID of the first attached AIC device; 0 when none */
+int aicwf_usbh_first_id(rt_uint16_t *vid, rt_uint16_t *pid);
 /* aicwf_fw_files.c: "wifi fwdiag" listing */
 void aicwf_fw_dump(void);
 /* aicwf_fw_files.c: publish the embedded firmware under AIC8800_WIFI_FIRMWARE_PATH */
