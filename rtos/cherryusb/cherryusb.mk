@@ -17,7 +17,7 @@ endif
 # endpoint kept linked, cancel by the schedule handshake, no IAA) or cherry (CherryUSB's EHCI
 # port with patches/). Both provide usb_hc_ehci.h for the glue and the AIC adapter; the nxp
 # directory comes first on the include path so its header wins (usb_ehci_reg.h stays CherryUSB's).
-CHERRY_HCD ?= cherry
+CHERRY_HCD ?= nxp
 ifeq ($(CHERRY_HCD),nxp)
 CHERRY_HCD_INC := -I$(CHERRY_DIR)/port/ehci_nxp
 CHERRY_HCD_OBJ := usb_hc_ehci_nxp.o
