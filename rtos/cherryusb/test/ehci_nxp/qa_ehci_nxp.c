@@ -739,6 +739,478 @@ static void t_qa_hc_recover(void)
     close_all_and_check();
 }
 
+/* ================= recovery under load, unplug during reset, hotplug at a high rate ================= */
+/*
+ * Another thread running while the driver sleeps with the critical section released (handshake,
+ * kill wait, controller reset): the hook runs at every driver sleep, never nested.
+ */
+void __real_usb_osal_msleep(uint32_t delay);
+static void (*g_sleep_hook)(void);
+static int g_in_sleep_hook;
+static uint32_t g_hook_calls;
+
+void __wrap_usb_osal_msleep(uint32_t delay)
+{
+    if (g_sleep_hook && !g_in_sleep_hook && g_sim_crit == 0) {
+        g_in_sleep_hook = 1;
+        g_hook_calls++;
+        g_sleep_hook();
+        g_in_sleep_hook = 0;
+    }
+    __real_usb_osal_msleep(delay);
+}
+
+static void stop_workers(void)
+{
+    g_stop = 1;
+    for (int i = 0; i < g_nwk; i++) {
+        g_wk[i]->want = 0;
+    }
+}
+
+/* the hub thread after a controller reset or a reconnect: change seen, port reset, enumerate */
+static int hub_reenumerate(uint8_t addr)
+{
+    uint32_t st = port_status();
+
+    if (st & (1U << HUB_PORT_FEATURE_C_CONNECTION)) {
+        CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_CLEAR_FEATURE,
+                     HUB_PORT_FEATURE_C_CONNECTION, 1, NULL) == 0);
+    }
+    if (!(port_status() & (1U << HUB_PORT_FEATURE_CONNECTION))) {
+        return 0;
+    }
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE, HUB_PORT_FEATURE_RESET, 1,
+                 NULL) == 0);
+    for (int i = 0; i < g_nwk; i++) {
+        wk_free(g_wk[i]);
+    }
+    g_nwk = 0;
+    memset(&g_dev_stats, 0, sizeof(g_dev_stats));
+    hport_init();
+    enumerate(addr);
+    g_stop = 0;
+    return 1;
+}
+
+static void start_all(void)
+{
+    g_cc_expected = g_cc_got = g_ncp_pkts = g_evt_bad = 0;
+    g_cc_head = g_cc_tail = 0;
+    start_wifi(4, 2);
+    sim_dev_in_enqueue(0x81, 1000000, 20, 1600);
+    stream_init(&s_evt, 0x83, 0, 0);
+    wk_init(&w_evt, &g_ep_evt, &s_evt, 4096);
+    w_evt.rx = rx_events;
+    w_evt.want = 1;
+    wk_register(&w_evt);
+    stream_init(&s_ain, 0x84, 0, 0);
+    wk_init(&w_ain[0], &g_ep_acl_in, &s_ain, 4096);
+    w_ain[0].want = 1;
+    wk_register(&w_ain[0]);
+    stream_init(&s_aout, 0x03, 300, 1000);
+    wk_init(&w_aout, &g_ep_acl_out, &s_aout, 1024);
+    w_aout.want = 0; /* one ACL frame per start (NCP events would pile up while workers stop) */
+    wk_register(&w_aout);
+    for (int i = 0; i < g_nwk; i++) {
+        if (!g_wk[i]->busy) {
+            wk_submit(g_wk[i]);
+        }
+    }
+}
+
+static int wait_recoveries(uint32_t n, uint32_t max_ms)
+{
+    for (uint32_t ms = 0; ms < max_ms && H()->stats.recoveries < n; ms++) {
+        pump_glue_us(1000);
+    }
+    return H()->stats.recoveries >= n;
+}
+
+/* HSE / wedge at random phases of heavy Wi-Fi + BT traffic, 30 times */
+static void t_qa_reset_under_load(void)
+{
+    uint32_t fails = 0;
+
+    bringup();
+    enumerate(60);
+    start_all();
+    pump_glue_us(20000);
+    for (int it = 0; it < 30 && g_fail < 5; it++) {
+        uint32_t r = H()->stats.recoveries;
+        struct pools p;
+
+        g_sim_cfg.stale_cache = sim_rand() & 1;
+        g_dev_cfg.nak_permille = sim_rand() % 300;
+        pump_glue_us(2000 + sim_rand() % 40000); /* any phase */
+        if (it % 3 == 2) {
+            /* wedged core found by a kill (timeout path) */
+            struct wk *w = &w_in[sim_rand() % 4];
+            g_sim_cfg.wedge = 1;
+            sim_dev_block(0x81, 0); /* the killed URB cannot finish by itself (see qa_stuck_stop) */
+            if (w->busy) {
+                /* the adapter's loop: -USB_ERR_BUSY -> sleep with the lock released, again */
+                int rc = 0, tries = 0;
+                do {
+                    size_t f = usb_osal_enter_critical_section();
+                    int want = w->want;
+                    w->want = 0;
+                    rc = usbh_kill_urb(&w->urb);
+                    w->want = want;
+                    usb_osal_leave_critical_section(f);
+                    if (rc == -USB_ERR_BUSY) {
+                        pump_glue_us(1000);
+                    }
+                } while (rc == -USB_ERR_BUSY && w->busy && ++tries < 40000);
+                CHECKV(!w->busy, "it %d: kill rc %d after %d BUSY retries, URB still in the controller", it, rc,
+                       tries);
+            } else {
+                sim_hc_inject_hse();
+            }
+            sim_dev_block(0x81, -1);
+        } else {
+            sim_hc_inject_hse();
+        }
+        if (!wait_recoveries(r + 1, 40000)) {
+            CHECKV(0, "it %d: no controller reset (USBCMD %08x USBSTS %08x USBINTR %08x running %d recovering %d "
+                      "req %d gate %d in_irq %d pending %d after %d us, hse %u halted %u)", it, sim_reg_peek(0x140),
+                   sim_reg_peek(0x144), sim_reg_peek(0x148), H()->running, H()->recovering, H()->recover_req,
+                   H()->gate, H()->in_irq, H()->pending, (int)(H()->recover_after_us - sim_now_us()),
+                   H()->stats.hse, H()->stats.halted_seen);
+            break;
+        }
+        stop_workers();
+        pump_glue_us(1000);
+        p = pools_now();
+        CHECKV(p.pipes == 0 && p.xfers == 0 && p.qtds_free == CONFIG_USB_EHCI_QTD_NUM && busy_workers() == 0,
+               "it %d: after reset pipes %u xfers %u qtds %u busy %d", it, p.pipes, p.xfers, p.qtds_free,
+               busy_workers());
+        /* gated until the port reset */
+        CHECK(ctrl(0x80, 6, 0x0100, 0, 8, 100) == -USB_ERR_NOTCONN);
+        CHECK(hub_reenumerate((uint8_t)(61 + it)));
+        start_all();
+        traffic_flows("after reset under load");
+        CHECKV(g_cc_got == g_cc_expected, "it %d HCI", it);
+        if (sim_viol_total()) {
+            check_no_violations();
+            sim_viol_clear();
+        }
+        /* space the resets beyond the backoff window now and then */
+        if (it % 5 == 4) {
+            stop_workers();
+            pump_glue_us(11000000);
+            g_stop = 0;
+            for (int i = 0; i < g_nwk; i++) {
+                if (g_wk[i] != &w_aout) {
+                    g_wk[i]->want = 1;
+                }
+            }
+        }
+    }
+    printf("  reset under load: recoveries %u (HSE %u wedges %u stuck %u failures %u, last %u ms), kill waits %u "
+           "busy %u, orphans %u, t=%.1f s\n",
+           H()->stats.recoveries, H()->stats.hse, H()->stats.wedges, H()->stats.stuck_cancels,
+           H()->stats.recover_failures, H()->stats.last_recover_ms, H()->stats.kill_waits, H()->stats.kill_busy,
+           H()->stats.orphans, sim_now_ns() / 1e9);
+    check_accounting("reset under load");
+    check_no_violations();
+    close_all_and_check();
+}
+
+/* unplug while the controller reset sleeps with the lock released; submit/kill from "other threads" */
+static int g_hook_mode, g_hook_fired;
+static uint32_t g_hook_refused, g_hook_accepted;
+static struct usbh_urb g_hook_urb;
+static uint8_t *g_hook_buf;
+
+static void hook_during_reset(void)
+{
+    int rc;
+
+    if (g_hook_fired || !H()->recovering) {
+        return;
+    }
+    g_hook_fired = 1;
+    if (g_hook_mode == 0) {
+        /* the device is pulled; the hub thread releases it (kill with !connected) */
+        sim_port_disconnect();
+        g_hp.connected = false;
+        {
+            size_t f = usb_osal_enter_critical_section();
+            CHECK(usbh_kill_urb(&g_ctl_urb) == 0);
+            usb_osal_leave_critical_section(f);
+        }
+    }
+    /* a class driver submits meanwhile: refused */
+    memset(&g_hook_urb, 0, sizeof(g_hook_urb));
+    usbh_bulk_urb_fill(&g_hook_urb, &g_hp, &g_ep_out_data, g_hook_buf, 100, 0, NULL, NULL);
+    rc = usbh_submit_urb(&g_hook_urb);
+    if (rc == -USB_ERR_NOTCONN) {
+        g_hook_refused++;
+    } else {
+        g_hook_accepted++;
+        CHECKV(0, "URB accepted during a controller reset (rc %d)", rc);
+    }
+    /* a kill of an URB the reset is handing back */
+    {
+        size_t f = usb_osal_enter_critical_section();
+        for (int i = 0; i < 4; i++) {
+            if (w_in[i].busy) {
+                int k = usbh_kill_urb(&w_in[i].urb);
+                CHECKV(k == 0 || k == -USB_ERR_BUSY || k == -USB_ERR_INVAL, "kill during reset rc %d", k);
+                break;
+            }
+        }
+        usb_osal_leave_critical_section(f);
+    }
+}
+
+static void t_qa_unplug_during_reset(void)
+{
+    g_hook_buf = sim_dma_alloc(512, 32);
+    for (int mode = 0; mode < 2; mode++) {
+        uint32_t r;
+
+        bringup();
+        enumerate(70);
+        start_all();
+        pump_glue_us(20000);
+        r = H()->stats.recoveries;
+        g_hook_mode = mode;
+        g_hook_fired = 0;
+        g_sleep_hook = hook_during_reset;
+        sim_hc_inject_hse();
+        CHECK(wait_recoveries(r + 1, 5000));
+        g_sleep_hook = NULL;
+        CHECKV(g_hook_fired, "mode %d: the reset never slept with the lock released", mode);
+        stop_workers();
+        pump_glue_us(5000);
+        {
+            struct pools p = pools_now();
+            CHECKV(p.pipes == 0 && p.xfers == 0 && p.qtds_free == CONFIG_USB_EHCI_QTD_NUM && busy_workers() == 0,
+                   "mode %d: pipes %u xfers %u qtds %u busy %d", mode, p.pipes, p.xfers, p.qtds_free, busy_workers());
+        }
+        if (mode == 0) {
+            /* replugged 300 ms later */
+            pump_glue_us(300000);
+            sim_port_connect();
+            sim_advance_ms(2);
+        }
+        CHECK(hub_reenumerate((uint8_t)(71 + mode)));
+        start_all();
+        traffic_flows(mode ? "reset, hook submits" : "unplug during reset, replug");
+        printf("  unplug during reset mode %d: hook refused %u accepted %u, recoveries %u failures %u\n", mode,
+               g_hook_refused, g_hook_accepted, H()->stats.recoveries, H()->stats.recover_failures);
+        check_accounting("unplug during reset");
+        check_no_violations();
+        close_all_and_check();
+    }
+    sim_dma_free(g_hook_buf);
+}
+
+/*
+ * After a controller reset the hub thread resets the port (gate opens), waits
+ * DELAY_TIME_AFTER_RESET (200 ms) and only then releases the old device. Meanwhile the old
+ * class drivers (hport still connected, old address) may submit: those URBs go to an address
+ * the reset device no longer has.
+ */
+static void t_qa_gate_stale_window(void)
+{
+    uint32_t r, accepted = 0, viol0;
+
+    bringup();
+    enumerate(80);
+    start_all();
+    pump_glue_us(20000);
+    r = H()->stats.recoveries;
+    sim_hc_inject_hse();
+    CHECK(wait_recoveries(r + 1, 5000));
+    stop_workers();
+    pump_glue_us(1000);
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_CLEAR_FEATURE,
+                 HUB_PORT_FEATURE_C_CONNECTION, 1, NULL) == 0);
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE, HUB_PORT_FEATURE_RESET, 1,
+                 NULL) == 0);
+    /* the old device's drivers, before usbh_hubport_release(): g_hp still connected, old address */
+    viol0 = g_viol[V_ADDR];
+    g_stop = 0;
+    for (int i = 0; i < g_nwk; i++) {
+        g_wk[i]->want = 1;
+        if (!g_wk[i]->busy) {
+            wk_submit(g_wk[i]);
+            accepted += g_wk[i]->busy;
+        }
+    }
+    pump_glue_us(200000);
+    printf("  stale window: %u old-device URBs accepted after the port reset, %u transactions to the old address, "
+           "errors %u\n", accepted, g_viol[V_ADDR] - viol0, H()->stats.errors);
+    CHECKV(accepted == 0, "%u URBs of the released-to-be device accepted between port reset and release", accepted);
+    stop_workers();
+    /* the hub thread releases it now */
+    g_hp.connected = false;
+    {
+        size_t f = usb_osal_enter_critical_section();
+        usbh_kill_urb(&g_ctl_urb);
+        usb_osal_leave_critical_section(f);
+    }
+    pump_glue_us(5000);
+    CHECK(busy_workers() == 0);
+    sim_viol_clear();
+    for (int i = 0; i < g_nwk; i++) {
+        wk_free(g_wk[i]);
+    }
+    g_nwk = 0;
+    memset(&g_dev_stats, 0, sizeof(g_dev_stats));
+    hport_init();
+    enumerate(81);
+    g_stop = 0;
+    start_all();
+    traffic_flows("after the stale window");
+    check_no_violations();
+    close_all_and_check();
+}
+
+/*
+ * Wedged core (USBSTS.AS stops following USBCMD.ASE) found by a kill whose URB completes
+ * during the stop handshake anyway: the kill returns at once (its URB is back), the stop stays
+ * "stuck" (ASE off) and only ehci_nxp_service() retries it with 20 us waits. Expected: the
+ * driver escalates to a controller reset (or the schedule runs again) within a bounded time.
+ */
+static void t_qa_stuck_stop(void)
+{
+    uint32_t r, fast0;
+    uint64_t t0;
+    int esc = 0;
+
+    bringup();
+    enumerate(95);
+    start_wifi(4, 2);
+    sim_dev_in_enqueue(0x81, 1000000, 20, 1600);
+    pump_glue_us(20000);
+    r = H()->stats.recoveries;
+    g_sim_cfg.wedge = 1;
+    for (int i = 0; i < 4; i++) {
+        if (w_in[i].busy) {
+            wk_kill(&w_in[i]);
+            break;
+        }
+    }
+    fast0 = g_glue_fast_wakeups;
+    t0 = sim_now_ns();
+    for (int ms = 0; ms < 10000 && !esc; ms++) {
+        pump_glue_us(1000);
+        esc = H()->stats.recoveries > r ||
+              ((sim_reg_peek(0x140) & (1U << 5)) && !H()->pending && !H()->sched_stuck[0]);
+    }
+    printf("  stuck stop: escalated %s after %.0f ms; misses %u, handshake run %u, deferred %u, kill waits %u, "
+           "glue 2 ms wakeups %u, USBCMD %08x pending %d stuck %d\n",
+           esc ? "yes" : "NO", (sim_now_ns() - t0) / 1e6, H()->stats.handshake_timeouts, H()->hs_miss_run,
+           H()->stats.deferred, H()->stats.kill_waits, g_glue_fast_wakeups - fast0, sim_reg_peek(0x140),
+           H()->pending, H()->sched_stuck[0]);
+    CHECKV(esc, "async schedule left disabled by a stuck stop with no controller reset for 10 s "
+                "(ehci_nxp_service retries with 20 us waits never count as a miss)");
+    g_sim_cfg.wedge = 0;
+    sim_viol_clear();
+    stop_workers();
+    if (!esc) {
+        size_t f = usb_osal_enter_critical_section();
+        ehci_nxp_request_recover(B);
+        usb_osal_leave_critical_section(f);
+        wait_recoveries(r + 1, 35000);
+    }
+    pump_glue_us(5000);
+    close_all_and_check();
+}
+
+/* USB-C hot swap: unplug/replug every 5..60 ms, also in the middle of enumeration and transfers */
+static void t_qa_hotplug_rate(void)
+{
+    uint32_t enum_ok = 0, cycles = 0, mid_enum = 0;
+
+    bringup();
+    enumerate(90);
+    start_all();
+    for (int c = 0; c < 400 && g_fail < 5; c++) {
+        uint32_t hold = 5 + sim_rand() % 55;
+        struct pools p;
+
+        pump_glue_us((uint64_t)hold * 1000);
+        stop_workers();
+        sim_port_disconnect();
+        pump_glue_us(500 + sim_rand() % 3000);
+        g_hp.connected = false;
+        {
+            size_t f = usb_osal_enter_critical_section();
+            usbh_kill_urb(&g_ctl_urb);
+            usb_osal_leave_critical_section(f);
+        }
+        pump_glue_us(2000);
+        p = pools_now();
+        CHECKV(p.pipes == 0 && p.xfers == 0 && p.qtds_free == CONFIG_USB_EHCI_QTD_NUM && busy_workers() == 0,
+               "cycle %d: pipes %u xfers %u qtds %u busy %d", c, p.pipes, p.xfers, p.qtds_free, busy_workers());
+        for (int i = 0; i < g_nwk; i++) {
+            wk_free(g_wk[i]);
+        }
+        g_nwk = 0;
+        sim_port_connect();
+        pump_glue_us(1000 + sim_rand() % 5000);
+        if (!(port_status() & (1U << HUB_PORT_FEATURE_CONNECTION))) {
+            continue;
+        }
+        CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_CLEAR_FEATURE,
+                     HUB_PORT_FEATURE_C_CONNECTION, 1, NULL) == 0);
+        CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE,
+                     HUB_PORT_FEATURE_RESET, 1, NULL) == 0);
+        memset(&g_dev_stats, 0, sizeof(g_dev_stats));
+        hport_init();
+        if (c % 4 == 3) {
+            /* pulled in the middle of enumeration */
+            int n;
+            CHECK(ctrl(0x80, 6, 0x0100, 0, 8, 500) == 8);
+            sim_port_disconnect();
+            n = ctrl(0x00, 5, (uint16_t)(1 + c % 100), 0, 0, 200);
+            CHECKV(n < 0, "SET_ADDRESS to an unplugged device returned %d", n);
+            g_hp.connected = false;
+            {
+                size_t f = usb_osal_enter_critical_section();
+                usbh_kill_urb(&g_ctl_urb);
+                usb_osal_leave_critical_section(f);
+            }
+            pump_glue_us(2000);
+            CHECK(pools_now().pipes == 0 && pools_now().xfers == 0);
+            sim_port_connect();
+            pump_glue_us(2000);
+            CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_CLEAR_FEATURE,
+                         HUB_PORT_FEATURE_C_CONNECTION, 1, NULL) == 0);
+            CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE,
+                         HUB_PORT_FEATURE_RESET, 1, NULL) == 0);
+            memset(&g_dev_stats, 0, sizeof(g_dev_stats));
+            hport_init();
+            mid_enum++;
+        }
+        enumerate((uint8_t)(1 + c % 120));
+        enum_ok++;
+        g_stop = 0;
+        start_all();
+        cycles++;
+        if (sim_viol_total()) {
+            printf("  cycle %d: violations\n", c);
+            check_no_violations();
+            sim_viol_clear();
+        }
+    }
+    pump_glue_us(20000);
+    traffic_flows("after hotplug storm");
+    printf("  hotplug: %u cycles (%u pulled mid-enumeration), %u enumerations, recoveries %u, handshake misses %u, "
+           "deferred %u, t=%.1f s\n",
+           cycles, mid_enum, enum_ok, H()->stats.recoveries, H()->stats.handshake_timeouts, H()->stats.deferred,
+           sim_now_ns() / 1e9);
+    CHECK(H()->stats.recoveries == 0);
+    check_accounting("hotplug");
+    check_no_violations();
+    close_all_and_check();
+}
+
 /* ================= runner ================= */
 static const struct {
     const char *name;
@@ -751,6 +1223,11 @@ static const struct {
     { "qa_deferred_kill", t_qa_deferred_kill },
     { "qa_error_storm", t_qa_error_storm },
     { "qa_hc_recover", t_qa_hc_recover },
+    { "qa_reset_under_load", t_qa_reset_under_load },
+    { "qa_unplug_during_reset", t_qa_unplug_during_reset },
+    { "qa_gate_stale_window", t_qa_gate_stale_window },
+    { "qa_stuck_stop", t_qa_stuck_stop },
+    { "qa_hotplug_rate", t_qa_hotplug_rate },
     { "qa_soak", t_qa_soak },
 };
 

@@ -18,7 +18,7 @@ $CC "${CF[@]}" -include "$HERE/qa_regs.h" -c "$ROOT/port/ehci_nxp/usb_hc_ehci_nx
 for f in sim_hc sim_mmio sim_dev sim_glue qa_ehci_nxp; do
   $CC "${CF[@]}" -c "$HERE/$f.c" -o "$OUT/$f.o"
 done
-$CC "${CF[@]}" -Wl,--wrap=usb_osal_enter_critical_section -Wl,--wrap=usb_osal_leave_critical_section \
+$CC "${CF[@]}" -Wl,--wrap=usb_osal_enter_critical_section -Wl,--wrap=usb_osal_leave_critical_section -Wl,--wrap=usb_osal_msleep \
     "$OUT"/drv.o "$OUT"/sim_hc.o "$OUT"/sim_mmio.o "$OUT"/sim_dev.o "$OUT"/sim_glue.o \
     "$OUT"/qa_ehci_nxp.o -o "$OUT/qa_ehci_nxp"
 "$OUT/qa_ehci_nxp" "$@"
