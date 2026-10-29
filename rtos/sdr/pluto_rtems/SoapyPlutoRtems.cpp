@@ -370,6 +370,12 @@ SoapyPlutoRtems::SoapyPlutoRtems(const SoapySDR::Kwargs &args)
     setAntenna(SOAPY_SDR_RX, 0, "A_BALANCED");
     setGainMode(SOAPY_SDR_RX, 0, false);
     setAntenna(SOAPY_SDR_TX, 0, "A");
+    // TX FIR scale: the device argument wins, else the board config key (config.txt [RADIO])
+    if (args.count("tx_fir_scale") == 0 && nexus_config_get) {
+      const char *v = nexus_config_get("ad9363_tx_fir_scale");
+      if (v && *v)
+        handle_args(SoapySDR::Kwargs{{"tx_fir_scale", v}}, -1);
+    }
     handle_args(args, -1);
   } catch (...) {
     pluto_hw_close();
@@ -412,6 +418,15 @@ void SoapyPlutoRtems::handle_args(const SoapySDR::Kwargs &args, int direction)
         SoapySDR_logf(SOAPY_SDR_INFO, "analog loopback enabled");
       loopback_ = int(lb);
     }
+  }
+
+  uint32_t scale = parse_u32(args, "tx_fir_scale", 1, present);
+  if (present) {
+    if (scale != 1 && scale != 2)
+      throw std::runtime_error("invalid value for tx_fir_scale, expected 1 (Linux table) or 2 (unity /4 TX FIR)");
+    std::lock_guard<std::recursive_mutex> lock(dev_mutex_);
+    if (pluto_hw_set_tx_fir_scale(scale) < 0)
+      throw std::runtime_error("PlutoSDR: TX FIR reload failed");
   }
 
   uint32_t every = parse_u32(args, "timestamp_every", 0, present);
@@ -765,9 +780,21 @@ void SoapyPlutoRtems::level_account(Stream *s, const void *buf, size_t samples, 
       SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR RX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; gain %d dB %s",
                     pk, rms, double(now - s->level_since_ns) * 1e-9, rx_gain_db_.load(),
                     gain_auto_ ? "slow_attack" : "manual");
-    else
-      SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR TX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; attenuation %u mdB",
-                    pk, rms, double(now - s->level_since_ns) * 1e-9, unsigned(tx_atten_mdb_.load()));
+    else {
+      // REG 0x05E CH1 overflow bits, read only (an SPI read every 10 s)
+      int ov = pluto_hw_tx_overflow();
+      char ovs[64];
+      if (ov < 0)
+        std::snprintf(ovs, sizeof(ovs), "unread (%d)", ov);
+      else
+        std::snprintf(ovs, sizeof(ovs), "0x%02x fir %d hb1 %d qec %d hb2 %d hb3 %d int3 %d", unsigned(ov),
+                      !!(ov & 0x02), !!(ov & 0x04), !!(ov & 0x08), !!(ov & 0x10), !!(ov & 0x20), !!(ov & 0x40));
+      SoapySDR_logf(SOAPY_SDR_INFO,
+                    "PlutoSDR TX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; attenuation %u mdB; FIR x%u; "
+                    "TX overflow: %s",
+                    pk, rms, double(now - s->level_since_ns) * 1e-9, unsigned(tx_atten_mdb_.load()),
+                    unsigned(pluto_hw_get_tx_fir_scale()), ovs);
+    }
   }
   pluto_level_reset(&s->level);
   s->level_since_ns = now;
@@ -1006,6 +1033,8 @@ void SoapyPlutoRtems::writeSetting(const std::string &key, const std::string &va
   // SoapyPlutoSDR ignores settings; loopback is accepted here like the device argument
   if (key == "loopback")
     handle_args(SoapySDR::Kwargs{{"loopback", value}}, -1);
+  else if (key == "tx_fir_scale")
+    handle_args(SoapySDR::Kwargs{{"tx_fir_scale", value}}, -1);
 }
 
 std::string SoapyPlutoRtems::readSetting(const std::string &key) const
@@ -1015,6 +1044,8 @@ std::string SoapyPlutoRtems::readSetting(const std::string &key) const
     return std::to_string(loopback_ < 0 ? 0 : loopback_);
   if (key == "ad936x_refclk")
     return std::to_string(refclk_hz_);
+  if (key == "tx_fir_scale")
+    return std::to_string(pluto_hw_get_tx_fir_scale());
   if (key == "rx_overflows" && rx_)
     return std::to_string(rx_->reader.track.overflows);
   if (key == "rx_lost_samples" && rx_)

@@ -64,6 +64,14 @@ int pluto_hw_summary(char *buf, size_t cap);
 /* "TX chain: ..." and "RX chain: ..." readback lines (FIR passband gain from the loaded taps) */
 int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rxcap);
 
+/* TX FIR taps x1 (default, the libad9361 table Linux loads: /4 passband -6.02 dB) or x2 (/4
+ * passband at unity); a loaded FIR is reloaded at once. 0 ok, -EINVAL */
+int pluto_hw_set_tx_fir_scale(uint32_t scale);
+uint32_t pluto_hw_get_tx_fir_scale(void);
+/* CH1 TX digital overflow bits of REG 0x05E (INT3 0x40, HB3 0x20, HB2 0x10, QEC 0x08, HB1 0x04,
+ * TX FIR 0x02), read only (bit 7 there is BBPLL lock, bit 0 the RX FIR); negative error */
+int pluto_hw_tx_overflow(void);
+
 /* AD9363 temperature in milli-degrees C */
 int pluto_hw_temp_mdeg(int32_t *mdeg);
 

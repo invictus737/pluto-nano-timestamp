@@ -49,6 +49,7 @@ static int suspect;             /* an operation failed: rebuild at the next open
 static uint32_t cur_bb_rate;    /* AD9363 baseband rate last programmed */
 static int cur_fpga_fir = -1;   /* PL x8 FIR on/off */
 static int cur_band = -1;
+static uint32_t tx_fir_scale = 1; /* TX FIR taps x1 (Linux table) or x2 (unity /4 passband) */
 
 #define LOCK() pthread_mutex_lock(&hw_lock)
 #define UNLOCK() pthread_mutex_unlock(&hw_lock)
@@ -492,7 +493,9 @@ static int load_fir(uint32_t dec, const int16_t *taps, uint32_t ntaps)
   tx.tx_gain = FIR_TX_GAIN_DB;
   tx.tx_int = dec;
   tx.tx_coef_size = (uint8_t)ntaps;
-  memcpy(tx.tx_coef, taps, ntaps * sizeof(int16_t));
+  /* tx_fir_scale applies to the /4 table only: the /2 tables are already unity per phase */
+  if (pluto_fir_scale_taps(taps, ntaps, dec == 4 ? tx_fir_scale : 1, tx.tx_coef) < 0)
+    return -ERANGE;
   int32_t ret = ad9361_set_rx_fir_config(phy, rx);
   if (ret >= 0)
     ret = ad9361_set_tx_fir_config(phy, tx);
@@ -874,16 +877,18 @@ int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rx
   uint32_t dgpio = REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT), agpio = REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT);
   uint32_t tint = tc.tx_int ? tc.tx_int : 1, rdec = rf.rx_dec ? rf.rx_dec : 1;
   /* the loaded taps are ours (load_fir); the readback sizes/gains say they are in place */
-  double tdb = fir_dc_db(fir_taps(tint, tc.tx_coef_size), tc.tx_coef_size, tint, tc.tx_gain);
+  uint32_t tscale = tint == 4 ? tx_fir_scale : 1;
+  double tdb = fir_dc_db(fir_taps(tint, tc.tx_coef_size), tc.tx_coef_size, tint, tc.tx_gain) +
+               20.0 * log10((double)tscale);
   double rdb = fir_dc_db(fir_taps(rdec, rf.rx_coef_size), rf.rx_coef_size, 1, rf.rx_gain);
   int thb3 = tf >= 0 ? (tf >> 4) & 3 : -1;
   int rhb3 = rfc >= 0 ? (rfc >> 4) & 3 : -1;
   snprintf(tx_line, txcap,
            "TX chain: FPGA interp x%u (stock ADI pluto interpolator, same bitstream as Linux), "
-           "FIR %u taps int %u gain %d dB, taps per output phase sum to %+.2f dB (libad9361 table, as on Linux), HB THB3 %d THB2 %d THB1 %d (reg 0x002 "
+           "FIR %u taps int %u gain %d dB x%u taps, effective passband %+.2f dB (x1 = libad9361 table as on Linux), HB THB3 %d THB2 %d THB1 %d (reg 0x002 "
            "= 0x%02x), PHY %u S/s, DAC 12-bit MSB aligned (CS16 +-32767 = full scale), atten %u mdB",
            (dgpio & 1u) ? 8u : 1u, (unsigned)tc.tx_coef_size, (unsigned)tc.tx_int, (int)tc.tx_gain,
-           tdb, thb3, tf >= 0 ? !!(tf & THB2_EN) : -1, tf >= 0 ? !!(tf & THB1_EN) : -1,
+           (unsigned)tscale, tdb, thb3, tf >= 0 ? !!(tf & THB2_EN) : -1, tf >= 0 ? !!(tf & THB1_EN) : -1,
            (unsigned)(tf & 0xff), (unsigned)txr, (unsigned)att);
   static const char *const modes[] = {"manual", "fast_attack", "slow_attack", "hybrid"};
   snprintf(rx_line, rxcap,
@@ -896,6 +901,52 @@ int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rx
            mode < 4 ? modes[mode] : "?");
   UNLOCK();
   return 0;
+}
+
+int pluto_hw_set_tx_fir_scale(uint32_t scale)
+{
+  if (scale != 1 && scale != 2)
+    return -EINVAL;
+  LOCK();
+  int ret = 0;
+  if (scale != tx_fir_scale) {
+    tx_fir_scale = scale;
+    printf("pluto: TX FIR taps x%u (%s)\n", (unsigned)scale,
+           scale == 1 ? "libad9361 table, as Linux" : "/4 passband at unity, +6.02 dB over Linux");
+    /* a loaded FIR is reloaded at once at the current rate */
+    if (phy && cur_bb_rate) {
+      struct pluto_rate_plan pl;
+      uint32_t stream = cur_fpga_fir > 0 ? cur_bb_rate / 8u : cur_bb_rate;
+      ret = pluto_rate_plan(stream, &pl);
+      if (ret == 0 && pl.phy_hz == cur_bb_rate) {
+        ret = set_bb_rate(&pl);
+        if (ret >= 0)
+          ret = verify_rate(&pl);
+      }
+      if (ret < 0) {
+        cur_bb_rate = 0;
+        suspect = 1;
+      }
+    }
+  }
+  UNLOCK();
+  return ret;
+}
+
+uint32_t pluto_hw_get_tx_fir_scale(void)
+{
+  LOCK();
+  uint32_t v = tx_fir_scale;
+  UNLOCK();
+  return v;
+}
+
+int pluto_hw_tx_overflow(void)
+{
+  LOCK();
+  int v = phy ? (int)ad9361_spi_read(phy->spi, REG_CH_1_OVERFLOW) : -ENODEV;
+  UNLOCK();
+  return v < 0 ? v : (v & (CH_1_INT3 | CH1_HB3 | CH1_HB2 | CH1_QEC | CH1_HB1 | CH1_TFIR));
 }
 
 /* ---- timestamping core registers ---- */

@@ -387,6 +387,12 @@ static int v_u32(char *v)
   return (end != NULL && *end == '\0') ? 0 : -1;
 }
 
+static int v_12(char *v)
+{
+  static const char *const l[] = {"1", "2", NULL};
+  return in_list(v, l);
+}
+
 static int v_usb_eth_mode(char *v)
 {
   static const char *const l[] = {"rndis", "ncm", "ecm", NULL};
@@ -439,13 +445,15 @@ static const keydef_t keys[] = {
   {"bluetooth", "SYSTEM", CFG_F_UBOOT, v_onoff},
   /* station thread placement (rtos/app/posix_compat.c), read at each `nexus start` */
   {"nexus_layout", "SYSTEM", 0, v_layout},
+  /* native AD9363 driver: TX FIR taps x1 (libad9361 table as Linux) or x2 (/4 passband unity) */
+  {"ad9363_tx_fir_scale", "RADIO", 0, v_12},
 };
 #define NKEYS (sizeof(keys) / sizeof(keys[0]))
 
 /* [ACTIONS]: reset and export act once and are not stored; the others are stored as
  * action_<name> = 1 for their consumers (which clear them) */
 static const char *const actions[] = {"reset", "export", "calibrate", "diagnostic_report", "dfu", NULL};
-static const char *const sections[] = {"NETWORK", "WLAN", "USB_ETHERNET", "SYSTEM", "SSH", "ACTIONS", NULL};
+static const char *const sections[] = {"NETWORK", "WLAN", "USB_ETHERNET", "SYSTEM", "RADIO", "SSH", "ACTIONS", NULL};
 
 static const keydef_t *find_key(const char *name)
 {

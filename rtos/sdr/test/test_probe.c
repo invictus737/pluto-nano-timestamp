@@ -8,8 +8,10 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "pluto_fir.h"
 #include "pluto_framing.h"
 #include "pluto_probe.h"
 
@@ -182,8 +184,43 @@ static void test_level(void)
         "CS8 peak %.2f", pk);
 }
 
+static void test_fir_scale(void)
+{
+  int16_t out[128];
+  int32_t ph[4] = {0, 0, 0, 0};
+  int peak = 0;
+  CHECK(pluto_fir_scale_taps(pluto_fir_128_4, 128, 2, out) == 0, "x2 fits int16");
+  for (int i = 0; i < 128; ++i) {
+    CHECK(out[i] == 2 * pluto_fir_128_4[i], "tap %d", i);
+    ph[i % 4] += out[i];
+    if (abs(out[i]) > peak)
+      peak = abs(out[i]);
+  }
+  CHECK(peak == 31842, "largest scaled tap %d", peak);
+  /* unity per output phase after the x4 zero stuffing: 32768 +- 0.1 % */
+  for (int k = 0; k < 4; ++k)
+    CHECK(abs(ph[k] - 32768) <= 33, "phase %d sum %d", k, (int)ph[k]);
+  double mean = (ph[0] + ph[1] + ph[2] + ph[3]) / 4.0 / 32768.0;
+  CHECK(fabs(20.0 * log10(mean)) < 0.01, "x2 passband %.3f dB", 20.0 * log10(mean));
+  /* x1 = the Linux table: -6.02 dB */
+  int32_t s1 = 0;
+  for (int i = 0; i < 128; ++i)
+    s1 += pluto_fir_128_4[i];
+  CHECK(fabs(20.0 * log10(s1 / 4.0 / 32768.0) + 6.02) < 0.01, "x1 passband -6.02 dB");
+  CHECK(pluto_fir_scale_taps(pluto_fir_128_4, 128, 1, out) == 0 && memcmp(out, pluto_fir_128_4, sizeof(out)) == 0,
+        "x1 unchanged");
+  /* the /2 tables (already unity) would overflow at x2: refused, output untouched */
+  int16_t guard[128];
+  memset(guard, 0x5a, sizeof(guard));
+  CHECK(pluto_fir_scale_taps(pluto_fir_128_2, 128, 2, guard) == -ERANGE && guard[0] == 0x5a5a, "x2 of a /2 table refused");
+  CHECK(pluto_fir_scale_taps(pluto_fir_128_4, 128, 3, out) == -EINVAL, "scale 3 refused");
+  printf("fir: /4 table x2 per-phase sums %d %d %d %d, largest tap %d\n", (int)ph[0], (int)ph[1], (int)ph[2],
+         (int)ph[3], peak);
+}
+
 int main(void)
 {
+  test_fir_scale();
   test_probe();
   test_plan();
   test_level();

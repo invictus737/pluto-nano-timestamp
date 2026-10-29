@@ -80,6 +80,7 @@ Sections and keys (canonical names = the Linux U-Boot env names):
 | SYSTEM | bluetooth | on, off | yes |
 | SYSTEM | nexus_layout | light (default: CPU1 = DSP/protocol, CPU0 = SDR I/O, network, dashboard), cpu1 (whole station on CPU1), float (priorities only) | |
 | SYSTEM | usb_ethernet_mode, udc_handle_suspend | rndis/ncm/ecm, 0/1 | yes |
+| RADIO | ad9363_tx_fir_scale | 1 (default: the libad9361 TX FIR Linux loads, -6.02 dB passband at /4), 2 (TX taps x2: unity passband); device argument `tx_fir_scale` overrides | |
 | SSH | authorized_key | OpenSSH public key line, repeatable (<= 8 stored) | |
 | ACTIONS | reset, export | 1 = once (reboot after apply / write config-current.txt) | |
 | ACTIONS | calibrate, diagnostic_report, dfu | 1 = stored flag `action_<name>` | |

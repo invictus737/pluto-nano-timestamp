@@ -107,3 +107,17 @@ int pluto_rate_plan(uint32_t stream_hz, struct pluto_rate_plan *plan)
   plan->via_fir_first = (uint64_t)plan->phy_hz * 12u <= 25000000u;
   return 0;
 }
+
+int pluto_fir_scale_taps(const int16_t *in, uint32_t n, uint32_t scale, int16_t *out)
+{
+  if (scale != 1 && scale != 2)
+    return -EINVAL;
+  for (uint32_t i = 0; i < n; ++i) {
+    int32_t v = (int32_t)in[i] * (int32_t)scale;
+    if (v > 32767 || v < -32768)
+      return -ERANGE;
+  }
+  for (uint32_t i = 0; i < n; ++i)
+    out[i] = (int16_t)((int32_t)in[i] * (int32_t)scale);
+  return 0;
+}

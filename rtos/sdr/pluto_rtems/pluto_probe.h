@@ -71,6 +71,14 @@ struct pluto_rate_plan {
 };
 int pluto_rate_plan(uint32_t stream_hz, struct pluto_rate_plan *plan);
 
+/*
+ * TX FIR taps x scale (1 or 2). The libad9361 128-tap /4 table sums to 2^14 per output phase,
+ * -6.02 dB after the x4 zero stuffing, while its /2 tables and the AD936x fixed interpolators sum to
+ * full scale per phase (unity). scale 2 brings the /4 table to unity (largest tap 31842).
+ * 0, or -ERANGE (nothing written) when a tap would leave int16, -EINVAL for another scale.
+ */
+int pluto_fir_scale_taps(const int16_t *in, uint32_t n, uint32_t scale, int16_t *out);
+
 #ifdef __cplusplus
 }
 #endif
