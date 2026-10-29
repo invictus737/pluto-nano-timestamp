@@ -14,14 +14,23 @@
  *     0x66 (DP/DM pull-downs, DrvVbus, DrvVbusExternal), so the PHY powers the port.
  * Before the stack starts, stale cache lines over the non-cacheable areas are discarded.
  *
- * The interrupt is handled in the RTEMS interrupt server task, inside the OSAL critical
- * section, so CherryUSB's schedule scans exclude the threads that submit and cancel. A poll
- * thread (NEXUS_USB_POLL_MS) completes what a lost interrupt left behind, re-rings or ends a
- * missing Interrupt on Async Advance (patch 0001) and kicks the hub thread when PORTSC shows a
- * connect change whose interrupt never came (seen with libbsd after unplugging).
+ * Interrupt: the hard handler (GIC SPI 53, routed to NEXUS_USB_THREAD_CPU) only masks the
+ * vector, timestamps and wakes the "usbh_irq" thread, which runs CherryUSB's handler inside
+ * the OSAL critical section (so the schedule scans exclude the threads that submit and cancel)
+ * and unmasks. The thread has its own SCHED_FIFO priority (nexus_cherryusb_irq_prio, default
+ * NEXUS_USB_IRQ_PRIO_FROM_MAX below the maximum): the shared libbsd interrupt server runs at
+ * classic priority 96 on CPU0 and was starved there by the station's real-time threads, which
+ * delays every completion (each bulk transfer needs its USBINT and its IAA handled).
+ * The same thread wakes at least every NEXUS_USB_POLL_MS: it handles status bits whose
+ * interrupt was lost, runs the IAA watchdog (patches/0004, Linux ehci_iaa_watchdog) and kicks
+ * the hub thread when PORTSC shows a connect change whose interrupt never came (seen with
+ * libbsd after unplugging). Watchdog events are counted; one line per 10 s at most.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#define _GNU_SOURCE /* pthread_attr_setaffinity_np, pthread_setname_np */
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,14 +97,21 @@
 #define SLCR_USB_RST_CTRL      0xf8000210U
 
 int nexus_cherryusb_sdis;
+int nexus_cherryusb_irq_prio;
 
 static rtems_binary_semaphore g_hc_ready = RTEMS_BINARY_SEMAPHORE_INITIALIZER("usbhc");
 static volatile bool g_irq_installed;
 static bool g_started;
 
+static rtems_binary_semaphore g_irq_sem = RTEMS_BINARY_SEMAPHORE_INITIALIZER("usbirq");
+static volatile rtems_counter_ticks g_irq_stamp;
+static volatile bool g_irq_stamped;
+static int g_irq_thread_prio;
+
 /* counters (`usbh` command) */
-static volatile uint32_t g_irqs, g_irq_iaa, g_poll_handled, g_iaa_rings, g_iaa_forced,
-    g_port_kicks, g_async_stalls;
+static volatile uint32_t g_irqs, g_irq_iaa, g_poll_handled, g_port_kicks, g_async_stalls;
+/* hard interrupt to handler start: maximum and count over 1 ms */
+static volatile uint32_t g_irq_lat_max_us, g_irq_lat_over_1ms;
 
 static void udelay(uint32_t us)
 {
@@ -155,20 +171,24 @@ static int zynq_ulpi_write(uint8_t addr, uint8_t val)
     return zynq_ulpi_wait(ULPI_VP_RUN);
 }
 
-/* ---- interrupt (interrupt server task) ---- */
+/* ---- interrupt ---- */
 
-static void zynq_usb_isr(void *arg)
+uint32_t usb_ehci_time_us(void)
 {
-    struct usbh_bus *bus = arg;
-    size_t flags = usb_osal_enter_critical_section();
-    uint32_t sts = REG32(ZY7_USB_USBSTS) & REG32(ZY7_USB_USBINTR);
+    /* uptime, not the CPU counter: rtems_counter_ticks is 32 bits and wraps within seconds */
+    return (uint32_t)(rtems_clock_get_uptime_nanoseconds() / 1000U);
+}
 
-    g_irqs++;
-    if (sts & USBSTS_IAA) {
-        g_irq_iaa++;
+/* hard interrupt: mask the vector and wake the handler thread (it unmasks) */
+static void zynq_usb_hard_isr(void *arg)
+{
+    (void)arg;
+    (void)rtems_interrupt_vector_disable(ZYNQ_IRQ_USB_0);
+    if (!g_irq_stamped) {
+        g_irq_stamp = rtems_counter_read();
+        g_irq_stamped = true;
     }
-    USBH_IRQHandler(bus->hcd.hcd_id);
-    usb_osal_leave_critical_section(flags);
+    rtems_binary_semaphore_post(&g_irq_sem);
 }
 
 void usb_hc_low_level_init(struct usbh_bus *bus)
@@ -190,12 +210,19 @@ void usb_hc_low_level_init(struct usbh_bus *bus)
         printf("usbh: ULPI PHY does not answer (reset polarity?)\n");
     }
     if (!g_irq_installed) {
-        sc = rtems_interrupt_server_handler_install(RTEMS_INTERRUPT_SERVER_DEFAULT, ZYNQ_IRQ_USB_0,
-                                                    "USB0", RTEMS_INTERRUPT_UNIQUE, zynq_usb_isr, bus);
+        cpu_set_t cpus;
+
+        (void)bus;
+        sc = rtems_interrupt_handler_install(ZYNQ_IRQ_USB_0, "USB0", RTEMS_INTERRUPT_UNIQUE,
+                                             zynq_usb_hard_isr, NULL);
         if (sc != RTEMS_SUCCESSFUL) {
             printf("usbh: USB0 interrupt handler: %s\n", rtems_status_text(sc));
         } else {
             g_irq_installed = true;
+            /* the GIC default target is CPU0; say it, next to the handler thread */
+            CPU_ZERO(&cpus);
+            CPU_SET(NEXUS_USB_THREAD_CPU, &cpus);
+            (void)rtems_interrupt_set_affinity(ZYNQ_IRQ_USB_0, sizeof(cpus), &cpus);
         }
     }
 }
@@ -238,8 +265,7 @@ void usb_hc_low_level2_init(struct usbh_bus *bus)
 void usb_hc_low_level_deinit(struct usbh_bus *bus)
 {
     if (g_irq_installed) {
-        (void)rtems_interrupt_server_handler_remove(RTEMS_INTERRUPT_SERVER_DEFAULT, ZYNQ_IRQ_USB_0,
-                                                    zynq_usb_isr, bus);
+        (void)rtems_interrupt_handler_remove(ZYNQ_IRQ_USB_0, zynq_usb_hard_isr, NULL);
         g_irq_installed = false;
     }
 }
@@ -286,79 +312,135 @@ void usb_dcache_flush(uintptr_t addr, size_t size)
 }
 #endif
 
-/* ---- watchdog poll ---- */
+/* ---- interrupt handler thread (also the lost-interrupt and IAA watchdog poll) ---- */
 
-static void zynq_usb_poll_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
+static void *zynq_usb_irq_thread(void *arg)
 {
-    struct usbh_bus *bus = (struct usbh_bus *)CONFIG_USB_OSAL_THREAD_GET_ARGV;
-    uint32_t last_pending = 0, last_iaa = 0, last_alist = 0, stuck_alist = 0;
-    unsigned ticks = 0, iaad_stuck = 0;
+    struct usbh_bus *bus = arg;
+    uint32_t last_alist = 0, stuck_alist = 0, last_port_kick = 0, last_log = 0;
+    uint32_t logged_lost = 0, logged_late = 0;
+    rtems_interval period = RTEMS_MILLISECONDS_TO_TICKS(NEXUS_USB_POLL_MS);
 
+    if (period == 0) {
+        period = 1;
+    }
     for (;;) {
         size_t flags;
-        uint32_t sts, pending, both;
+        uint32_t sts, now;
+        bool woken;
+        const struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[bus->hcd.hcd_id];
 
-        usb_osal_msleep(NEXUS_USB_POLL_MS);
-        ticks++;
+        /* while a cycle runs, wake at least every 2 ms so the 10 ms watchdog is not late */
+        woken = rtems_binary_semaphore_wait_timed_ticks(
+                    &g_irq_sem, usbh_ehci_iaa_pending(bus->hcd.hcd_id) ?
+                                    RTEMS_MILLISECONDS_TO_TICKS(2) + 1 : period) == 0;
+        now = usb_ehci_time_us();
+        if (woken && g_irq_stamped) {
+            uint32_t us = (uint32_t)(rtems_counter_ticks_to_nanoseconds(
+                                         rtems_counter_read() - g_irq_stamp) / 1000U);
+
+            g_irq_stamped = false;
+            if (us > g_irq_lat_max_us) {
+                g_irq_lat_max_us = us;
+            }
+            if (us > 1000) {
+                g_irq_lat_over_1ms++;
+            }
+        }
+
         flags = usb_osal_enter_critical_section();
-
-        /* an enabled status bit nobody handled: the interrupt was lost */
         sts = REG32(ZY7_USB_USBSTS) & REG32(ZY7_USB_USBINTR);
         if (sts != 0) {
-            g_poll_handled++;
+            if (woken) {
+                g_irqs++;
+            } else {
+                /* an enabled status bit nobody handled: the interrupt was lost */
+                g_poll_handled++;
+            }
             if (sts & USBSTS_IAA) {
                 g_irq_iaa++;
             }
             USBH_IRQHandler(bus->hcd.hcd_id);
         }
-
-        /* QHs still waiting for an IAA one poll period later, with no IAA seen meanwhile */
-        pending = usbh_ehci_iaa_pending(bus->hcd.hcd_id);
-        both = (g_irq_iaa == last_iaa) ? (pending & last_pending) : 0;
-        if (both != 0) {
-            if ((REG32(ZY7_USB_USBCMD) & USBCMD_IAAD) == 0) {
-                /* the IAA was consumed by usbh_kill_urb(): ring the doorbell again */
-                REG32(ZY7_USB_USBCMD) |= USBCMD_IAAD;
-                g_iaa_rings++;
-                iaad_stuck = 0;
-            } else if (++iaad_stuck >= 2) {
-                /* doorbell ignored for two periods: end the unlink as Linux does */
-                (void)usbh_ehci_iaa_complete(bus->hcd.hcd_id, both);
-                g_iaa_forced++;
-                iaad_stuck = 0;
-                pending = usbh_ehci_iaa_pending(bus->hcd.hcd_id);
-            }
-        } else {
-            iaad_stuck = 0;
-        }
-        last_pending = pending;
-        last_iaa = g_irq_iaa;
+        (void)usbh_ehci_iaa_watchdog(bus->hcd.hcd_id);
 
         /* async engine parked on one QH (diagnostic only: ASYNCLISTADDR frozen while busy) */
         {
             uint32_t alist = REG32(ZY7_USB_ASYNCLISTADDR);
 
-            if ((REG32(ZY7_USB_USBCMD) & (1U << 5)) && pending == 0 && alist == last_alist &&
-                alist != 0 && (REG32(ZY7_USB_USBSTS) & (1U << 15))) {
+            if (!woken && (REG32(ZY7_USB_USBCMD) & (1U << 5)) && alist == last_alist && alist != 0 &&
+                (REG32(ZY7_USB_USBSTS) & (1U << 15))) {
                 if (++stuck_alist == 100) {
                     g_async_stalls++;
                 }
-            } else {
+            } else if (!woken) {
                 stuck_alist = 0;
             }
             last_alist = alist;
         }
         usb_osal_leave_critical_section(flags);
+        if (woken) {
+            (void)rtems_interrupt_vector_enable(ZYNQ_IRQ_USB_0);
+        }
 
         /* port change without its interrupt: let the hub thread look (twice a second at most) */
-        if ((ticks % (500 / NEXUS_USB_POLL_MS)) == 0 && (REG32(ZY7_USB_PORTSC1) & PORTSC_CSC)) {
+        if ((uint32_t)(now - last_port_kick) >= 500000U && (REG32(ZY7_USB_PORTSC1) & PORTSC_CSC)) {
+            last_port_kick = now;
             flags = usb_osal_enter_critical_section();
             bus->hcd.roothub.int_buffer[0] |= (1U << 1);
             usb_osal_leave_critical_section(flags);
             usbh_hub_thread_wakeup(&bus->hcd.roothub);
             g_port_kicks++;
         }
+
+        /* IAA watchdog events: one line per 10 s at most (never in the per-transfer path) */
+        if ((st->lost != logged_lost || st->late != logged_late) &&
+            (uint32_t)(now - last_log) >= 10000000U) {
+            printf("usbh: IAA watchdog: %lu lost, %lu late of %lu cycles (USBCMD 0x%08lx USBSTS "
+                   "0x%08lx ASYNCLISTADDR 0x%08lx, longest cycle %lu us)\n",
+                   (unsigned long)st->lost, (unsigned long)st->late, (unsigned long)st->cycles,
+                   (unsigned long)st->last_cmd, (unsigned long)st->last_sts,
+                   (unsigned long)st->last_async, (unsigned long)st->max_cycle_us);
+            logged_lost = st->lost;
+            logged_late = st->late;
+            last_log = now;
+        }
     }
+    return NULL;
+}
+
+static int zynq_usb_irq_thread_start(struct usbh_bus *bus)
+{
+    struct sched_param param;
+    pthread_attr_t attr;
+    pthread_t tid;
+    cpu_set_t cpus;
+    int rc, prio = nexus_cherryusb_irq_prio;
+
+    if (prio <= 0) {
+        prio = sched_get_priority_max(SCHED_FIFO) - NEXUS_USB_IRQ_PRIO_FROM_MAX;
+    }
+    if (prio > sched_get_priority_max(SCHED_FIFO)) {
+        prio = sched_get_priority_max(SCHED_FIFO);
+    }
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16 * 1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    param.sched_priority = prio;
+    pthread_attr_setschedparam(&attr, &param);
+    CPU_ZERO(&cpus);
+    CPU_SET(NEXUS_USB_THREAD_CPU, &cpus);
+    pthread_attr_setaffinity_np(&attr, sizeof(cpus), &cpus);
+    rc = pthread_create(&tid, &attr, zynq_usb_irq_thread, bus);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        return -rc;
+    }
+    (void)pthread_setname_np(tid, "usbh_irq");
+    g_irq_thread_prio = prio;
+    return 0;
 }
 
 /* ---- start ---- */
@@ -405,8 +487,9 @@ int nexus_cherryusb_start(void)
     if (zynq_ulpi_write(ULPI_OTG_CTRL_SET, ULPI_OTG_HOST_VBUS) != 0) {
         printf("usbh: ULPI OTG control write timed out\n");
     }
-    if (usb_osal_thread_create("usbh_poll", 8192, 2, zynq_usb_poll_thread, bus) == NULL) {
-        printf("usbh: poll thread failed to start\n");
+    if (zynq_usb_irq_thread_start(bus) != 0) {
+        printf("usbh: interrupt thread failed to start: no USB\n");
+        return -1;
     }
     printf("usbh: CherryUSB %s EHCI host up (USBMODE 0x%lx, PORTSC1 0x%08lx)\n", CHERRYUSB_VERSION_STR,
            (unsigned long)REG32(ZY7_USB_USBMODE), (unsigned long)REG32(ZY7_USB_PORTSC1));
@@ -425,12 +508,26 @@ int nexus_cherryusb_shell(int argc, char **argv)
     printf("PORTSC1 0x%08lx USBMODE 0x%08lx TXFILLTUNING 0x%08lx BURSTSIZE 0x%08lx\n",
            (unsigned long)REG32(ZY7_USB_PORTSC1), (unsigned long)REG32(ZY7_USB_USBMODE),
            (unsigned long)REG32(ZY7_USB_TXFILLTUNING), (unsigned long)REG32(ZY7_USB_BURSTSIZE));
-    printf("irqs %lu (IAA %lu), poll-handled %lu, IAA re-rung %lu forced %lu, port kicks %lu, "
-           "async stalls %lu, XACTERR restarts %lu, QHs waiting for IAA 0x%08lx\n",
-           (unsigned long)g_irqs, (unsigned long)g_irq_iaa, (unsigned long)g_poll_handled,
-           (unsigned long)g_iaa_rings, (unsigned long)g_iaa_forced, (unsigned long)g_port_kicks,
-           (unsigned long)g_async_stalls, (unsigned long)g_ehci_xacterr_retries,
-           (unsigned long)usbh_ehci_iaa_pending(0));
+    {
+        const struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[0];
+
+        printf("irqs %lu (IAA %lu), poll-handled %lu, port kicks %lu, async stalls %lu, "
+               "XACTERR restarts %lu; irq thread prio %d, latency max %lu us, >1 ms %lu\n",
+               (unsigned long)g_irqs, (unsigned long)g_irq_iaa, (unsigned long)g_poll_handled,
+               (unsigned long)g_port_kicks, (unsigned long)g_async_stalls,
+               (unsigned long)g_ehci_xacterr_retries, g_irq_thread_prio,
+               (unsigned long)g_irq_lat_max_us, (unsigned long)g_irq_lat_over_1ms);
+        printf("IAA cycles %lu: irq %lu polled %lu watchdog %lu (lost %lu late %lu), spurious %lu "
+               "stale %lu doorbell-busy %lu not-running %lu, kill waits %lu, HSE %lu, longest "
+               "%lu us; QHs waiting 0x%08lx\n",
+               (unsigned long)st->cycles, (unsigned long)st->irq_ends,
+               (unsigned long)st->polled_ends, (unsigned long)st->watchdog_ends,
+               (unsigned long)st->lost, (unsigned long)st->late, (unsigned long)st->spurious,
+               (unsigned long)st->stale_iaa, (unsigned long)st->iaad_busy,
+               (unsigned long)st->not_running, (unsigned long)st->kill_waits,
+               (unsigned long)st->fatal, (unsigned long)st->max_cycle_us,
+               (unsigned long)usbh_ehci_iaa_pending(0));
+    }
     if (aicwf_cherry_stats) {
         aicwf_cherry_stats();
     }

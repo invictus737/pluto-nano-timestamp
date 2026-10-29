@@ -8,7 +8,7 @@
  * thread.
  *
  * Critical section: CherryUSB uses it to serialise its schedule lists against the interrupt
- * handler. On RTEMS the EHCI interrupt is handled in the interrupt server task
+ * handler. On RTEMS the EHCI interrupt is handled in the "usbh_irq" thread
  * (port/usb_glue_zynq.c), so the critical section is a recursive mutex shared by the handler and
  * every thread; it may be held across a blocking call. Leaving the outermost level drains the
  * CPU write buffers and the L2C-310 store buffer (Cortex-A9 erratum 769419 / PL310: Normal

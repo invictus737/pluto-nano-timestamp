@@ -90,6 +90,14 @@
 #define CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES
 /* restart a qTD halted by transaction errors in place, as Linux (QH_XACTERR_MAX, patches/0003) */
 #define CONFIG_USB_EHCI_XACTERR_RETRIES 32
+/*
+ * IAA cycles (patches/0004): descriptor stores are drained to memory (DSB + L2C-310 cache
+ * sync, osal/usb_osal_rtems.c) before every doorbell and schedule-enable write; a cycle that
+ * got no IAA ends after 10 ms (Linux EHCI_HRTIMER_IAA_WATCHDOG).
+ */
+void usb_osal_dma_barrier(void);
+#define CONFIG_USB_EHCI_DMA_WMB()          usb_osal_dma_barrier()
+#define CONFIG_USB_EHCI_IAA_WATCHDOG_US    10000
 
 #define CONFIG_USB_HS
 
@@ -100,8 +108,15 @@
 /* ================ Nexus glue (port/usb_glue_zynq.c) ================ */
 
 #define NEXUS_USB0_BASE      0xE0002000U
-/* poll period of the lost-interrupt / IAA watchdog */
+/* poll period of the lost-interrupt check (the IAA watchdog polls every 2 ms during a cycle) */
 #define NEXUS_USB_POLL_MS    10
+/*
+ * SCHED_FIFO priority of the "usbh_irq" handler thread, below the POSIX maximum: 18 puts it
+ * above the station's SDR workers (max - 19) and below the PL DMA service threads (max - 2).
+ * Its work per interrupt is a schedule scan and the completions (tens of us); a run-time
+ * value in nexus_cherryusb_irq_prio (POSIX priority, 0 = this default) overrides it.
+ */
+#define NEXUS_USB_IRQ_PRIO_FROM_MAX 18
 /* CPU of every CherryUSB thread (the AIC driver threads run on CPU0 as well, AICWF_THREAD_CPU) */
 #define NEXUS_USB_THREAD_CPU 0
 

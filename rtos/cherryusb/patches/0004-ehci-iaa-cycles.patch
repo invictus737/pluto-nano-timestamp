@@ -1,0 +1,633 @@
+Nexus-BS: Interrupt on Async Advance handled as Linux ehci-q.c / ehci-timer.c.
+
+- IAA cycles (start_iaa_cycle/end_iaa_cycle): an unlinked asynchronous QH waits for the next
+  doorbell; only the end of a cycle started after its unlink hands it back. The interrupt
+  handler takes IAA before USBINT/USBERR, so a QH unlinked in the same pass is never completed
+  by an IAA that answered an earlier doorbell (stock: every unlinked QH completed on any IAA,
+  then freed and reused while the controller could still fetch it).
+- One doorbell per handler pass for all QHs it unlinked (batched unlinks).
+- IAA watchdog (ehci_iaa_watchdog): a cycle older than CONFIG_USB_EHCI_IAA_WATCHDOG_US ends
+  anyway, counted as lost (IAA without interrupt, IAAD dropped) or late; never a transfer error.
+- usbh_kill_urb(): unlink and join the cycles, wait (polling, then 1 ms sleeps) for the
+  hand-back; no PSE/ASE toggling, no private handshake that cleared USBSTS.IAA under other
+  QHs, no QH freed before its IAA, never "iaad timeout"/-USB_ERR_TIMEOUT. Periodic QHs wait
+  two microframes. A QH not on its list is not "unlinked" (stock walk relinked the periodic
+  tail or looped forever on the ring).
+- Bulk toggle after a kill or transaction error comes from the (stable) QH overlay.
+- CONFIG_USB_EHCI_DMA_WMB(): descriptor stores drained (DSB + outer cache sync on the
+  Zynq) before linking a QH, before ASE/PSE writes and before the doorbell, as Linux wmb() /
+  writel(). USBCMD set without writing IAAD back (Linux writes its shadow ehci->command).
+- The QH semaphore is reset on allocation; a synchronous URB that finished between its
+  timeout and the kill reports its own result.
+
+diff --git a/port/ehci/usb_hc_ehci.c b/port/ehci/usb_hc_ehci.c
+index 7ef2839..0d8e69a 100644
+--- a/port/ehci/usb_hc_ehci.c
++++ b/port/ehci/usb_hc_ehci.c
+@@ -18,6 +18,55 @@ struct ehci_hcd g_ehci_hcd[CONFIG_USBHOST_MAX_BUS];
+ /* transaction-error restarts (CONFIG_USB_EHCI_XACTERR_RETRIES) */
+ volatile uint32_t g_ehci_xacterr_retries;
+ 
++/*
++ * Nexus-BS: memory ordering before the controller may look at a descriptor change.
++ * Linux orders every QH/qTD store before an MMIO write with wmb() (on ARM: DSB plus the
++ * outer cache sync, which drains the L2C-310 store buffer; writel() includes it). The QH/qTD
++ * pools are Normal non-cacheable memory, so without it the controller can fetch a stale
++ * horizontal link or token after a doorbell or ASE write.
++ */
++#ifdef CONFIG_USB_EHCI_DMA_WMB
++#define ehci_dma_wmb() CONFIG_USB_EHCI_DMA_WMB()
++#else
++#define ehci_dma_wmb() __asm__ volatile("" ::: "memory")
++#endif
++
++/*
++ * Nexus-BS: Interrupt on Async Advance cycles as Linux ehci-q.c (start_iaa_cycle(),
++ * end_iaa_cycle()) and ehci-timer.c (ehci_iaa_watchdog()).
++ *
++ * A QH unlinked from the asynchronous ring (completion, error or kill) is EHCI_IAA_WAIT. One
++ * doorbell starts a cycle for every waiting QH (EHCI_IAA_CYCLE); only the end of that cycle
++ * (USBSTS.IAA, or the watchdog after CONFIG_USB_EHCI_IAA_WATCHDOG_US) hands them back. QHs
++ * unlinked while a cycle runs wait for the next one: an IAA never completes a QH that was
++ * unlinked after its doorbell, and a missing or late IAA never fails a transfer.
++ */
++/*
++ * Nexus-BS: USBCMD bits are set without writing IAAD back. A read-modify-write that reads
++ * IAAD = 1 just before the controller clears it rings an untracked doorbell, whose IAA then
++ * ends the next cycle early (Linux writes its shadow ehci->command, which never has IAAD).
++ */
++#define ehci_usbcmd_set(bits) (EHCI_HCOR->usbcmd = (EHCI_HCOR->usbcmd & ~EHCI_USBCMD_IAAD) | (bits))
++
++#define EHCI_IAA_NONE  0
++#define EHCI_IAA_WAIT  1
++#define EHCI_IAA_CYCLE 2
++
++#ifndef CONFIG_USB_EHCI_IAA_WATCHDOG_US
++#define CONFIG_USB_EHCI_IAA_WATCHDOG_US 10000 /* Linux EHCI_HRTIMER_IAA_WATCHDOG: 10 ms */
++#endif
++#ifndef CONFIG_USB_EHCI_IAA_SPIN_US
++#define CONFIG_USB_EHCI_IAA_SPIN_US 500 /* usbh_kill_urb(): poll, then sleep 1 ms per check */
++#endif
++
++struct ehci_iaa_state {
++    bool in_progress;
++    uint32_t start_us;
++};
++
++static struct ehci_iaa_state g_ehci_iaa[CONFIG_USBHOST_MAX_BUS];
++struct usbh_ehci_iaa_stats g_ehci_iaa_stats[CONFIG_USBHOST_MAX_BUS];
++
+ USB_NOCACHE_RAM_SECTION struct ehci_qh_hw ehci_qh_pool[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_QH_NUM];
+ USB_NOCACHE_RAM_SECTION struct ehci_qtd_hw ehci_qtd_pool[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_QTD_NUM];
+ 
+@@ -86,8 +135,10 @@ static struct ehci_qh_hw *ehci_qh_alloc(struct usbh_bus *bus)
+             qh->hw.overlay.alt_next_qtd = QTD_LIST_END;
+             qh->urb = NULL;
+             qh->first_qtd = QTD_LIST_END;
+-            qh->remove_in_iaad = 0;
++            qh->remove_in_iaad = EHCI_IAA_NONE;
+             qh->xacterrs = 0;
++            /* a give that raced with its previous owner's timeout must not end this URB */
++            usb_osal_sem_reset(qh->waitsem);
+ 
+             return qh;
+         }
+@@ -142,28 +193,48 @@ static inline void ehci_qh_add_head(struct ehci_qh_hw *head, struct ehci_qh_hw *
+ 
+     usb_dcache_flush((uintptr_t)n->urb->transfer_buffer, USB_ALIGN_UP(n->urb->transfer_buffer_length, CONFIG_USB_ALIGN_SIZE));
+ 
++    /* Linux qh_link_async(): the QH and its qTDs are complete before the ring points at it */
++    ehci_dma_wmb();
+     head->hw.hlp = QH_HLP_QH(n);
+ #if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
+     usb_dcache_clean((uintptr_t)&head->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
+ #endif
++    /* and the link is visible before the caller's USBCMD write (ASE/PSE) */
++    ehci_dma_wmb();
+ }
+ 
+-static inline void ehci_qh_remove(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
++/*
++ * Unlinks n when it is on the list that starts at head (the asynchronous ring or the
++ * periodic chain); returns false, changing nothing, when it is not. The stock walk relinked
++ * the last element (periodic) or never ended (asynchronous ring) for a QH that is not there.
++ */
++static bool ehci_qh_unlink(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
+ {
+     struct ehci_qh_hw *tmp = head;
+ 
+-    while (EHCI_ADDR2QH(tmp->hw.hlp) && EHCI_ADDR2QH(tmp->hw.hlp) != n) {
+-        tmp = EHCI_ADDR2QH(tmp->hw.hlp);
+-    }
++    for (;;) {
++        struct ehci_qh_hw *next = EHCI_ADDR2QH(tmp->hw.hlp);
+ 
+-    if (tmp) {
+-        tmp->hw.hlp = n->hw.hlp;
++        if (next == NULL || next == head) {
++            return false;
++        }
++        if (next == n) {
++            /* n keeps its own link: a controller standing on it still finds the ring */
++            tmp->hw.hlp = n->hw.hlp;
+ #if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
+-        usb_dcache_clean((uintptr_t)&tmp->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
++            usb_dcache_clean((uintptr_t)&tmp->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
+ #endif
++            return true;
++        }
++        tmp = next;
+     }
+ }
+ 
++static inline void ehci_qh_remove(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
++{
++    (void)ehci_qh_unlink(head, n);
++}
++
+ static int ehci_caculate_smask(int binterval)
+ {
+     int order, interval;
+@@ -420,7 +491,7 @@ static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_bus *bus, struct usb
+     /* add qh into async list */
+     ehci_qh_add_head(&g_async_qh_head[bus->hcd.hcd_id], qh);
+ 
+-    EHCI_HCOR->usbcmd |= EHCI_USBCMD_ASEN;
++    ehci_usbcmd_set(EHCI_USBCMD_ASEN);
+ 
+     usb_osal_leave_critical_section(flags);
+     return qh;
+@@ -516,7 +587,7 @@ static struct ehci_qh_hw *ehci_bulk_urb_init(struct usbh_bus *bus, struct usbh_u
+     /* add qh into async list */
+     ehci_qh_add_head(&g_async_qh_head[bus->hcd.hcd_id], qh);
+ 
+-    EHCI_HCOR->usbcmd |= EHCI_USBCMD_ASEN;
++    ehci_usbcmd_set(EHCI_USBCMD_ASEN);
+ 
+     usb_osal_leave_critical_section(flags);
+     return qh;
+@@ -612,7 +683,7 @@ static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_bus *bus, struct usbh_u
+     /* add qh into periodic list */
+     ehci_qh_add_head(&g_periodic_qh_head[bus->hcd.hcd_id], qh);
+ 
+-    EHCI_HCOR->usbcmd |= EHCI_USBCMD_PSEN;
++    ehci_usbcmd_set(EHCI_USBCMD_PSEN);
+ 
+     usb_osal_leave_critical_section(flags);
+     return qh;
+@@ -641,6 +712,170 @@ static void ehci_urb_waitup(struct usbh_bus *bus, struct usbh_urb *urb)
+     }
+ }
+ 
++static void ehci_start_iaa_cycle(struct usbh_bus *bus);
++
++/* hands back every QH of the cycle that just ended (or of a controller that is not running) */
++static void ehci_complete_iaa_qhs(struct usbh_bus *bus)
++{
++    for (uint32_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
++        struct ehci_qh_hw *qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
++        struct usbh_urb *urb = qh->urb;
++
++        if (qh->remove_in_iaad != EHCI_IAA_CYCLE) {
++            continue;
++        }
++        if (urb == NULL) {
++            qh->remove_in_iaad = EHCI_IAA_NONE;
++            continue;
++        }
++        /*
++         * Bulk QHs run with DTC = 0: the overlay holds the data toggle. After a kill or a
++         * transaction error the overlay (now stable: no longer reachable by the controller)
++         * is the truth; packets of a cancelled transfer that were already acknowledged
++         * advanced it, and resubmitting with the old toggle makes the device drop data.
++         */
++        if ((urb->errorcode == -USB_ERR_SHUTDOWN || urb->errorcode == -USB_ERR_IO) &&
++            USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK) {
++            urb->data_toggle = (qh->hw.overlay.token & QTD_TOKEN_TOGGLE) ? true : false;
++        }
++        ehci_urb_waitup(bus, urb);
++    }
++}
++
++static void ehci_end_iaa_cycle(struct usbh_bus *bus)
++{
++    struct ehci_iaa_state *s = &g_ehci_iaa[bus->hcd.hcd_id];
++    struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[bus->hcd.hcd_id];
++    uint32_t us = usb_ehci_time_us() - s->start_us;
++
++    s->in_progress = false;
++    if (us > st->max_cycle_us) {
++        st->max_cycle_us = us;
++    }
++    ehci_complete_iaa_qhs(bus);
++    /* QHs unlinked during the cycle (or by the completions above) */
++    ehci_start_iaa_cycle(bus);
++}
++
++/* Linux start_iaa_cycle(): one doorbell for every QH waiting; no-op while a cycle runs */
++static void ehci_start_iaa_cycle(struct usbh_bus *bus)
++{
++    struct ehci_iaa_state *s = &g_ehci_iaa[bus->hcd.hcd_id];
++    struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[bus->hcd.hcd_id];
++    bool any = false;
++    uint32_t cmd, sts;
++
++    if (s->in_progress) {
++        return;
++    }
++    for (uint32_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
++        struct ehci_qh_hw *qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
++
++        if (qh->remove_in_iaad == EHCI_IAA_WAIT) {
++            qh->remove_in_iaad = EHCI_IAA_CYCLE;
++            any = true;
++        }
++    }
++    if (!any) {
++        return;
++    }
++    cmd = EHCI_HCOR->usbcmd;
++    sts = EHCI_HCOR->usbsts;
++    if ((sts & EHCI_USBSTS_HALTED) || !(cmd & EHCI_USBCMD_RUN) ||
++        (!(cmd & EHCI_USBCMD_ASEN) && !(sts & EHCI_USBSTS_ASS))) {
++        /* the asynchronous schedule does not run: nothing can hold the QHs, no IAA will come */
++        st->not_running++;
++        ehci_complete_iaa_qhs(bus);
++        return;
++    }
++    if (sts & EHCI_USBSTS_IAA) {
++        /* left over (no cycle runs): it must not end the cycle started now */
++        EHCI_HCOR->usbsts = EHCI_USBSTS_IAA;
++        st->stale_iaa++;
++    }
++    if (cmd & EHCI_USBCMD_IAAD) {
++        /* a doorbell the controller has not answered yet (after a watchdog end) */
++        st->iaad_busy++;
++    }
++    /* Linux: "Make sure the unlinks are all visible to the hardware" */
++    ehci_dma_wmb();
++    EHCI_HCOR->usbcmd = cmd | EHCI_USBCMD_IAAD;
++    (void)EHCI_HCOR->usbcmd;
++    s->in_progress = true;
++    s->start_us = usb_ehci_time_us();
++    st->cycles++;
++}
++
++/*
++ * Linux ehci_iaa_watchdog(): a cycle older than CONFIG_USB_EHCI_IAA_WATCHDOG_US ends anyway.
++ * USBSTS.IAA set (IAA without its interrupt) or USBCMD.IAAD clear (doorbell dropped without
++ * IAA) count as lost; IAAD still set counts as late. Critical section held. Returns 1 when it
++ * ended a cycle.
++ */
++uint32_t usbh_ehci_iaa_watchdog(uint8_t busid)
++{
++    struct usbh_bus *bus = &g_usbhost_bus[busid];
++    struct ehci_iaa_state *s = &g_ehci_iaa[busid];
++    struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[busid];
++    uint32_t cmd, sts;
++
++    if (!s->in_progress ||
++        (uint32_t)(usb_ehci_time_us() - s->start_us) < CONFIG_USB_EHCI_IAA_WATCHDOG_US) {
++        return 0;
++    }
++    /* as Linux: USBCMD first, then USBSTS (the controller clears IAAD when it sets IAA) */
++    cmd = EHCI_HCOR->usbcmd;
++    sts = EHCI_HCOR->usbsts;
++    st->last_cmd = cmd;
++    st->last_sts = sts;
++    st->last_async = EHCI_HCOR->asynclistaddr;
++    if ((sts & EHCI_USBSTS_IAA) || !(cmd & EHCI_USBCMD_IAAD)) {
++        st->lost++;
++        EHCI_HCOR->usbsts = EHCI_USBSTS_IAA;
++    } else {
++        st->late++;
++    }
++    st->watchdog_ends++;
++    ehci_end_iaa_cycle(bus);
++    return 1;
++}
++
++/*
++ * Thread context, critical section held (the interrupt handler cannot run): drives the IAA
++ * cycles by polling until qh has been handed back. Bounded by the watchdog: a few
++ * microframes normally, CONFIG_USB_EHCI_IAA_WATCHDOG_US (+1 ms) at worst per cycle.
++ */
++static void ehci_iaa_wait_qh(struct usbh_bus *bus, struct ehci_qh_hw *qh)
++{
++    struct ehci_iaa_state *s = &g_ehci_iaa[bus->hcd.hcd_id];
++    struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[bus->hcd.hcd_id];
++
++    st->kill_waits++;
++    while (qh->remove_in_iaad != EHCI_IAA_NONE) {
++        if (!s->in_progress) {
++            ehci_start_iaa_cycle(bus);
++            if (!s->in_progress && qh->remove_in_iaad != EHCI_IAA_NONE) {
++                /* cannot happen: a waiting QH either starts a cycle or is handed back */
++                qh->remove_in_iaad = EHCI_IAA_CYCLE;
++                ehci_complete_iaa_qhs(bus);
++            }
++            continue;
++        }
++        if (EHCI_HCOR->usbsts & EHCI_USBSTS_IAA) {
++            EHCI_HCOR->usbsts = EHCI_USBSTS_IAA;
++            st->polled_ends++;
++            ehci_end_iaa_cycle(bus);
++            continue;
++        }
++        if (usbh_ehci_iaa_watchdog(bus->hcd.hcd_id)) {
++            continue;
++        }
++        if ((uint32_t)(usb_ehci_time_us() - s->start_us) > CONFIG_USB_EHCI_IAA_SPIN_US) {
++            usb_osal_msleep(1);
++        }
++    }
++}
++
+ static void ehci_qh_scan_qtds(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
+ {
+     struct ehci_qtd_hw *qtd;
+@@ -711,7 +946,9 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
+         qh->xacterrs++;
+         g_ehci_xacterr_retries++;
+         qtd->hw.token = (token & keep) | set;
++        ehci_dma_wmb(); /* Linux qh_completions(): qTD before the overlay */
+         qh->hw.overlay.token = (qh->hw.overlay.token & keep) | set;
++        ehci_dma_wmb();
+         return;
+     }
+ #endif
+@@ -742,9 +979,8 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
+     if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
+         ehci_urb_waitup(bus, urb);
+     } else {
+-        qh->remove_in_iaad = 1;
+-
+-        EHCI_HCOR->usbcmd |= EHCI_USBCMD_IAAD;
++        /* the doorbell rings once per handler pass for all of them (ehci_start_iaa_cycle) */
++        qh->remove_in_iaad = EHCI_IAA_WAIT;
+     }
+ }
+ 
+@@ -1318,6 +1554,10 @@ int usbh_submit_urb(struct usbh_urb *urb)
+ errout_timeout:
+     urb->timeout = 0;
+     usbh_kill_urb(urb);
++    /* it may have finished between the timeout and the kill: report its own result then */
++    if (urb->errorcode != -USB_ERR_SHUTDOWN && urb->errorcode != -USB_ERR_BUSY) {
++        ret = urb->errorcode;
++    }
+     return ret;
+ }
+ 
+@@ -1326,7 +1566,7 @@ int usbh_kill_urb(struct usbh_urb *urb)
+     struct ehci_qh_hw *qh;
+     struct usbh_bus *bus;
+     size_t flags;
+-    bool remove_in_iaad = false;
++    uint8_t type;
+ 
+     if (!urb || !urb->hport || !urb->hcpriv || !urb->hport->bus) {
+         return -USB_ERR_INVAL;
+@@ -1342,67 +1582,74 @@ int usbh_kill_urb(struct usbh_urb *urb)
+ 
+     flags = usb_osal_enter_critical_section();
+ 
+-#ifndef CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES
+-    EHCI_HCOR->usbcmd &= ~(EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
+-#endif
++    qh = (struct ehci_qh_hw *)urb->hcpriv;
++    type = USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes);
+ 
+-    if ((USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_CONTROL) || (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK)) {
+-        qh = EHCI_ADDR2QH(g_async_qh_head[bus->hcd.hcd_id].hw.hlp);
+-        while ((qh != &g_async_qh_head[bus->hcd.hcd_id]) && qh) {
+-            if (qh->urb == urb) {
+-                remove_in_iaad = true;
+-                ehci_kill_qh(bus, &g_async_qh_head[bus->hcd.hcd_id], qh);
+-            }
+-            qh = EHCI_ADDR2QH(qh->hw.hlp);
+-        }
+-    } else if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
+-        qh = EHCI_ADDR2QH(g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp);
+-        while (qh) {
+-            if (qh->urb == urb) {
+-                ehci_kill_qh(bus, &g_periodic_qh_head[bus->hcd.hcd_id], qh);
+-            }
+-            qh = EHCI_ADDR2QH(qh->hw.hlp);
+-        }
+-    } else {
+ #ifdef CONFIG_USB_EHCI_ISO
++    if (type == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
+         ehci_kill_iso_urb(bus, urb);
+-        EHCI_HCOR->usbcmd |= (EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
+         usb_osal_leave_critical_section(flags);
+         return 0;
+-#endif
+     }
+-
+-#ifndef CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES
+-    EHCI_HCOR->usbcmd |= (EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
+ #endif
+-
+-    qh = (struct ehci_qh_hw *)urb->hcpriv;
+-    qh->remove_in_iaad = 0;
+-    urb->errorcode = -USB_ERR_SHUTDOWN;
+-
+-    if (urb->timeout) {
+-        usb_osal_sem_give(qh->waitsem);
+-    } else {
+-        ehci_qh_free(bus, qh);
++    if (qh == NULL || qh->urb != urb) {
++        usb_osal_leave_critical_section(flags);
++        return -USB_ERR_INVAL;
+     }
+ 
+-    if (remove_in_iaad) {
+-        volatile uint32_t timeout = 0;
+-        EHCI_HCOR->usbsts = EHCI_USBSTS_IAA;
+-        EHCI_HCOR->usbcmd |= EHCI_USBCMD_IAAD;
+-        while (!(EHCI_HCOR->usbsts & EHCI_USBSTS_IAA)) {
+-            timeout++;
+-            if (timeout > 200000) {
+-                USB_LOG_ERR("iaad timeout\r\n");
++    /*
++     * Nexus-BS: no PSE/ASE toggling (EHCI 4.6/4.8 need the PSS/ASS handshake; the ChipIdea
++     * core hung its asynchronous engine on it, patches/0002) and no private IAA handshake
++     * with USBSTS.IAA cleared under the cycle of other QHs: an asynchronous QH is unlinked
++     * and joins the IAA cycles like any completed one, the caller waits for its hand-back
++     * (bounded by the IAA watchdog), and its completion runs before this returns, as
++     * before. A QH is never freed while the controller can still hold it.
++     */
++    if (type == USB_ENDPOINT_TYPE_CONTROL || type == USB_ENDPOINT_TYPE_BULK) {
++        if (qh->remove_in_iaad == EHCI_IAA_NONE) {
++            if (!ehci_qh_unlink(&g_async_qh_head[bus->hcd.hcd_id], qh)) {
++                /* already handed back; its submitter (timeout != 0) frees it, or we do */
++                if (urb->timeout == 0) {
++                    ehci_qh_free(bus, qh);
++                }
+                 usb_osal_leave_critical_section(flags);
+-                return -USB_ERR_TIMEOUT;
++                return 0;
+             }
++            urb->errorcode = -USB_ERR_SHUTDOWN;
++            qh->remove_in_iaad = EHCI_IAA_WAIT;
+         }
+-        EHCI_HCOR->usbsts = EHCI_USBSTS_IAA;
++        /* else: finished, waiting for its IAA cycle; it completes with its own result */
++        ehci_iaa_wait_qh(bus, qh);
++        usb_osal_leave_critical_section(flags);
++        return 0;
+     }
+ 
+-    if (urb->complete) {
+-        urb->complete(urb->arg, urb->errorcode);
++    if (type == USB_ENDPOINT_TYPE_INTERRUPT) {
++        uint32_t frindex, tries;
++
++        if (!ehci_qh_unlink(&g_periodic_qh_head[bus->hcd.hcd_id], qh)) {
++            if (urb->timeout == 0) {
++                ehci_qh_free(bus, qh);
++            }
++            usb_osal_leave_critical_section(flags);
++            return 0;
++        }
++        /* EHCI 4.8.2: the controller may hold a periodic QH until the microframe ends */
++        ehci_dma_wmb();
++        frindex = EHCI_HCOR->frindex;
++        for (tries = 0; tries < 4000 && ((EHCI_HCOR->frindex - frindex) & 0x3fff) < 2; tries++) {
++        }
++        qh->remove_in_iaad = EHCI_IAA_NONE;
++        urb->errorcode = -USB_ERR_SHUTDOWN;
++
++        if (urb->timeout) {
++            usb_osal_sem_give(qh->waitsem);
++        } else {
++            ehci_qh_free(bus, qh);
++        }
++        if (urb->complete) {
++            urb->complete(urb->arg, urb->errorcode);
++        }
+     }
+ 
+     usb_osal_leave_critical_section(flags);
+@@ -1446,6 +1693,22 @@ void USBH_IRQHandler(uint8_t busid)
+     usbsts = EHCI_HCOR->usbsts & EHCI_HCOR->usbintr;
+     EHCI_HCOR->usbsts = usbsts;
+ 
++    /*
++     * Nexus-BS: IAA first. The IAA in this snapshot answers the doorbell of the running cycle;
++     * QHs that the INT/ERR scan below unlinks are EHCI_IAA_WAIT and go to the next cycle. The
++     * stock handler completed every unlinked QH on any IAA, also those unlinked in this same
++     * pass after the doorbell had been answered (USBINT and IAA together, i.e. whenever the
++     * handler runs late), and freed QHs the controller could still be fetching.
++     */
++    if (usbsts & EHCI_USBSTS_IAA) {
++        if (g_ehci_iaa[busid].in_progress) {
++            g_ehci_iaa_stats[busid].irq_ends++;
++            ehci_end_iaa_cycle(bus);
++        } else {
++            g_ehci_iaa_stats[busid].spurious++;
++        }
++    }
++
+     if (usbsts & EHCI_USBSTS_INT) {
+         ehci_scan_async_list(bus);
+         ehci_scan_periodic_list(bus);
+@@ -1481,55 +1744,22 @@ void USBH_IRQHandler(uint8_t busid)
+         }
+     }
+ 
+-    if (usbsts & EHCI_USBSTS_IAA) {
+-        for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
+-            struct ehci_qh_hw *qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
+-            if (qh->remove_in_iaad) {
+-                ehci_urb_waitup(bus, qh->urb);
+-            }
+-        }
+-    }
+-
+     if (usbsts & EHCI_USBSTS_FATAL) {
++        g_ehci_iaa_stats[busid].fatal++;
+     }
++
++    /* one doorbell for every QH unlinked in this pass (Linux batches them the same way) */
++    ehci_start_iaa_cycle(bus);
+ }
+-/*
+- * Nexus-BS (RTEMS, Zynq-7000 ChipIdea core): Interrupt on Async Advance watchdog.
+- *
+- * A finished bulk/control QH is unlinked and completed only when the IAA interrupt arrives.
+- * usbh_kill_urb() runs its own IAA handshake and clears USBSTS.IAA, so QHs that were waiting
+- * for that same IAA are never completed; a controller that never raises IAA (seen on this
+- * core) has the same effect. The glue samples usbh_ehci_iaa_pending() every poll period and
+- * completes, with usbh_ehci_iaa_complete(), the QHs that were already waiting one period
+- * earlier, as Linux ehci_iaa_watchdog() does. The caller holds the critical section.
+- */
++/* Nexus-BS: QHs unlinked and not yet handed back (bit = pool index; `usbh` command) */
+ uint32_t usbh_ehci_iaa_pending(uint8_t busid)
+ {
+     uint32_t mask = 0;
+ 
+     for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM && index < 32; index++) {
+-        if (ehci_qh_pool[busid][index].remove_in_iaad) {
++        if (ehci_qh_pool[busid][index].remove_in_iaad != EHCI_IAA_NONE) {
+             mask |= 1U << index;
+         }
+     }
+     return mask;
+ }
+-
+-uint32_t usbh_ehci_iaa_complete(uint8_t busid, uint32_t mask)
+-{
+-    struct usbh_bus *bus = &g_usbhost_bus[busid];
+-    uint32_t done = 0;
+-
+-    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM && index < 32; index++) {
+-        struct ehci_qh_hw *qh = &ehci_qh_pool[busid][index];
+-
+-        if ((mask & (1U << index)) && qh->remove_in_iaad && qh->urb) {
+-            ehci_urb_waitup(bus, qh->urb);
+-            done |= 1U << index;
+-        }
+-    }
+-    if (done) {
+-        EHCI_HCOR->usbcmd &= ~EHCI_USBCMD_IAAD;
+-    }
+-    return done;
+-}
+diff --git a/port/ehci/usb_hc_ehci.h b/port/ehci/usb_hc_ehci.h
+index f05527e..2e129c0 100644
+--- a/port/ehci/usb_hc_ehci.h
++++ b/port/ehci/usb_hc_ehci.h
+@@ -100,9 +100,29 @@ int ehci_iso_urb_init(struct usbh_bus *bus, struct usbh_urb *urb);
+ void ehci_kill_iso_urb(struct usbh_bus *bus, struct usbh_urb *urb);
+ void ehci_scan_isochronous_list(struct usbh_bus *bus);
+ 
+-/* Nexus-BS: IAA watchdog (usb_hc_ehci.c) */
++/* Nexus-BS: Interrupt on Async Advance cycles and watchdog (usb_hc_ehci.c) */
++struct usbh_ehci_iaa_stats {
++    uint32_t cycles;        /* doorbells rung */
++    uint32_t irq_ends;      /* cycles ended by the IAA interrupt */
++    uint32_t polled_ends;   /* ended by USBSTS.IAA seen in usbh_kill_urb() */
++    uint32_t watchdog_ends; /* ended by usbh_ehci_iaa_watchdog() */
++    uint32_t lost;          /*   of those: IAA set without interrupt or IAAD dropped */
++    uint32_t late;          /*   of those: doorbell still pending after the watchdog time */
++    uint32_t spurious;      /* IAA with no cycle running */
++    uint32_t stale_iaa;     /* IAA status cleared before a new doorbell */
++    uint32_t iaad_busy;     /* doorbell still set when a cycle started */
++    uint32_t not_running;   /* QHs handed back at once: asynchronous schedule not running */
++    uint32_t kill_waits;    /* usbh_kill_urb() waits for a hand-back */
++    uint32_t fatal;         /* USBSTS host system error */
++    uint32_t max_cycle_us;
++    uint32_t last_cmd, last_sts, last_async; /* registers at the last watchdog end */
++};
++extern struct usbh_ehci_iaa_stats g_ehci_iaa_stats[CONFIG_USBHOST_MAX_BUS];
+ uint32_t usbh_ehci_iaa_pending(uint8_t busid);
+-uint32_t usbh_ehci_iaa_complete(uint8_t busid, uint32_t mask);
++/* critical section held; ends a cycle older than CONFIG_USB_EHCI_IAA_WATCHDOG_US, returns 1 */
++uint32_t usbh_ehci_iaa_watchdog(uint8_t busid);
++/* microsecond clock (wraps), provided by the port glue */
++uint32_t usb_ehci_time_us(void);
+ extern volatile uint32_t g_ehci_xacterr_retries;
+ 
+ #endif
