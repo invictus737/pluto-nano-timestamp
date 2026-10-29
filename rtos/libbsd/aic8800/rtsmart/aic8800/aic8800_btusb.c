@@ -13,12 +13,12 @@
 #define DBG_LVL AIC8800_DBG_LVL
 #include <rtdbg.h>
 
-/* The receive URBs must expire on their own.  usbh_kill_urb() cannot cancel a
- * request that a worker is about to submit, so an unbounded receive would let
- * that request outlive both the worker thread and its transfer buffer.  Keep
- * the stop timeout above this value so a racing submission always completes
- * before the buffers are released. */
-#define AIC_BT_USB_RX_TIMEOUT_MS      1000U
+/* The receive URBs stay armed without a timeout, as Linux btusb keeps its
+ * interrupt and bulk IN URBs: an idle link costs no cancel and no wakeup.  They
+ * are asynchronous (completion callback); the worker waits for the completion.
+ * A teardown that raced the submission (worker->active cleared and the URB
+ * killed before it was in the controller) is caught after usbh_submit_urb():
+ * the worker kills its own URB when it sees the worker stopped. */
 #define AIC_BT_USB_TX_TIMEOUT_MS      1000U
 #define AIC_BT_USB_STOP_TIMEOUT_MS    3000U
 #define AIC_BT_USB_DMA_ALIGNMENT        64U
@@ -32,6 +32,7 @@ struct aic_btusb_rx_worker
     struct usb_endpoint_descriptor *endpoint;
     struct usbh_urb urb;
     struct rt_completion stopped;
+    struct rt_completion rx_done; /* the armed receive URB completed */
     rt_thread_t thread;
     rt_uint8_t *transfer_buffer;
     rt_uint8_t *packet_buffer;
@@ -186,6 +187,14 @@ static void aic_btusb_feed_rx(struct aic_btusb_rx_worker *worker,
     }
 }
 
+static void aic_btusb_rx_urb_done(void *arg, int nbytes)
+{
+    struct aic_btusb_rx_worker *worker = arg;
+
+    (void)nbytes;
+    rt_completion_done(&worker->rx_done);
+}
+
 static void aic_btusb_rx_thread(void *parameter)
 {
     struct aic_btusb_rx_worker *worker = parameter;
@@ -202,27 +211,37 @@ static void aic_btusb_rx_thread(void *parameter)
         int result;
 
         rt_memset(&worker->urb, 0, sizeof(worker->urb));
+        rt_completion_init(&worker->rx_done);
         if (worker->interrupt_endpoint)
         {
             usbh_int_urb_fill(&worker->urb, context->hport,
                               worker->endpoint, worker->transfer_buffer,
-                              AIC8800_BT_USB_RX_BUFFER_SIZE,
-                              AIC_BT_USB_RX_TIMEOUT_MS, RT_NULL, RT_NULL);
+                              AIC8800_BT_USB_RX_BUFFER_SIZE, 0,
+                              aic_btusb_rx_urb_done, worker);
         }
         else
         {
             usbh_bulk_urb_fill(&worker->urb, context->hport,
                                worker->endpoint, worker->transfer_buffer,
-                               AIC8800_BT_USB_RX_BUFFER_SIZE,
-                               AIC_BT_USB_RX_TIMEOUT_MS, RT_NULL, RT_NULL);
+                               AIC8800_BT_USB_RX_BUFFER_SIZE, 0,
+                               aic_btusb_rx_urb_done, worker);
         }
-        /* Re-check immediately before submission.  A request posted after the
-         * teardown path has run its usbh_kill_urb() would not be cancelled. */
         if (!worker->active || !context->connected || !context->opened)
         {
             break;
         }
         result = usbh_submit_urb(&worker->urb);
+        if (!result)
+        {
+            /* A teardown between the check above and the submission killed
+             * nothing: cancel the URB here.  Its completion always follows. */
+            if (!worker->active || !context->connected || !context->opened)
+            {
+                usbh_kill_urb(&worker->urb);
+            }
+            (void)rt_completion_wait(&worker->rx_done, RT_WAITING_FOREVER);
+            result = worker->urb.errorcode < 0 ? worker->urb.errorcode : 0;
+        }
         if (!worker->active || !context->connected || !context->opened)
         {
             break;
@@ -289,6 +308,7 @@ static rt_err_t aic_btusb_start_worker(
 
     rt_memset(&worker->urb, 0, sizeof(worker->urb));
     rt_completion_init(&worker->stopped);
+    rt_completion_init(&worker->rx_done);
     worker->context = context;
     worker->endpoint = endpoint;
     worker->packet_type = packet_type;
@@ -329,11 +349,11 @@ static void aic_btusb_stop_worker(struct aic_btusb_rx_worker *worker)
             &worker->stopped,
             rt_tick_from_millisecond(AIC_BT_USB_STOP_TIMEOUT_MS)) != RT_EOK)
     {
-        /* The receive timeout is shorter than the stop timeout, so a request
-         * which raced the cancellation has already expired.  Reaching this
-         * point means the thread is wedged somewhere else; deleting it leaves
-         * its URB owning transfer_buffer, so retain the buffers instead of
-         * handing freed memory to the host controller. */
+        /* The kill above completes the armed URB (a submission that raced
+         * it kills itself).  Reaching this point means the thread is wedged
+         * somewhere else; deleting it leaves its URB owning transfer_buffer,
+         * so retain the buffers instead of handing freed memory to the host
+         * controller. */
         LOG_E("RX thread %s did not stop after USB cancellation; "
               "orphaning it and retaining its buffers", worker->name);
         worker->orphaned = RT_TRUE;

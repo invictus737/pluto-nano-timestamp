@@ -319,7 +319,11 @@ static void *zynq_usb_irq_thread(void *arg)
     struct usbh_bus *bus = arg;
     uint32_t last_alist = 0, stuck_alist = 0, last_port_kick = 0, last_log = 0;
     uint32_t logged_lost = 0, logged_late = 0, logged_kicks = 0;
+#ifdef USB_HC_EHCI_NXP
+    rtems_interval period = RTEMS_MILLISECONDS_TO_TICKS(NEXUS_USB_NXP_POLL_MS);
+#else
     rtems_interval period = RTEMS_MILLISECONDS_TO_TICKS(NEXUS_USB_POLL_MS);
+#endif
 
     if (period == 0) {
         period = 1;

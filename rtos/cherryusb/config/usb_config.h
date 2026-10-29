@@ -121,8 +121,14 @@ void usb_osal_dma_barrier(void);
 /* ================ Nexus glue (port/usb_glue_zynq.c) ================ */
 
 #define NEXUS_USB0_BASE      0xE0002000U
-/* poll period of the lost-interrupt check (the IAA watchdog polls every 2 ms during a cycle) */
-#define NEXUS_USB_POLL_MS    10
+/*
+ * poll period of the lost-interrupt check (the IAA watchdog polls every 2 ms during a cycle);
+ * CHERRY_HCD=nxp has no IAA: completions are interrupt-driven only, the poll is a 1 s
+ * watchdog (lost interrupt, port change without interrupt), 2 ms only while a cancel/close
+ * waits for a missed schedule handshake
+ */
+#define NEXUS_USB_POLL_MS     10
+#define NEXUS_USB_NXP_POLL_MS 1000
 /*
  * SCHED_FIFO priority of the "usbh_irq" handler thread, below the POSIX maximum: 18 puts it
  * above the station's SDR workers (max - 19) and below the PL DMA service threads (max - 2).
