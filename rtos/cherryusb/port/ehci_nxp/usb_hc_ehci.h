@@ -109,9 +109,35 @@
 #ifndef CONFIG_USB_EHCI_NXP_SPIN_US
 #define CONFIG_USB_EHCI_NXP_SPIN_US 20
 #endif
-/* a synchronous URB whose cancel is deferred: its submitter waits this long, then abandons it */
+/*
+ * usbh_kill_urb() and a timed-out synchronous URB wait (sleeping, critical section released)
+ * this long for a deferred cancel, then reset the controller (ehci_nxp_recover()) and wait up
+ * to CONFIG_USB_EHCI_NXP_RECOVER_WAIT_MS more; a URB still not back is then -USB_ERR_BUSY
+ * (kill) or abandoned (synchronous: only after a controller reset that stopped all DMA, or if
+ * no reset was possible)
+ */
+#ifndef CONFIG_USB_EHCI_NXP_KILL_WAIT_MS
+#define CONFIG_USB_EHCI_NXP_KILL_WAIT_MS 250
+#endif
+#ifndef CONFIG_USB_EHCI_NXP_RECOVER_WAIT_MS
+#define CONFIG_USB_EHCI_NXP_RECOVER_WAIT_MS 2000
+#endif
 #ifndef CONFIG_USB_EHCI_NXP_ORPHAN_MS
 #define CONFIG_USB_EHCI_NXP_ORPHAN_MS 5000
+#endif
+/* controller reset after this many schedule handshake misses in a row (a wedged controller) */
+#ifndef CONFIG_USB_EHCI_NXP_WEDGE_MISSES
+#define CONFIG_USB_EHCI_NXP_WEDGE_MISSES 3
+#endif
+/* a reset within CONFIG_USB_EHCI_NXP_BACKOFF_QUICK_MS of the last waits MIN_MS doubling to MAX_MS */
+#ifndef CONFIG_USB_EHCI_NXP_BACKOFF_QUICK_MS
+#define CONFIG_USB_EHCI_NXP_BACKOFF_QUICK_MS 10000
+#endif
+#ifndef CONFIG_USB_EHCI_NXP_BACKOFF_MIN_MS
+#define CONFIG_USB_EHCI_NXP_BACKOFF_MIN_MS 1000
+#endif
+#ifndef CONFIG_USB_EHCI_NXP_BACKOFF_MAX_MS
+#define CONFIG_USB_EHCI_NXP_BACKOFF_MAX_MS 30000
 #endif
 
 struct ehci_nxp_pipe;
@@ -148,6 +174,7 @@ struct ehci_nxp_xfer {
     uint8_t in;                   /* IN endpoint (data stage IN for control) */
     uint8_t cancel_pending;       /* cancel deferred: schedule handshake missed */
     uint8_t orphan;               /* synchronous submitter gave up: no URB to hand back */
+    uint8_t kill_req;             /* killed before it was queued (submitter in a handshake) */
     uint32_t seq;                 /* incremented at every allocation */
 };
 
@@ -185,6 +212,16 @@ struct ehci_nxp_stats {
     uint32_t deferred;            /* cancels/closes deferred by a missed handshake */
     uint32_t cancel_races;        /* cancelled transfers the controller finished before it stopped */
     uint32_t orphans;             /* synchronous transfers abandoned by their submitter */
+    uint32_t kill_waits;          /* usbh_kill_urb() waited for a deferred cancel */
+    uint32_t nested_defers;       /* handshake not awaited inside an open edit: deferred */
+    uint32_t kill_busy;           /* usbh_kill_urb() gave up waiting: -USB_ERR_BUSY */
+    uint32_t hse;                 /* host system errors */
+    uint32_t halted_seen;         /* controller found halted while running */
+    uint32_t wedges;              /* CONFIG_USB_EHCI_NXP_WEDGE_MISSES handshake misses in a row */
+    uint32_t stuck_cancels;       /* a kill/timeout waited CONFIG_USB_EHCI_NXP_KILL_WAIT_MS in vain */
+    uint32_t recoveries;          /* controller resets (ehci_nxp_recover()) */
+    uint32_t recover_failures;
+    uint32_t last_recover_ms;     /* duration of the last reset */
     uint32_t max_handshake_us;
 };
 
@@ -204,6 +241,15 @@ struct ehci_nxp_hcd {
     uint8_t sched_depth[2];       /* nested stops of the async [0] / periodic [1] schedule */
     uint8_t sched_stuck[2];       /* enable bit cleared, status not yet 0 */
     uint8_t pending;              /* deferred work for ehci_nxp_service() */
+    uint8_t recover_req;          /* controller reset wanted (HSE, halted, wedged, stuck cancel) */
+    uint8_t recovering;           /* ehci_nxp_recover() running */
+    uint8_t in_irq;               /* USBH_IRQHandler() running: never sleep, no reset there */
+    uint8_t gate;                 /* after a reset: no URB until the hub thread resets a root port */
+    uint8_t forced_csc;           /* root ports reporting a connection change after a reset */
+    uint8_t hs_miss_run;          /* consecutive handshake misses */
+    uint32_t recover_after_us;    /* backoff: not before this time */
+    uint32_t last_recover_us;
+    uint32_t backoff_ms;
     uint32_t xfer_seq;
     struct ehci_nxp_stats stats;
 };
@@ -218,8 +264,19 @@ extern uint32_t g_framelist[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_FRAME_LIST_S
 struct ehci_nxp_pipe *ehci_nxp_pipe_find(struct usbh_bus *bus, struct usbh_hubport *hport, uint8_t ep_addr, uint8_t type);
 void ehci_nxp_close_hport(struct usbh_bus *bus, struct usbh_hubport *hport);
 void ehci_nxp_scan(struct usbh_bus *bus);
-/* deferred cancels/closes and a stuck schedule stop; critical section held */
+/* deferred cancels/closes, a stuck schedule stop, a controller reset; critical section held */
 void ehci_nxp_service(struct usbh_bus *bus);
+/*
+ * Controller reset (Linux usb_hc_died() + HCD reset): interrupts off, RUN off, HCRESET (all DMA
+ * stops), every URB handed back (-USB_ERR_SHUTDOWN unless finished), every pipe closed, the
+ * register init again (usb_hc_low_level2_init() re-applies the glue tunables), port power; the
+ * root ports report a connection change so the hub thread resets the port, releases the old
+ * device and enumerates it again. URBs are refused (-USB_ERR_NOTCONN) until that port reset.
+ * Critical section held; it sleeps with the critical section released.
+ */
+void ehci_nxp_recover(struct usbh_bus *bus);
+/* ask for a controller reset (run by ehci_nxp_service(): interrupt thread or glue poll) */
+void ehci_nxp_request_recover(struct usbh_bus *bus);
 
 /* glue (port/usb_glue_zynq.c) */
 extern uint8_t usbh_get_port_speed(struct usbh_bus *bus, const uint8_t port);
@@ -258,7 +315,15 @@ extern volatile uint32_t g_ehci_xacterr_retries;
 #define USBH_EHCI_URB_APPEND_ONLY (1 << 29)
 #define USBH_EHCI_STREAM_MAX_LEN  0x4000U
 
-/* the OSAL critical section, released at every nesting level and taken back (no sleep in it) */
+/*
+ * The OSAL critical section (a recursive mutex on RTEMS) released at EVERY nesting level the
+ * calling thread holds, outer levels of its callers included, and taken back as deep. This
+ * driver suspends it only to sleep in a schedule handshake, a kill/timeout wait or a controller
+ * reset, never while one of its own schedule edits is open (ehci_may_sleep()); everything a
+ * caller holds across a call into the driver (usbh_submit_urb, usbh_kill_urb, completions) may
+ * therefore change meanwhile: callers re-check their state after such a call, as the AIC
+ * adapter does (aicwf_cherry_kill_urb()).
+ */
 size_t usb_osal_crit_suspend(void);
 void usb_osal_crit_resume(size_t depth);
 

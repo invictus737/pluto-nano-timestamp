@@ -579,6 +579,13 @@ int nexus_cherryusb_shell(int argc, char **argv)
                (unsigned long)ns->async_stops, (unsigned long)ns->periodic_stops,
                (unsigned long)ns->handshake_timeouts, (unsigned long)ns->max_handshake_us,
                (unsigned long)ns->ep_updates, (unsigned long)ns->no_qtd, (unsigned long)ns->no_xfer);
+        printf("ehci-nxp: deferred %lu, kill waits %lu (busy %lu), orphans %lu; controller resets %lu (HSE %lu, "
+               "halted %lu, wedged %lu, stuck cancels %lu, failed %lu, last %lu ms)%s\n",
+               (unsigned long)ns->deferred, (unsigned long)ns->kill_waits, (unsigned long)ns->kill_busy,
+               (unsigned long)ns->orphans, (unsigned long)ns->recoveries, (unsigned long)ns->hse,
+               (unsigned long)ns->halted_seen, (unsigned long)ns->wedges, (unsigned long)ns->stuck_cancels,
+               (unsigned long)ns->recover_failures, (unsigned long)ns->last_recover_ms,
+               g_ehci_nxp[0].gate ? ", waiting for the port reset" : "");
     }
 #endif
     if (aicwf_cherry_stats) {

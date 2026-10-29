@@ -498,6 +498,21 @@ static void port_update_connect(void)
 void sim_dev_bus_reset(void);
 void sim_dev_detach(void);
 
+static void cache_drop(void);
+
+void sim_hc_inject_hse(void)
+{
+    /* EHCI 2.3.2: a host system error clears Run/Stop; the controller halts at once */
+    R.usbcmd &= ~CMD_RS;
+    R.usbsts |= STS_SEI | STS_HCH;
+    R.usbsts &= ~(STS_AS | STS_PS);
+    g_cur = 0;
+    cache_drop();
+    g_as_epoch++;
+    g_ps_epoch++;
+    g_halt_due_ns = 0;
+}
+
 void sim_port_connect(void)
 {
     g_dev_present = 1;
@@ -649,6 +664,7 @@ static void write_usbcmd(uint32_t v)
             sim_viol(V_RS_MODE, "HCRESET written while the controller runs (HCH=0)");
         }
         reset_regs();
+        g_sim_cfg.wedge = 0; /* a reset core answers handshakes again */
         R.usbcmd |= CMD_RST;
         g_rst_done_ns = g_now + 2000;
         return;
@@ -1587,7 +1603,7 @@ static void hc_uframe(void)
     }
     R.usbsts |= STS_SRI;
     /* schedule status follows the enables */
-    if (((R.usbcmd & CMD_ASE) != 0) != ((R.usbsts & STS_AS) != 0) && g_now >= g_ase_due_ns) {
+    if (((R.usbcmd & CMD_ASE) != 0) != ((R.usbsts & STS_AS) != 0) && g_now >= g_ase_due_ns && !g_sim_cfg.wedge) {
         R.usbsts ^= STS_AS;
         if (R.usbsts & STS_AS) {
             g_cur = R.aladdr;
@@ -1597,7 +1613,7 @@ static void hc_uframe(void)
             g_as_epoch++;
         }
     }
-    if (((R.usbcmd & CMD_PSE) != 0) != ((R.usbsts & STS_PS) != 0) && g_now >= g_pse_due_ns) {
+    if (((R.usbcmd & CMD_PSE) != 0) != ((R.usbsts & STS_PS) != 0) && g_now >= g_pse_due_ns && !g_sim_cfg.wedge) {
         R.usbsts ^= STS_PS;
         if (!(R.usbsts & STS_PS)) {
             g_ps_epoch++;

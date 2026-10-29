@@ -168,7 +168,7 @@ static volatile unsigned g_attach_count;
 
 /* counters (`usbh` command) */
 static unsigned g_st_submit, g_st_complete, g_st_bounce, g_st_zlp, g_st_kill, g_st_noreq,
-    g_st_maxq, g_st_reenum, g_st_requeue, g_st_append_busy;
+    g_st_maxq, g_st_reenum, g_st_requeue, g_st_append_busy, g_st_kill_busy;
 
 #define CRIT_ENTER() size_t crit_flags_ = usb_osal_enter_critical_section()
 #define CRIT_LEAVE() usb_osal_leave_critical_section(crit_flags_)
@@ -775,21 +775,33 @@ int aicwf_cherry_kill_urb(struct usbh_urb *urb)
             ep_finish(req->ep, req, -USB_ERR_SHUTDOWN);
             continue;
         case REQ_HW:
+        case REQ_ZLP: {
+            struct usbh_urb *hw = req->state == REQ_HW ? urb : &req->ep->zlp_urb;
+            uint8_t state = req->state;
+            int rc;
+
             g_st_kill++;
             req->killing = 1;
-            if (usbh_kill_urb(urb) != 0 && req->state == REQ_HW) {
+            rc = usbh_kill_urb(hw);
+            if (rc == -USB_ERR_BUSY) {
+                /*
+                 * the controller still owns it (cancel deferred, controller reset pending):
+                 * wait with the lock released at every level, never loop with it held
+                 */
+                size_t depth = usb_osal_crit_suspend();
+
+                usb_osal_msleep(1);
+                usb_osal_crit_resume(depth);
+                g_st_kill_busy++;
+                continue;
+            }
+            if (rc != 0 && req->state == state) {
                 /* the controller side does not know it: end it here */
                 ep_finish(req->ep, req, -USB_ERR_SHUTDOWN);
                 ep_kick(req->ep);
             }
             continue;
-        case REQ_ZLP:
-            g_st_kill++;
-            if (usbh_kill_urb(&req->ep->zlp_urb) != 0 && req->state == REQ_ZLP) {
-                ep_finish(req->ep, req, -USB_ERR_SHUTDOWN);
-                ep_kick(req->ep);
-            }
-            continue;
+        }
         case REQ_DONE:
             if (req->waiter) {
                 break; /* the synchronous submitter finishes it */
@@ -1256,10 +1268,10 @@ void aicwf_cherry_stats(void)
     }
     CRIT_LEAVE();
     printf("aic: urbs submitted %u completed %u killed %u, bounced %u, zlp %u, no slot %u, "
-           "max queue %u, re-enumerations %u, stream requeues %u append-busy %u; now in controller %d "
-           "queued %d giveback %d\n",
+           "max queue %u, re-enumerations %u, stream requeues %u append-busy %u kill-busy %u; now in "
+           "controller %d queued %d giveback %d\n",
            g_st_submit, g_st_complete, g_st_kill, g_st_bounce, g_st_zlp, g_st_noreq, g_st_maxq,
-           g_st_reenum, g_st_requeue, g_st_append_busy, inflight, queued, done);
+           g_st_reenum, g_st_requeue, g_st_append_busy, g_st_kill_busy, inflight, queued, done);
     {
         CRIT_ENTER();
         for (i = 0; i < NX_MAX_EP; i++) {

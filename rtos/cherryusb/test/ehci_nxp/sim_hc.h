@@ -37,6 +37,7 @@ struct sim_cfg {
                                   outermost critical section (models the IRQ thread) */
     uint32_t port_reset_ms;    /* ChipIdea: PORTSC.PR self-clears after this */
     unsigned seed;
+    int wedge;                 /* USBSTS.AS/PS stop following ASE/PSE until HCRESET (wedged core) */
 };
 extern struct sim_cfg g_sim_cfg;
 
@@ -131,6 +132,9 @@ enum sim_hs sim_dev_transact(uint8_t addr, uint8_t ep, uint8_t pid, int toggle, 
                              uint32_t *len, uint16_t mps, int is_periodic);
 void sim_dev_tick_uframe(void);
 int sim_dev_present(void);
+
+/* fault injection: host system error (USBSTS.SEI, controller halts itself, RS cleared) */
+void sim_hc_inject_hse(void);
 
 /* port model */
 void sim_port_connect(void);

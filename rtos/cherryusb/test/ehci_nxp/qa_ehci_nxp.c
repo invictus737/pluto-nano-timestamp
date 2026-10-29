@@ -14,6 +14,8 @@
  *                      the critical section until the request leaves REQ_HW) when the schedule
  *                      handshake is missed
  *   qa_error_storm     XACTERR/NAK/STALL storm on every pipe, then recovery without reset
+ *   qa_hc_recover      host system error and a wedged core (AS/PS never follow): controller reset,
+ *                      URBs back, gate until the port reset, re-enumeration, traffic; reset backoff
  *   qa_soak            replug + re-enumeration WITHOUT controller reset, random NAK/latency/
  *                      errors/AS lag/kills, until QA_SOAK completions (default 300000)
  *
@@ -626,6 +628,117 @@ static void t_qa_soak(void)
     close_all_and_check();
 }
 
+
+/* ================= controller death: HSE and a wedged core, reset and re-enumeration ================= */
+/* what the hub thread does after a controller reset: connection change seen, port reset, enumerate */
+static void rehub_after_reset(uint8_t addr)
+{
+    uint32_t st = port_status();
+    struct pools p = pools_now();
+
+    CHECKV(st & (1U << HUB_PORT_FEATURE_C_CONNECTION), "no connection change after the reset (0x%x)", st);
+    CHECKV(B->hcd.roothub.int_buffer[0] & 2, "hub thread not woken");
+    CHECKV(p.pipes == 0 && p.xfers == 0 && p.qtds_free == CONFIG_USB_EHCI_QTD_NUM,
+           "after the reset: pipes %u xfers %u qtds %u", p.pipes, p.xfers, p.qtds_free);
+    CHECKV(busy_workers() == 0, "%d URBs not handed back by the reset", busy_workers());
+    g_stop = 1;
+    for (int i = 0; i < g_nwk; i++) {
+        g_wk[i]->want = 0;
+    }
+    /* gated until the port reset: an URB of the old device is refused */
+    CHECK(ctrl(0x80, 6, 0x0100, 0, 8, 100) == -USB_ERR_NOTCONN);
+    B->hcd.roothub.int_buffer[0] = 0;
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_CLEAR_FEATURE,
+                 HUB_PORT_FEATURE_C_CONNECTION, 1, NULL) == 0);
+    CHECK(!(port_status() & (1U << HUB_PORT_FEATURE_C_CONNECTION)));
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE, HUB_PORT_FEATURE_RESET, 1,
+                 NULL) == 0);
+    CHECK(port_status() & (1U << HUB_PORT_FEATURE_ENABLE));
+    for (int i = 0; i < g_nwk; i++) {
+        wk_free(g_wk[i]);
+    }
+    g_nwk = 0;
+    memset(&g_dev_stats, 0, sizeof(g_dev_stats));
+    hport_init();
+    enumerate(addr);
+    g_stop = 0;
+    start_wifi(4, 2);
+}
+
+static void traffic_flows(const char *when)
+{
+    uint64_t f0 = s_in.frames, o0 = g_dev_stats.out[1].frames;
+
+    sim_dev_in_enqueue(0x81, 40, 1, 1600);
+    pump_glue_us(60000);
+    CHECKV(s_in.frames >= f0 + 40, "%s: %lu of 40 IN frames", when, (unsigned long)(s_in.frames - f0));
+    CHECKV(g_dev_stats.out[1].frames > o0, "%s: no OUT frame", when);
+    CHECKV(g_dev_stats.toggle_errors == 0, "%s: %lu toggle errors", when, (unsigned long)g_dev_stats.toggle_errors);
+}
+
+static void t_qa_hc_recover(void)
+{
+    struct wk *w = NULL;
+    uint32_t r0;
+    int rc;
+
+    bringup();
+    enumerate(50);
+    start_wifi(4, 2);
+    pump_glue_us(20000);
+    traffic_flows("before");
+    r0 = H()->stats.recoveries;
+
+    /* 1) host system error: the controller halted itself */
+    sim_hc_inject_hse();
+    pump_glue_us(30000);
+    printf("  HSE: hse %u recoveries %u (last %u ms), failures %u\n", H()->stats.hse, H()->stats.recoveries,
+           H()->stats.last_recover_ms, H()->stats.recover_failures);
+    CHECK(H()->stats.hse == 1);
+    CHECKV(H()->stats.recoveries == r0 + 1, "recoveries %u", H()->stats.recoveries - r0);
+    CHECK(sim_reg_peek(0x1a8) == 3); /* the glue tunables again (USBMODE host) */
+    rehub_after_reset(51);
+    traffic_flows("after HSE");
+
+    /* 2) wedged core: AS/PS never follow; a kill still completes (deferred, then reset) */
+    for (int i = 0; i < 4; i++) {
+        if (w_in[i].busy) {
+            w = &w_in[i];
+            break;
+        }
+    }
+    CHECK(w != NULL);
+    g_sim_cfg.wedge = 1;
+    if (w) {
+        size_t f = usb_osal_enter_critical_section();
+        w->want = 0;
+        rc = usbh_kill_urb(&w->urb);
+        usb_osal_leave_critical_section(f);
+        printf("  wedge: kill rc %d, URB %s, misses %u, wedges %u, deferred %u, kill waits %u busy %u, "
+               "recoveries %u\n", rc, w->busy ? "STILL IN THE CONTROLLER" : "back", H()->stats.handshake_timeouts,
+               H()->stats.wedges, H()->stats.deferred, H()->stats.kill_waits, H()->stats.kill_busy,
+               H()->stats.recoveries);
+        CHECK(rc == 0 && !w->busy);
+    }
+    pump_glue_us(30000);
+    CHECKV(H()->stats.recoveries == r0 + 2, "recoveries %u", H()->stats.recoveries - r0);
+    CHECK(g_sim_cfg.wedge == 0);
+    rehub_after_reset(52);
+    traffic_flows("after wedge");
+
+    /* 3) rate limit: a third death right away waits for the backoff */
+    sim_hc_inject_hse();
+    pump_glue_us(30000);
+    CHECKV(H()->stats.recoveries == r0 + 2, "reset not delayed by the backoff (%u)", H()->stats.recoveries - r0);
+    pump_glue_us(1500000);
+    CHECKV(H()->stats.recoveries == r0 + 3, "reset never ran after the backoff (%u)", H()->stats.recoveries - r0);
+    rehub_after_reset(53);
+    traffic_flows("after backoff");
+    check_accounting("recover");
+    check_no_violations();
+    close_all_and_check();
+}
+
 /* ================= runner ================= */
 static const struct {
     const char *name;
@@ -637,6 +750,7 @@ static const struct {
     { "qa_pages_zlp", t_qa_pages_zlp },
     { "qa_deferred_kill", t_qa_deferred_kill },
     { "qa_error_storm", t_qa_error_storm },
+    { "qa_hc_recover", t_qa_hc_recover },
     { "qa_soak", t_qa_soak },
 };
 
