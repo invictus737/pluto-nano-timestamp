@@ -970,6 +970,21 @@ struct aic8800_context
                                        [AIC8800_PS_ID_COUNT];
     struct rt_work traffic_work;
     struct rt_work station_loss_work;
+#ifdef AICWF_RTEMS
+    /* EAPOL frames received by a USB RX worker, handed to the system work
+     * queue: the supplicant answers them with synchronous firmware commands,
+     * which must not run on a thread the confirmations depend on. */
+    struct rt_work eapol_work;
+    rt_bool_t eapol_work_initialized;
+    struct
+    {
+        rt_uint8_t *frame;
+        rt_uint16_t length;
+        rt_uint8_t iftype;
+    } eapol_queue[4];
+    rt_uint8_t eapol_head;
+    rt_uint8_t eapol_count;
+#endif
     struct aic8800_station_loss station_loss[AIC8800_AP_STATION_COUNT];
     rt_bool_t command_gate_initialized;
     rt_bool_t traffic_work_initialized;

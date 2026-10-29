@@ -20,6 +20,15 @@ Local changes (RTEMS port), all inside #ifdef AICWF_RTEMS (defined in ../shim/rt
       runtime never confirms MM_SET_RF_CALIB_REQ.
     - DBG_MEM_BLOCK_WRITE_CFM: a nonzero wstatus is logged, not fatal (Linux never reads
       it; the ROM flags the unaligned last block of the V3 fmacfw).
+  aic8800/aic8800_wifi.c, aic8800/aic8800_wifi.h
+    - EAPOL frames received on a USB RX worker go to the system work queue (4-deep FIFO)
+      before the embedded supplicant/authenticator sees them: its synchronous key and
+      control-port commands must not block the worker their confirmations may arrive on.
+    - a failed firmware command logs request/CFM IDs and the caller thread; a CFM nobody
+      waits for (late, after a timeout) is logged with the receiving thread.
+  wlan/offload/wlan_offload_supplicant.c
+    - each step after EAPOL 3/4 / group 1/2 (GTK, default key, PTK, IGTK, response TX,
+      authorize) logs which one failed and its firmware message ID.
     - upload verify: a file whose size is not a multiple of 4 compares the first word only;
       on mismatch log a register/region dump; for the legacy D80 set a mismatch is a
       warning (the Linux loader never reads uploads back).

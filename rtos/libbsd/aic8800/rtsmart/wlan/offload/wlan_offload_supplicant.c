@@ -2439,6 +2439,13 @@ rt_bool_t rt_wlan_offload_supplicant_handle_eapol(
                                         group_cipher,
                                         gtk_index,
                                         gtk, gtk_length, key_rsc, RT_NULL);
+#ifdef AICWF_RTEMS
+        if (status != RT_EOK)
+        {
+            LOG_W("WPA step GTK install (MM_KEY_ADD_REQ 0x0024, key %u) failed: %d",
+                  gtk_index, status);
+        }
+#endif
         if (status == RT_EOK)
         {
             rt_uint32_t request_id =
@@ -2449,6 +2456,13 @@ rt_bool_t rt_wlan_offload_supplicant_handle_eapol(
                                            RT_WLAN_OFFLOAD_IFTYPE_STATION,
                                            request_id, gtk_index,
                                            RT_FALSE, RT_TRUE) : -RT_EBUSY;
+#ifdef AICWF_RTEMS
+            if (status != RT_EOK)
+            {
+                LOG_W("WPA step set default key %u (no firmware message) failed: %d",
+                      gtk_index, status);
+            }
+#endif
         }
     }
     if (status == RT_EOK && install_pairwise)
@@ -2459,24 +2473,51 @@ rt_bool_t rt_wlan_offload_supplicant_handle_eapol(
                                         pairwise_key,
                                         pairwise_key_length, RT_NULL,
                                         bssid);
+#ifdef AICWF_RTEMS
+        if (status != RT_EOK)
+        {
+            LOG_W("WPA step PTK install (MM_KEY_ADD_REQ 0x0024) failed: %d", status);
+        }
+#endif
     }
     if (status == RT_EOK && igtk_length)
     {
         status = supplicant_install_key(
             radio, RT_FALSE, RT_WLAN_OFFLOAD_CIPHER_AES_CMAC,
             igtk_index, igtk, igtk_length, igtk_sequence, RT_NULL);
+#ifdef AICWF_RTEMS
+        if (status != RT_EOK)
+        {
+            LOG_W("WPA step IGTK install (MM_KEY_ADD_REQ 0x0024, key %u) failed: %d",
+                  igtk_index, status);
+        }
+#endif
     }
     if (status == RT_EOK && response)
     {
         status = rt_wlan_offload_transmit_eapol(
             radio, RT_WLAN_OFFLOAD_IFTYPE_STATION,
             source, response, response_length);
+#ifdef AICWF_RTEMS
+        if (status != RT_EOK)
+        {
+            LOG_W("WPA step EAPOL-Key response TX (data path, no firmware message) failed: %d",
+                  status);
+        }
+#endif
     }
     if (status == RT_EOK &&
         ((install_pairwise && protocol == WLAN_OFFLOAD_WPA_PROTOCOL_RSN) ||
          (group_rekey && initial_group)))
     {
         status = supplicant_set_authorized(radio, bssid, RT_TRUE);
+#ifdef AICWF_RTEMS
+        if (status != RT_EOK)
+        {
+            LOG_W("WPA step authorize (ME_SET_CONTROL_PORT_REQ 0x1404) failed: %d",
+                  status);
+        }
+#endif
     }
     if (status == RT_EOK && install_pairwise)
     {

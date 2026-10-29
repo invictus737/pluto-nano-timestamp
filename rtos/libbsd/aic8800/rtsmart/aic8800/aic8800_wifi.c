@@ -1855,6 +1855,16 @@ rt_err_t aic8800_protocol_command(struct aic8800_context *context,
         request, request_length, response, response_capacity, response_length,
         rt_tick_from_millisecond(AIC8800_WIFI_COMMAND_TIMEOUT_MS), RT_NULL);
     rt_sem_release(&context->command_gate);
+#ifdef AICWF_RTEMS
+    if (result != RT_EOK)
+    {
+        rt_thread_t self = rt_thread_self();
+
+        LOG_W("firmware command 0x%04x (CFM 0x%04x) failed: %d, caller thread %.*s",
+              request_id, confirmation_id, result, RT_NAME_MAX,
+              self ? self->parent.name : "?");
+    }
+#endif
     return result;
 }
 
@@ -3610,8 +3620,22 @@ static rt_err_t aic_handle_command(struct aic8800_context *context,
      * caller with an unrelated event, especially after a timeout. */
     if (aic_command_is_confirmation(id))
     {
+#ifdef AICWF_RTEMS
+        rt_err_t matched = rt_wlan_offload_command_complete(
+            &context->commands, 0, id, RT_EOK, parameter, parameter_length);
+
+        if (matched != RT_EOK)
+        {
+            rt_thread_t self = rt_thread_self();
+
+            /* a CFM nobody waits for: it came after its command timed out */
+            LOG_W("firmware CFM 0x%04x with no waiting command (%d), received on %.*s",
+                  id, matched, RT_NAME_MAX, self ? self->parent.name : "?");
+        }
+#else
         rt_wlan_offload_command_complete(&context->commands, 0, id, RT_EOK,
                                     parameter, parameter_length);
+#endif
     }
     return RT_EOK;
 }
@@ -4176,6 +4200,131 @@ static rt_err_t aic_tcp_ack_init(struct aic8800_context *context)
 }
 #endif
 
+#ifdef AICWF_RTEMS
+static void aic_eapol_work(struct rt_work *work, void *work_data)
+{
+    struct aic8800_context *context = work_data;
+
+    (void)work;
+    while (context)
+    {
+        rt_uint8_t *frame = RT_NULL;
+        rt_uint16_t length = 0;
+        rt_uint8_t iftype = 0;
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        if (context->eapol_count)
+        {
+            rt_uint8_t slot = context->eapol_head;
+
+            frame = context->eapol_queue[slot].frame;
+            length = context->eapol_queue[slot].length;
+            iftype = context->eapol_queue[slot].iftype;
+            context->eapol_queue[slot].frame = RT_NULL;
+            context->eapol_head = (rt_uint8_t)((slot + 1U) %
+                (sizeof(context->eapol_queue) / sizeof(context->eapol_queue[0])));
+            context->eapol_count--;
+        }
+        rt_hw_interrupt_enable(level);
+        if (!frame)
+        {
+            break;
+        }
+        if (context->attached &&
+            context->radio.state == RT_WLAN_OFFLOAD_STARTED)
+        {
+            (void)rt_wlan_offload_rx(&context->radio,
+                                     (enum rt_wlan_offload_iftype)iftype,
+                                     frame, length);
+        }
+        rt_free(frame);
+    }
+}
+
+static void aic_eapol_flush(struct aic8800_context *context)
+{
+    rt_size_t index;
+
+    if (!context->eapol_work_initialized)
+    {
+        return;
+    }
+    rt_work_cancel_sync(&context->eapol_work);
+    for (index = 0; index < sizeof(context->eapol_queue) /
+                            sizeof(context->eapol_queue[0]); index++)
+    {
+        if (context->eapol_queue[index].frame)
+        {
+            rt_free(context->eapol_queue[index].frame);
+            context->eapol_queue[index].frame = RT_NULL;
+        }
+    }
+    context->eapol_head = 0;
+    context->eapol_count = 0;
+}
+
+/* RT_TRUE when the frame was taken over by the EAPOL work item. */
+static rt_bool_t aic_eapol_defer(struct aic8800_context *context,
+                                 enum rt_wlan_offload_iftype iftype,
+                                 const rt_uint8_t *ethernet,
+                                 rt_size_t length)
+{
+    const rt_size_t depth = sizeof(context->eapol_queue) /
+                            sizeof(context->eapol_queue[0]);
+    rt_thread_t self = rt_thread_self();
+    rt_uint8_t *copy;
+    rt_bool_t queued = RT_FALSE;
+    rt_base_t level;
+
+    if (!context->eapol_work_initialized || length < 14U ||
+        length > 0xffffU || ethernet[12] != 0x88 || ethernet[13] != 0x8e)
+    {
+        return RT_FALSE;
+    }
+#ifdef AIC8800_WIFI_TRANSPORT_USB
+    if (!self || (self != context->data_worker.thread &&
+                  self != context->message_worker.thread))
+    {
+        return RT_FALSE;
+    }
+#else
+    (void)self;
+    return RT_FALSE;
+#endif
+    copy = rt_malloc(length);
+    if (!copy)
+    {
+        LOG_W("EAPOL frame dropped: no memory to defer it");
+        return RT_TRUE;
+    }
+    rt_memcpy(copy, ethernet, length);
+    level = rt_hw_interrupt_disable();
+    if (context->eapol_count < depth)
+    {
+        rt_uint8_t slot = (rt_uint8_t)((context->eapol_head +
+                                        context->eapol_count) % depth);
+
+        context->eapol_queue[slot].frame = copy;
+        context->eapol_queue[slot].length = (rt_uint16_t)length;
+        context->eapol_queue[slot].iftype = (rt_uint8_t)iftype;
+        context->eapol_count++;
+        queued = RT_TRUE;
+    }
+    rt_hw_interrupt_enable(level);
+    if (!queued)
+    {
+        rt_free(copy);
+        LOG_W("EAPOL frame dropped: deferral queue full");
+        return RT_TRUE;
+    }
+    if (rt_work_submit(&context->eapol_work, 0) != RT_EOK)
+    {
+        LOG_W("EAPOL work submit failed");
+    }
+    return RT_TRUE;
+}
+#endif
+
 static rt_err_t aic_submit_ethernet(struct aic8800_context *context,
                                     enum rt_wlan_offload_iftype iftype,
                                     const rt_uint8_t *ethernet,
@@ -4207,6 +4356,18 @@ static rt_err_t aic_submit_ethernet(struct aic8800_context *context,
         {
             AIC8800_STAT(context->icmp_rx_count++);
         }
+    }
+#endif
+#ifdef AICWF_RTEMS
+    /* The embedded supplicant handles EAPOL inline and installs keys with
+     * synchronous commands (MM_KEY_ADD, ME_SET_CONTROL_PORT). Run on a USB RX
+     * worker that blocks the worker which may have to decode the very
+     * confirmation it waits for (the firmware may send CFMs on the data
+     * endpoint, as the Linux driver's data path accepts), so every key step
+     * then timed out. Linux hands EAPOL to a separate wpa_supplicant. */
+    if (aic_eapol_defer(context, iftype, ethernet, length))
+    {
+        return RT_EOK;
     }
 #endif
     result = rt_wlan_offload_rx(&context->radio, iftype, ethernet, length);
@@ -6188,6 +6349,9 @@ static rt_err_t aic_wlan_offload_stop(struct rt_wlan_offload_radio *radio)
         rt_memset(context->station_loss, 0,
                   sizeof(context->station_loss));
     }
+#ifdef AICWF_RTEMS
+    aic_eapol_flush(context);
+#endif
     context->lmac_started = RT_FALSE;
     context->firmware_capabilities_valid = RT_FALSE;
     context->firmware_supports_5ghz = RT_FALSE;
@@ -10420,6 +10584,10 @@ static void aic8800_core_cancel_work(struct aic8800_context *context)
         rt_memset(context->station_loss, 0,
                   sizeof(context->station_loss));
     }
+#ifdef AICWF_RTEMS
+    aic_eapol_flush(context);
+    context->eapol_work_initialized = RT_FALSE;
+#endif
     if (context->scan_work_initialized)
     {
         rt_work_cancel_sync(&context->scan_work);
@@ -10506,6 +10674,12 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
     rt_work_init(&context->station_loss_work,
                  aic_station_loss_work, context);
     context->station_loss_work_initialized = RT_TRUE;
+#ifdef AICWF_RTEMS
+    rt_work_init(&context->eapol_work, aic_eapol_work, context);
+    context->eapol_head = 0;
+    context->eapol_count = 0;
+    context->eapol_work_initialized = RT_TRUE;
+#endif
     context->station_loss_work_queued = RT_FALSE;
     rt_memset(context->station_loss, 0, sizeof(context->station_loss));
     rt_work_init(&context->ap_rechannel_work, aic_ap_rechannel_work, context);
