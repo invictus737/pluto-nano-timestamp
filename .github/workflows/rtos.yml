@@ -103,10 +103,26 @@ jobs:
           NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
           NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
         run: rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out
+      - name: CherryUSB cache
+        uses: actions/cache@v4
+        with: { path: rtos/cherryusb/CherryUSB, key: "cherryusb-${{ hashFiles('rtos/cherryusb/fetch-cherryusb.sh', 'rtos/cherryusb/patches/*.patch') }}" }
+      - name: CherryUSB (fetch)
+        run: rtos/cherryusb/fetch-cherryusb.sh
+      - name: Image, CherryUSB USB host variant (rtos-cherry.itb)
+        continue-on-error: true
+        env:
+          NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
+          NEXUS_WIFI_SSID: '${{ secrets.NEXUS_WIFI_SSID }}'
+          NEXUS_WIFI_PSK: '${{ secrets.NEXUS_WIFI_PSK }}'
+        run: |
+          USB_STACK=cherry rtos/ci/image.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX xsa/system_top.xsa out-cherry
+          cp out-cherry/rtos.itb out/rtos-cherry.itb
+          cp out-cherry/nexus-rtos.elf out/nexus-rtos-cherry.elf
+          cp out-cherry/nexus-rtos.map out/nexus-rtos-cherry.map
       - name: Draft release with the base image (repository is public; drafts are visible to collaborators only)
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
-          gh release create "$TAG" out/rtos.itb out/nexus-rtos.elf out/nexus-rtos.map out/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+          gh release create "$TAG" out/rtos.itb out/nexus-rtos.elf out/nexus-rtos.map out/SHA256SUMS $(ls out/rtos-cherry.itb out/nexus-rtos-cherry.elf out/nexus-rtos-cherry.map 2>/dev/null) --repo "$GITHUB_REPOSITORY" \
             --draft --target "$GITHUB_SHA" --title "RTOS CI ${{ github.run_number }} (${GITHUB_SHA::7})" \
             --notes "Draft: CI outputs of the Nexus-BS RTOS branch, not a release."
           gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,createdAt \
