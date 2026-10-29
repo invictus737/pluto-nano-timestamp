@@ -109,8 +109,44 @@ def quirk_c(s):
     return s.replace(anchor, anchor + rows)
 
 
+DIAG_MARK = "/* Pluto RTOS diag */"
+
+
+def diag_proto_c(s):
+    """trace: the parent up/down task runs (net80211 -> driver ic_parent)"""
+    if DIAG_MARK in s:
+        return s
+    old = "\tstruct ieee80211com *ic = arg;\n\n\tic->ic_parent(ic);\n"
+    assert s.count(old) == 1, "parent_updown anchor"
+    return s.replace(old, "\tstruct ieee80211com *ic = arg;\n\n\tprintf(\"wlan diag: %s parent task, %d vap(s) running\\n\", ic->ic_name, ic->ic_nrunning); " + DIAG_MARK + "\n\tic->ic_parent(ic);\n")
+
+
+def diag_ioctl_c(s):
+    """trace: SIOCSIFFLAGS on a vap (state, running count)"""
+    if DIAG_MARK in s:
+        return s
+    old = "\t\tif (ifp->if_flags & IFF_UP) {\n\t\t\t/*\n\t\t\t * Bring ourself up unless we're already operational."
+    assert s.count(old) == 1, "SIOCSIFFLAGS anchor"
+    return s.replace(old, "\t\tprintf(\"wlan diag: %s flags 0x%x state %d running %d\\n\", ifp->if_xname, (unsigned)ifp->if_flags, (int)vap->iv_state, ic->ic_nrunning); " + DIAG_MARK + "\n" + old)
+
+
+def diag_rtwn_c(s):
+    """trace: rtwn_init entry and its error"""
+    if DIAG_MARK in s:
+        return s
+    old = "\tRTWN_LOCK(sc);\n\tif (sc->sc_flags & RTWN_RUNNING) {\n\t\tRTWN_UNLOCK(sc);\n\t\treturn (0);\n\t}\n\tsc->sc_flags |= RTWN_STARTED;"
+    assert s.count(old) == 1, "rtwn_init anchor"
+    s = s.replace(old, old + "\n\tdevice_printf(sc->sc_dev, \"diag: init, flags 0x%x\\n\", sc->sc_flags); " + DIAG_MARK)
+    old = "fail:\n\tRTWN_UNLOCK(sc);\n\n\treturn (error);\n}"
+    assert s.count(old) == 1, "rtwn_init fail anchor"
+    return s.replace(old, "fail:\n\tif (error != 0)\n\t\tdevice_printf(sc->sc_dev, \"diag: init failed, error %d\\n\", error);\n\tRTWN_UNLOCK(sc);\n\n\treturn (error);\n}")
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
 edit("freebsd/sys/dev/usb/quirk/usb_quirk.c", quirk_c)
+edit("freebsd/sys/net80211/ieee80211_proto.c", diag_proto_c)
+edit("freebsd/sys/net80211/ieee80211_ioctl.c", diag_ioctl_c)
+edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
 print("libbsd patched for the Pluto")
