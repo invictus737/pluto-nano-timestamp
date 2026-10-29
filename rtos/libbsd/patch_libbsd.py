@@ -214,6 +214,67 @@ def busdma_c(s):
     return s.replace(old, new)
 
 
+TRACE_MARK = "/* Pluto RTOS: transfer trace */"
+
+
+def ehci_trace_c(s):
+    """Errors and timeouts at the qTD/QH level, printed (bounded) without USB_DEBUG."""
+    if TRACE_MARK in s:
+        return s
+    old = """#ifdef USB_DEBUG
+	if (status & EHCI_QTD_STATERRS) {
+		DPRINTFN(11, "error, addr=%d, endpt=0x%02x, frame=0x%02x\""""
+    assert s.count(old) == 1, "done_sub error anchor"
+    s = s.replace(old, """	""" + TRACE_MARK + """
+	if ((status & EHCI_QTD_STATERRS) != 0) {
+		static int n;
+		if (n++ < 60)
+			printf("ehci: xfer error addr %d ep 0x%02x len %u status 0x%08x cerr %d%s%s%s%s%s\\n",
+			    xfer->address, xfer->endpointno, (unsigned)xfer->sumlen, (unsigned)status,
+			    (int)EHCI_QTD_GET_CERR(status),
+			    (status & EHCI_QTD_HALTED) ? " HALTED" : "",
+			    (status & EHCI_QTD_BUFERR) ? " BUFERR" : "",
+			    (status & EHCI_QTD_BABBLE) ? " BABBLE" : "",
+			    (status & EHCI_QTD_XACTERR) ? " XACTERR" : "",
+			    (status & EHCI_QTD_MISSEDMICRO) ? " MISSED" : "");
+	}
+#ifdef USB_DEBUG
+	if (status & EHCI_QTD_STATERRS) {
+		DPRINTFN(11, "error, addr=%d, endpt=0x%02x, frame=0x%02x\"""")
+    old = """	DPRINTF("xfer=%p\\n", xfer);
+
+	USB_BUS_LOCK_ASSERT(xfer->xroot->bus, MA_OWNED);
+
+	/* transfer is transferred */
+	ehci_device_done(xfer, USB_ERR_TIMEOUT);"""
+    assert s.count(old) == 1, "ehci_timeout anchor"
+    return s.replace(old, """	DPRINTF("xfer=%p\\n", xfer);
+
+	USB_BUS_LOCK_ASSERT(xfer->xroot->bus, MA_OWNED);
+	{
+		static int n;
+		ehci_softc_t *tsc = EHCI_BUS2SC(xfer->xroot->bus);
+		ehci_qh_t *qh = xfer->qh_start[xfer->flags_int.curr_dma_set];
+		ehci_qtd_t *td = xfer->td_transfer_cache;
+		if (n++ < 40 && qh != NULL) {
+			usb_pc_cpu_invalidate(qh->page_cache);
+			if (td != NULL)
+				usb_pc_cpu_invalidate(td->page_cache);
+			printf("ehci: timeout addr %d ep 0x%02x len %u qh endp 0x%08x cur 0x%08x "
+			    "overlay 0x%08x td 0x%08x/0x%08x cmd 0x%08x sts 0x%08x\\n",
+			    xfer->address, xfer->endpointno, (unsigned)xfer->sumlen,
+			    (unsigned)hc32toh(tsc, qh->qh_endp), (unsigned)hc32toh(tsc, qh->qh_curqtd),
+			    (unsigned)hc32toh(tsc, qh->qh_qtd.qtd_status),
+			    td != NULL ? (unsigned)td->qtd_self : 0u,
+			    td != NULL ? (unsigned)hc32toh(tsc, td->qtd_status) : 0u,
+			    (unsigned)EOREAD4(tsc, EHCI_USBCMD), (unsigned)EOREAD4(tsc, EHCI_USBSTS));
+		}
+	}
+
+	/* transfer is transferred */
+	ehci_device_done(xfer, USB_ERR_TIMEOUT);""")
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
@@ -222,5 +283,6 @@ edit("freebsd/sys/net80211/ieee80211_proto.c", diag_proto_c)
 edit("freebsd/sys/net80211/ieee80211_ioctl.c", diag_ioctl_c)
 edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_c)
+edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_trace_c)
 edit("rtemsbsd/rtems/rtems-kernel-bus-dma.c", busdma_c)
 print("libbsd patched for the Pluto")
