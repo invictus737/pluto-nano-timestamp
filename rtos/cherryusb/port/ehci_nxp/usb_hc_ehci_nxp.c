@@ -254,7 +254,8 @@ static bool ehci_sched_stop(struct usbh_bus *bus, int g, uint32_t wait_us)
             }
             return false;
         }
-        if (el >= CONFIG_USB_EHCI_NXP_SPIN_US) {
+        /* a short retry (ehci_nxp_service()) never sleeps */
+        if (el >= CONFIG_USB_EHCI_NXP_SPIN_US && wait_us > CONFIG_USB_EHCI_NXP_SPIN_US) {
             size_t depth = usb_osal_crit_suspend();
 
             h->stats.handshake_sleeps++;
@@ -790,6 +791,13 @@ void ehci_nxp_close_hport(struct usbh_bus *bus, struct usbh_hubport *hport)
 {
     struct ehci_nxp_hcd *h = hcd_of(bus);
 
+    /* released by the hub thread: no longer a device of the dead controller */
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_NXP_STALE_HPORTS; i++) {
+        if (h->stale[i].hport == hport) {
+            h->stale[i].hport = NULL;
+        }
+    }
+
     for (uint32_t i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
         if (h->pipes[i].inuse && h->pipes[i].hport == hport) {
             ehci_pipe_close(bus, &h->pipes[i], -USB_ERR_SHUTDOWN);
@@ -811,16 +819,17 @@ static bool ehci_pipe_set_toggle(struct usbh_bus *bus, struct ehci_nxp_pipe *p, 
     if (((tok & QTD_TOKEN_TOGGLE) != 0) != dt) {
         bool linked = p->linked;
         int g = p->periodic ? SCHED_PERIODIC : SCHED_ASYNC;
+        uint32_t gen = p->gen;
 
         if (linked && !ehci_stop_schedule(bus, p)) {
             return false;
         }
-        /* others may have run while the stop slept */
-        if (!p->inuse || p->closing || p->head != NULL) {
+        /* others may have run while the stop slept (closed, reopened, queued) */
+        if (!p->inuse || p->closing || p->gen != gen || p->head != NULL) {
             if (linked) {
                 ehci_sched_start(bus, g);
             }
-            return p->inuse && !p->closing;
+            return p->inuse && !p->closing && p->gen == gen;
         }
         tok = p->qh->hw.overlay.token;
         p->qh->hw.overlay.token = (tok & ~QTD_TOKEN_TOGGLE) | (dt ? QTD_TOKEN_TOGGLE : 0);
@@ -878,12 +887,13 @@ static int ehci_xfer_queue(struct usbh_bus *bus, struct ehci_nxp_pipe *p, struct
     /* the toggle the URB carries, while the pipe is idle (old port: urb->data_toggle) */
     if (p->head == NULL) {
         bool dt = p->reset_toggle ? false : urb->data_toggle != 0;
+        uint32_t gen = p->gen;
 
         if (!ehci_pipe_set_toggle(bus, p, dt)) {
             /* schedule handshake missed, or the pipe closed meanwhile: nothing queued */
-            return p->inuse && !p->closing ? -USB_ERR_BUSY : -USB_ERR_NOTCONN;
+            return p->inuse && !p->closing && p->gen == gen ? -USB_ERR_BUSY : -USB_ERR_NOTCONN;
         }
-        if (!p->inuse || p->closing) {
+        if (!p->inuse || p->closing || p->gen != gen) {
             return -USB_ERR_NOTCONN; /* closed while the handshake slept */
         }
         if (x->kill_req) {
@@ -1291,7 +1301,7 @@ static void ehci_xfer_cancel(struct usbh_bus *bus, struct ehci_nxp_pipe *p, stru
 }
 
 /* deferred cancels and closes, a stuck stop (critical section held) */
-void ehci_nxp_service(struct usbh_bus *bus)
+static void ehci_service(struct usbh_bus *bus, bool may_reset)
 {
     struct ehci_nxp_hcd *h = hcd_of(bus);
     bool left = false;
@@ -1301,10 +1311,10 @@ void ehci_nxp_service(struct usbh_bus *bus)
     }
     if (h->recover_req) {
         /*
-         * never in the interrupt handler (it sleeps): the glue poll right after it; rate
-         * limited: the backoff is waited by the 1 s glue poll, not polled faster
+         * only the glue's usbh_irq poll resets (it sleeps; never in the interrupt handler or
+         * a thread waiting in a kill); rate limited: the backoff is waited by the 1 s poll
          */
-        if (!h->in_irq && (int32_t)(usb_ehci_time_us() - h->recover_after_us) >= 0) {
+        if (may_reset && !h->in_irq && (int32_t)(usb_ehci_time_us() - h->recover_after_us) >= 0) {
             ehci_nxp_recover(bus);
         }
         if (h->recovering || h->recover_req) {
@@ -1312,6 +1322,18 @@ void ehci_nxp_service(struct usbh_bus *bus)
         }
     }
     if (!h->pending) {
+        h->pend_valid = 0;
+        return;
+    }
+    /* deferred work that never completes (a stop stuck with ASE off): the controller is wedged */
+    if (!h->pend_valid) {
+        h->pend_valid = 1;
+        h->pend_since_us = usb_ehci_time_us();
+    } else if ((uint32_t)(usb_ehci_time_us() - h->pend_since_us) > CONFIG_USB_EHCI_NXP_PENDING_MAX_MS * 1000U) {
+        h->pend_valid = 0;
+        h->stats.stuck_pending++;
+        h->stats.wedges++;
+        ehci_nxp_request_recover(bus);
         return;
     }
     h->pending = 0;
@@ -1363,7 +1385,14 @@ void ehci_nxp_service(struct usbh_bus *bus)
     }
     if (left) {
         h->pending = 1;
+    } else if (!h->pending) {
+        h->pend_valid = 0;
     }
+}
+
+void ehci_nxp_service(struct usbh_bus *bus)
+{
+    ehci_service(bus, false);
 }
 
 /* ---- roothub (CherryUSB EHCI port, W1C-safe register updates) ---- */
@@ -1549,6 +1578,11 @@ __WEAK void usb_hc_low_level_deinit(struct usbh_bus *bus)
     (void)bus;
 }
 
+__WEAK void usb_hc_low_level_vbus(struct usbh_bus *bus)
+{
+    (void)bus;
+}
+
 /*
  * Register part of the initialisation after HCRESET (also after a controller reset): host mode
  * and the glue tunables, list bases, frame list size, run, both schedules, port power,
@@ -1627,10 +1661,13 @@ void ehci_nxp_recover(struct usbh_bus *bus)
     uint32_t t0 = usb_ehci_time_us(), n, since;
     size_t depth;
     int rc = 0;
+    bool board;
 
     if (h->recovering || !h->running) {
         return;
     }
+    board = h->board_reset != 0;
+    h->board_reset = 0;
     h->recovering = 1;
     h->recover_req = 0;
     h->gate = 1;
@@ -1649,6 +1686,14 @@ void ehci_nxp_recover(struct usbh_bus *bus)
     for (n = 0; n < 20 && !ehci_hc_halted(bus); n++) {
         usb_osal_msleep(1);
     }
+    if (board) {
+        /*
+         * the last reset failed, or the controller died twice within the backoff window: the
+         * board-level init as at boot (glue: SLCR USB0 reset, ULPI PHY reset), then HCRESET
+         */
+        h->stats.board_resets++;
+        usb_hc_low_level_init(bus);
+    }
     op_wr(bus, EHCI_NXP_USBCMD, EHCI_USBCMD_HCRESET);
     for (n = 0; n < 100 && (op_rd(bus, EHCI_NXP_USBCMD) & EHCI_USBCMD_HCRESET); n++) {
         usb_osal_msleep(1);
@@ -1664,6 +1709,23 @@ void ehci_nxp_recover(struct usbh_bus *bus)
         struct ehci_nxp_pipe *p = &h->pipes[i];
 
         if (p->inuse) {
+            /* its device: URBs refused until the hub thread released it */
+            if (p->hport && p->hport->connected && p->hport->dev_addr) {
+                uint32_t k, freek = CONFIG_USB_EHCI_NXP_STALE_HPORTS;
+
+                for (k = 0; k < CONFIG_USB_EHCI_NXP_STALE_HPORTS; k++) {
+                    if (h->stale[k].hport == p->hport) {
+                        break;
+                    }
+                    if (!h->stale[k].hport && freek == CONFIG_USB_EHCI_NXP_STALE_HPORTS) {
+                        freek = k;
+                    }
+                }
+                if (k == CONFIG_USB_EHCI_NXP_STALE_HPORTS && freek < CONFIG_USB_EHCI_NXP_STALE_HPORTS) {
+                    h->stale[freek].hport = p->hport;
+                    h->stale[freek].dev_addr = p->hport->dev_addr;
+                }
+            }
             p->linked = 0;
             p->closing = 1;
             ehci_pipe_close_stopped(bus, p, -USB_ERR_SHUTDOWN);
@@ -1683,19 +1745,28 @@ void ehci_nxp_recover(struct usbh_bus *bus)
     } else {
         depth = usb_osal_crit_suspend();
         rc = ehci_hc_run(bus);
+        if (rc == 0 && board) {
+            usb_hc_low_level_vbus(bus); /* the PHY was reset: VBUS and host pull-downs again */
+        }
         usb_osal_crit_resume(depth);
     }
+    h->dma_halted = 0;
     h->stats.last_recover_ms = (usb_ehci_time_us() - t0) / 1000U;
 
     /* backoff of the next reset (Linux-like: a controller dying again soon waits longer) */
     since = t0 - h->last_recover_us;
     if (h->stats.recoveries > 1 && since < CONFIG_USB_EHCI_NXP_BACKOFF_QUICK_MS * 1000U) {
+        /* dying again soon after a reset: the next one is board level (N4) */
+        if (++h->quick_run >= 2) {
+            h->board_reset = 1;
+        }
         h->backoff_ms = h->backoff_ms ? h->backoff_ms * 2 : CONFIG_USB_EHCI_NXP_BACKOFF_MIN_MS;
         if (h->backoff_ms > CONFIG_USB_EHCI_NXP_BACKOFF_MAX_MS) {
             h->backoff_ms = CONFIG_USB_EHCI_NXP_BACKOFF_MAX_MS;
         }
     } else {
         h->backoff_ms = 0;
+        h->quick_run = 0;
     }
     h->last_recover_us = t0;
     h->recover_after_us = usb_ehci_time_us() + h->backoff_ms * 1000U;
@@ -1704,6 +1775,7 @@ void ehci_nxp_recover(struct usbh_bus *bus)
 
     if (rc < 0) {
         h->stats.recover_failures++;
+        h->board_reset = 1; /* a controller reset that failed: board level next time */
         CONFIG_USB_PRINTF("ehci-nxp: controller reset failed (%d), next try in %lu ms\n", rc,
                           (unsigned long)(h->backoff_ms ? h->backoff_ms : CONFIG_USB_EHCI_NXP_BACKOFF_MIN_MS));
         if (!h->backoff_ms) {
@@ -1840,6 +1912,53 @@ uint16_t usbh_get_frame_number(struct usbh_bus *bus)
 
 /* ---- URB API ---- */
 
+/*
+ * Critical section held: stop every DMA of the controller (RUN off, wait for HCH, 1 ms sleeps
+ * with the lock released) when a URB must be given up while the reset is held by its backoff;
+ * URBs are refused until the reset (ehci_nxp_recover() clears it).
+ */
+static void ehci_halt_dma(struct usbh_bus *bus)
+{
+    struct ehci_nxp_hcd *h = hcd_of(bus);
+
+    if (!h->running || h->recovering) {
+        return;
+    }
+    if (!h->dma_halted) {
+        h->dma_halted = 1;
+        h->gate = 1;
+        h->stats.dma_halts++;
+        usbcmd_update(bus, EHCI_USBCMD_RUN, 0);
+        ehci_nxp_request_recover(bus);
+    }
+    for (uint32_t n = 0; n < 20 && !ehci_hc_halted(bus) && ehci_may_sleep(h); n++) {
+        size_t depth = usb_osal_crit_suspend();
+
+        usb_osal_msleep(1);
+        usb_osal_crit_resume(depth);
+    }
+}
+
+/*
+ * A device of a controller that was reset, not yet released by the hub thread (it resets the
+ * port first, releases the old device ~200 ms later): its class drivers would talk to an
+ * address the device no longer has. A new enumeration on the same hport (address 0) ends it.
+ */
+static bool ehci_stale_hport(struct ehci_nxp_hcd *h, struct usbh_hubport *hport)
+{
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_NXP_STALE_HPORTS; i++) {
+        if (h->stale[i].hport == hport) {
+            if (hport->dev_addr != h->stale[i].dev_addr) {
+                h->stale[i].hport = NULL; /* enumerating again: a new device */
+                return false;
+            }
+            h->stats.stale_refused++;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* the transfer has been handed back (synchronous: done, waiting for its submitter) */
 static bool ehci_xfer_final(struct ehci_nxp_xfer *x, uint32_t seq)
 {
@@ -1924,7 +2043,7 @@ int usbh_submit_urb(struct usbh_urb *urb)
 
     flags = usb_osal_enter_critical_section();
     /* gated after a controller reset until the hub thread resets the port; hport re-checked */
-    if (!h->running || h->recovering || h->gate || !urb->hport->connected) {
+    if (!h->running || h->recovering || h->gate || !urb->hport->connected || ehci_stale_hport(h, urb->hport)) {
         usb_osal_leave_critical_section(flags);
         return -USB_ERR_NOTCONN;
     }
@@ -1984,7 +2103,8 @@ int usbh_submit_urb(struct usbh_urb *urb)
         }
     }
     /* others ran during a handshake sleep: killed, reset, or the device gone */
-    if (ret == 0 && (x->kill_req || h->recovering || h->gate || !urb->hport->connected)) {
+    if (ret == 0 && (x->kill_req || h->recovering || h->gate || !urb->hport->connected ||
+                     ehci_stale_hport(h, urb->hport))) {
         ret = x->kill_req ? -USB_ERR_SHUTDOWN : -USB_ERR_NOTCONN;
     }
     if (ret == 0 && p == NULL) {
@@ -2021,9 +2141,19 @@ int usbh_submit_urb(struct usbh_urb *urb)
         }
         if (!x->done) {
             /*
-             * Still in the controller after a reset was asked for (none possible yet:
-             * backoff, or the reset failed): abandoned, never handed back to this URB. The
-             * next controller reset frees it.
+             * The reset is held (backoff) or failed: stop all controller DMA (RUN off, wait
+             * HCH) and cancel it on the halted controller, so its buffer is never written
+             * after this returns; the reset follows when the backoff allows.
+             */
+            ehci_halt_dma(bus);
+            if (x->pipe && !x->done && !x->cancel_pending) {
+                ehci_xfer_cancel(bus, x->pipe, x);
+            }
+        }
+        if (!x->done) {
+            /*
+             * Still not back (the controller would not halt): abandoned, never handed back to
+             * this URB. The next controller reset frees it.
              */
             x->orphan = 1;
             x->urb = NULL;
@@ -2098,10 +2228,11 @@ void USBH_IRQHandler(uint8_t busid)
     uint32_t usbsts, raw;
     size_t flags;
 
+    flags = usb_osal_enter_critical_section();
     if (!h->running || h->recovering) {
+        usb_osal_leave_critical_section(flags);
         return;
     }
-    flags = usb_osal_enter_critical_section();
     h->in_irq = 1;
     ehci_nxp_service(bus);
     raw = op_rd(bus, EHCI_NXP_USBSTS);
@@ -2124,7 +2255,7 @@ void USBH_IRQHandler(uint8_t busid)
         g_ehci_iaa_stats[busid].fatal++;
         h->stats.hse++;
         ehci_nxp_request_recover(bus);
-    } else if ((raw & EHCI_USBSTS_HALTED) && h->running && !h->recovering) {
+    } else if ((raw & EHCI_USBSTS_HALTED) && h->running && !h->recovering && !h->dma_halted) {
         h->stats.halted_seen++;
         ehci_nxp_request_recover(bus);
     }
@@ -2156,7 +2287,7 @@ uint32_t usbh_ehci_async_watchdog(uint8_t busid)
     uint32_t was = h->pending || h->recover_req;
 
     if (h->running && was) {
-        ehci_nxp_service(&g_usbhost_bus[busid]);
+        ehci_service(&g_usbhost_bus[busid], true);
     }
     return was ? 1 : 0;
 }

@@ -78,19 +78,30 @@ static void glue_poll(void)
     usb_osal_leave_critical_section(f);
 }
 
-/* pump with the glue poll modelled (1 s idle period, 2 ms while pending) */
+/* the glue poll (1 s idle period, 2 ms while pending), also while a driver thread sleeps */
+static uint64_t g_next_poll;
+
+static void glue_poll_if_due(void)
+{
+    if (g_next_poll == 0 || sim_now_ns() >= g_next_poll) {
+        glue_poll();
+        g_next_poll = sim_now_ns() + (usbh_ehci_iaa_pending(0) ? 2000000ULL : 1000000000ULL);
+    } else if (usbh_ehci_iaa_pending(0) && g_next_poll > sim_now_ns() + 2000000ULL) {
+        g_next_poll = sim_now_ns() + 2000000ULL;
+    }
+}
+
+extern void (*g_sim_sleep_hook)(void);
+
+/* pump with the glue poll modelled */
 static void pump_glue_us(uint64_t us)
 {
-    static uint64_t next_poll;
     uint64_t end = sim_now_ns() + us * 1000ULL;
+
+    g_sim_sleep_hook = glue_poll_if_due;
     while (sim_now_ns() < end) {
         pump_us(125);
-        if (next_poll == 0 || sim_now_ns() >= next_poll) {
-            glue_poll();
-            next_poll = sim_now_ns() + (usbh_ehci_iaa_pending(0) ? 2000000ULL : 1000000000ULL);
-        } else if (usbh_ehci_iaa_pending(0) && next_poll > sim_now_ns() + 2000000ULL) {
-            next_poll = sim_now_ns() + 2000000ULL;
-        }
+        glue_poll_if_due();
     }
 }
 
@@ -654,6 +665,13 @@ static void rehub_after_reset(uint8_t addr)
     CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE, HUB_PORT_FEATURE_RESET, 1,
                  NULL) == 0);
     CHECK(port_status() & (1U << HUB_PORT_FEATURE_ENABLE));
+    /* the hub thread releases the old device (its pipes are already gone) */
+    g_hp.connected = false;
+    {
+        size_t f = usb_osal_enter_critical_section();
+        usbh_kill_urb(&g_ctl_urb);
+        usb_osal_leave_critical_section(f);
+    }
     for (int i = 0; i < g_nwk; i++) {
         wk_free(g_wk[i]);
     }
@@ -1237,6 +1255,7 @@ int main(int argc, char **argv)
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     sim_init();
+    g_sim_sleep_hook = glue_poll_if_due;
     signal(SIGALRM, on_alarm);
     for (unsigned i = 0; i < sizeof(k_qa) / sizeof(k_qa[0]); i++) {
         int sel = argc < 2;

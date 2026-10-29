@@ -262,6 +262,15 @@ void usb_hc_low_level2_init(struct usbh_bus *bus)
     rtems_binary_semaphore_post(&g_hc_ready);
 }
 
+/* CHERRY_HCD=nxp board-level reset (usb_hc_low_level_init() again): the PHY drives VBUS again */
+void usb_hc_low_level_vbus(struct usbh_bus *bus)
+{
+    (void)bus;
+    if (zynq_ulpi_write(ULPI_OTG_CTRL_SET, ULPI_OTG_HOST_VBUS) != 0) {
+        printf("usbh: ULPI OTG control write timed out after the board-level reset\n");
+    }
+}
+
 void usb_hc_low_level_deinit(struct usbh_bus *bus)
 {
     if (g_irq_installed) {
@@ -586,6 +595,9 @@ int nexus_cherryusb_shell(int argc, char **argv)
                (unsigned long)ns->halted_seen, (unsigned long)ns->wedges, (unsigned long)ns->stuck_cancels,
                (unsigned long)ns->recover_failures, (unsigned long)ns->last_recover_ms,
                g_ehci_nxp[0].gate ? ", waiting for the port reset" : "");
+        printf("ehci-nxp: board-level resets %lu, stuck deferred work %lu, stale-device URBs refused %lu, "
+               "DMA halts %lu\n", (unsigned long)ns->board_resets, (unsigned long)ns->stuck_pending,
+               (unsigned long)ns->stale_refused, (unsigned long)ns->dma_halts);
     }
 #endif
     if (aicwf_cherry_stats) {

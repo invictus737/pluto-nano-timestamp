@@ -125,6 +125,14 @@
 #ifndef CONFIG_USB_EHCI_NXP_ORPHAN_MS
 #define CONFIG_USB_EHCI_NXP_ORPHAN_MS 5000
 #endif
+/* deferred work (a stuck stop, a deferred cancel/close) older than this resets the controller */
+#ifndef CONFIG_USB_EHCI_NXP_PENDING_MAX_MS
+#define CONFIG_USB_EHCI_NXP_PENDING_MAX_MS 250
+#endif
+/* hports of the dead controller remembered until their release (stale URBs refused) */
+#ifndef CONFIG_USB_EHCI_NXP_STALE_HPORTS
+#define CONFIG_USB_EHCI_NXP_STALE_HPORTS 8
+#endif
 /* controller reset after this many schedule handshake misses in a row (a wedged controller) */
 #ifndef CONFIG_USB_EHCI_NXP_WEDGE_MISSES
 #define CONFIG_USB_EHCI_NXP_WEDGE_MISSES 3
@@ -219,6 +227,10 @@ struct ehci_nxp_stats {
     uint32_t halted_seen;         /* controller found halted while running */
     uint32_t wedges;              /* CONFIG_USB_EHCI_NXP_WEDGE_MISSES handshake misses in a row */
     uint32_t stuck_cancels;       /* a kill/timeout waited CONFIG_USB_EHCI_NXP_KILL_WAIT_MS in vain */
+    uint32_t stuck_pending;       /* deferred work older than CONFIG_USB_EHCI_NXP_PENDING_MAX_MS */
+    uint32_t board_resets;        /* resets escalated to SLCR + ULPI PHY (usb_hc_low_level_init) */
+    uint32_t stale_refused;       /* URBs of a device of the dead controller refused */
+    uint32_t dma_halts;           /* controller halted to abandon a synchronous URB safely */
     uint32_t recoveries;          /* controller resets (ehci_nxp_recover()) */
     uint32_t recover_failures;
     uint32_t last_recover_ms;     /* duration of the last reset */
@@ -244,6 +256,15 @@ struct ehci_nxp_hcd {
     uint8_t recover_req;          /* controller reset wanted (HSE, halted, wedged, stuck cancel) */
     uint8_t recovering;           /* ehci_nxp_recover() running */
     uint8_t in_irq;               /* USBH_IRQHandler() running: never sleep, no reset there */
+    uint8_t pend_valid;           /* pend_since_us holds when deferred work was first seen */
+    uint8_t board_reset;          /* next reset: board level (SLCR + ULPI PHY, usb_hc_low_level_init) */
+    uint8_t quick_run;            /* resets in a row within CONFIG_USB_EHCI_NXP_BACKOFF_QUICK_MS */
+    uint8_t dma_halted;           /* RUN cleared by this driver (abandoned URB), reset pending */
+    uint32_t pend_since_us;
+    struct {
+        struct usbh_hubport *hport; /* device of the dead controller, not yet released */
+        uint8_t dev_addr;
+    } stale[CONFIG_USB_EHCI_NXP_STALE_HPORTS];
     uint8_t gate;                 /* after a reset: no URB until the hub thread resets a root port */
     uint8_t forced_csc;           /* root ports reporting a connection change after a reset */
     uint8_t hs_miss_run;          /* consecutive handshake misses */
@@ -264,7 +285,11 @@ extern uint32_t g_framelist[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_FRAME_LIST_S
 struct ehci_nxp_pipe *ehci_nxp_pipe_find(struct usbh_bus *bus, struct usbh_hubport *hport, uint8_t ep_addr, uint8_t type);
 void ehci_nxp_close_hport(struct usbh_bus *bus, struct usbh_hubport *hport);
 void ehci_nxp_scan(struct usbh_bus *bus);
-/* deferred cancels/closes, a stuck schedule stop, a controller reset; critical section held */
+/*
+ * deferred cancels/closes and a stuck schedule stop; critical section held. Never the
+ * controller reset: that runs only in the glue's usbh_irq thread poll
+ * (usbh_ehci_async_watchdog()), at its priority, never in a thread that waits in a kill.
+ */
 void ehci_nxp_service(struct usbh_bus *bus);
 /*
  * Controller reset (Linux usb_hc_died() + HCD reset): interrupts off, RUN off, HCRESET (all DMA
@@ -279,6 +304,8 @@ void ehci_nxp_recover(struct usbh_bus *bus);
 void ehci_nxp_request_recover(struct usbh_bus *bus);
 
 /* glue (port/usb_glue_zynq.c) */
+/* weak, default none: drive VBUS again after a board-level reset (ULPI PHY reset) */
+void usb_hc_low_level_vbus(struct usbh_bus *bus);
 extern uint8_t usbh_get_port_speed(struct usbh_bus *bus, const uint8_t port);
 void usb_hc_low_level_init(struct usbh_bus *bus);
 void usb_hc_low_level2_init(struct usbh_bus *bus);

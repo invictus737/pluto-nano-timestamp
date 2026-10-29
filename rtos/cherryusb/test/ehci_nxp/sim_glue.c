@@ -120,6 +120,23 @@ void usb_osal_crit_resume(size_t depth) { g_sim_crit = (int)depth; }
 void usb_osal_dma_barrier(void) { g_sim_barriers++; }
 
 /* ---- time ---- */
+/*
+ * the glue's usbh_irq thread runs while a driver thread sleeps: a test sets this hook to model
+ * its poll (usbh_ehci_async_watchdog) during sleeps
+ */
+void (*g_sim_sleep_hook)(void);
+
+static void sim_sleep_hook(void)
+{
+    static int in_hook;
+
+    if (g_sim_sleep_hook && !in_hook && !g_sim_crit && !g_sim_in_isr) {
+        in_hook = 1;
+        g_sim_sleep_hook();
+        in_hook = 0;
+    }
+}
+
 void usb_osal_msleep(uint32_t delay)
 {
     if (g_sim_crit) {
@@ -128,7 +145,10 @@ void usb_osal_msleep(uint32_t delay)
     if (g_sim_in_isr) {
         sim_viol(V_SLEEP_IN_CRIT, "usb_osal_msleep(%u) in the interrupt handler", delay);
     }
-    sim_advance_ms(delay);
+    for (uint32_t i = 0; i < delay; i++) {
+        sim_advance_ms(1);
+        sim_sleep_hook();
+    }
 }
 
 /* ---- semaphores ---- */
@@ -185,6 +205,11 @@ int usb_osal_sem_take(usb_osal_sem_t sem, uint32_t timeout)
     end = sim_now_ns() + (uint64_t)timeout * 1000000ULL;
     while (sim_now_ns() < end) {
         sim_advance_ns(125000);
+        if (s->count) {
+            s->count--;
+            return 0;
+        }
+        sim_sleep_hook();
         if (s->count) {
             s->count--;
             return 0;
