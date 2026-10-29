@@ -201,7 +201,7 @@ static void load_report(unsigned seconds)
 static volatile unsigned log_period_s = 60;
 static load_snapshot log_a, log_b;
 static load_row log_rows[LOAD_MAX_THREADS];
-static char log_stage[512];
+static char log_stage[1024]; /* stages + drive.wake, tx.lead min/mean, tx.late */
 
 static void *load_logger(void *arg)
 {
@@ -218,7 +218,7 @@ static void *load_logger(void *arg)
     uint32_t idle[LOAD_CPUS];
     Timestamp_Control wall;
     size_t n = load_diff(&log_a, &log_b, log_rows, idle, &wall);
-    char line[768];
+    char line[1280];
     size_t o = 0;
     char b0[16], b1[16];
     print_pct(b0, sizeof(b0), 10000u - (idle[0] > 10000u ? 10000u : idle[0]));
@@ -350,22 +350,69 @@ static const char *const env_pluto[] = {
   NULL,
 };
 
-void nexus_env_load_file(void)
+/* RTEMS defaults: the parity-tested fast path of the Linux Pluto station (env_pluto without
+ * RUST_LOG, whose INFO lines carry the registration evidence). Applied at every start to each
+ * switch that neither the shell nor nexus2.env set; NAME=0 (saved) turns one off.
+ *  - RX_LATENCY_US=2000: the RX-derived clock's acquisition bound. The policy default (4 RX
+ *    blocks + 2 ms = 6 ms, sized for the USB gadget) left ~3 ms of the 10 ms TX lead for the
+ *    whole RX->TETRA->synthesis->TX chain; local DMA delivers a block ~1 block after its end.
+ *  - RUNNING_LEAD12/16: prepare TX 16 ms ahead once running (startup keeps 10 ms), inside the
+ *    16-block TX DMA ring. With 2 ms latency that leaves ~13.5 ms of pipeline slack.
+ *  - ANALYSIS_PAIR/Q15, SYNTHESIS_HISTORY, TX/RX_RESAMPLER_BLOCK: the NEON PFB/resampler kernels.
+ *  - DRIVE_WAKE: the drive loop parks until RX analysis wakes it (a 250 us sleep is a 1-2 ms
+ *    tick on RTEMS); TX_SILENT/TX_BATCH/IDLE_GATE and the DMR/FM credits as on Linux. */
+static const char *const env_rtems_defaults[] = {
+  "NEXUS2_PLUTO_RX_LATENCY_US=2000",
+  "NEXUS2_PLUTO_RUNNING_LEAD12=1",
+  "NEXUS2_PLUTO_RUNNING_LEAD16=1",
+  "NEXUS2_PLUTO_ANALYSIS_PAIR=1",
+  "NEXUS2_PLUTO_ANALYSIS_Q15=1",
+  "NEXUS2_PLUTO_SYNTHESIS_HISTORY=1",
+  "NEXUS2_PLUTO_TX_RESAMPLER_BLOCK=1",
+  "NEXUS2_PLUTO_RX_RESAMPLER_BLOCK=1",
+  "NEXUS2_DRIVE_WAKE=1",
+  "NEXUS2_TX_SILENT=1",
+  "NEXUS2_TX_BATCH=4",
+  "NEXUS2_IDLE_GATE=1",
+  "NEXUS2_PLUTO_DMR_RX_CREDIT=1",
+  "NEXUS2_PLUTO_FM_RX1PACKET=1",
+  NULL,
+};
+
+static void env_apply_defaults(void)
 {
-  FILE *f = fopen(NEXUS2_ENV_FILE, "r");
-  if (f == NULL) {
-    return;
-  }
-  char line[160];
   int n = 0;
-  while (fgets(line, sizeof(line), f) != NULL) {
-    line[strcspn(line, "\r\n")] = '\0';
-    if (line[0] != '\0' && line[0] != '#' && env_put(line) == 0) {
+  for (const char *const *kv = env_rtems_defaults; *kv != NULL; ++kv) {
+    const char *eq = strchr(*kv, '=');
+    char name[64];
+    if (eq == NULL || (size_t)(eq - *kv) >= sizeof(name)) {
+      continue;
+    }
+    memcpy(name, *kv, (size_t)(eq - *kv));
+    name[eq - *kv] = '\0';
+    if (getenv(name) == NULL && setenv(name, eq + 1, 0) == 0) {
       ++n;
     }
   }
-  fclose(f);
-  printf("nexus2: %d switch(es) from %s\n", n, NEXUS2_ENV_FILE);
+  printf("nexus2: %d default switch(es) applied (`nexus env NAME=0` + save turns one off)\n", n);
+}
+
+void nexus_env_load_file(void)
+{
+  FILE *f = fopen(NEXUS2_ENV_FILE, "r");
+  if (f != NULL) {
+    char line[160];
+    int n = 0;
+    while (fgets(line, sizeof(line), f) != NULL) {
+      line[strcspn(line, "\r\n")] = '\0';
+      if (line[0] != '\0' && line[0] != '#' && env_put(line) == 0) {
+        ++n;
+      }
+    }
+    fclose(f);
+    printf("nexus2: %d switch(es) from %s\n", n, NEXUS2_ENV_FILE);
+  }
+  env_apply_defaults();
 }
 
 static void env_list(void)
@@ -387,7 +434,9 @@ int nexus_env_shell(int argc, char **argv)
   /* argv[0] = "nexus", argv[1] = "env" */
   if (argc < 3) {
     env_list();
-    printf("nexus env NAME=VALUE|NAME= ... | pluto | save | clear  (applies at the next start)\n");
+    printf("nexus env NAME=VALUE|NAME= ... | pluto | save | clear  (applies at the next start)\n"
+           "  every start fills in the RTEMS default fast-path switches not set here or in the\n"
+           "  saved file; NAME=0 then save disables one\n");
     return 0;
   }
   if (strcmp(argv[2], "pluto") == 0) {
