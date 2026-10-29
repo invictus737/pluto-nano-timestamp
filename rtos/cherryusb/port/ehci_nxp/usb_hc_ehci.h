@@ -103,7 +103,11 @@
 #define CONFIG_USB_EHCI_NXP_HANDSHAKE_US 100000
 #endif
 #ifndef CONFIG_USB_EHCI_NXP_RETRY_US
-#define CONFIG_USB_EHCI_NXP_RETRY_US 1000
+#define CONFIG_USB_EHCI_NXP_RETRY_US 20
+#endif
+/* a handshake wait spins this long, then sleeps 1 ms per check with the critical section released */
+#ifndef CONFIG_USB_EHCI_NXP_SPIN_US
+#define CONFIG_USB_EHCI_NXP_SPIN_US 20
 #endif
 /* a synchronous URB whose cancel is deferred: its submitter waits this long, then abandons it */
 #ifndef CONFIG_USB_EHCI_NXP_ORPHAN_MS
@@ -177,6 +181,7 @@ struct ehci_nxp_stats {
     uint32_t no_qtd, no_xfer, no_pipe;
     uint32_t ep_updates;          /* endpoint characteristics rewritten in place (EP0 address/mps) */
     uint32_t toggle_sets;         /* idle pipe toggle changed (URB data_toggle, CLEAR_FEATURE(HALT)) */
+    uint32_t handshake_sleeps;    /* 1 ms sleeps of a handshake wait (critical section released) */
     uint32_t deferred;            /* cancels/closes deferred by a missed handshake */
     uint32_t cancel_races;        /* cancelled transfers the controller finished before it stopped */
     uint32_t orphans;             /* synchronous transfers abandoned by their submitter */

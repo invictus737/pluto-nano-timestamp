@@ -185,68 +185,93 @@ static bool ehci_wait_sts(struct usbh_bus *bus, uint32_t sts_bit, bool on, uint3
     }
 }
 
+/* no schedule edit of this thread is open: the critical section can be released for a sleep */
+static inline bool ehci_may_sleep(struct ehci_nxp_hcd *h)
+{
+    return h->sched_depth[SCHED_ASYNC] == 0 && h->sched_depth[SCHED_PERIODIC] == 0;
+}
+
 /*
  * Stop a schedule (NXP USB_HostEhciStopAsync/StopPeriodic): wait until the status equals the
  * enable bit, clear the enable bit, wait until the status reads 0. True only when the
  * controller no longer runs that schedule; descriptors of it may be edited until the matching
  * ehci_sched_start(). Nested stops just count. Nothing is written while status != enable
- * (EHCI 4.8): a missed handshake returns false with nothing edited; when the enable bit was
- * already cleared the group is `stuck` and a later stop (or ehci_nxp_service()) finishes it.
+ * (EHCI 4.8). The wait spins CONFIG_USB_EHCI_NXP_SPIN_US, then sleeps 1 ms per check with
+ * the critical section released (not while an edit of this thread is open), and gives up after
+ * wait_us: false, nothing edited; when the enable bit was already cleared the group is
+ * `stuck` and a later stop (or ehci_nxp_service()) finishes it. Every caller re-checks its
+ * objects after a true return: other threads may have run during a sleep.
  */
 static bool ehci_sched_stop(struct usbh_bus *bus, int g, uint32_t wait_us)
 {
     struct ehci_nxp_hcd *h = hcd_of(bus);
-    uint32_t cmd = sched_cmd_bit(g), sts = sched_sts_bit(g), t0;
-    bool en, st;
+    uint32_t cmd = sched_cmd_bit(g), sts = sched_sts_bit(g), t0 = usb_ehci_time_us(), el;
+    bool counted = false;
 
-    if (h->sched_depth[g]) {
-        h->sched_depth[g]++;
-        return true;
-    }
-    if (g == SCHED_ASYNC) {
-        h->stats.async_stops++;
-    } else {
-        h->stats.periodic_stops++;
-    }
-    if (ehci_hc_halted(bus)) {
-        /* not running: no schedule is processed (status reads 0) */
-        usbcmd_update(bus, cmd, 0);
-        h->sched_stuck[g] = 0;
-        h->sched_depth[g] = 1;
-        return true;
-    }
-    t0 = usb_ehci_time_us();
-    en = (op_rd(bus, EHCI_NXP_USBCMD) & cmd) != 0;
-    if (en) {
-        /* the status must equal the enable bit before the enable bit changes */
-        if (!ehci_wait_sts(bus, sts, true, t0, wait_us)) {
+    for (;;) {
+        bool en, st;
+
+        if (h->sched_depth[g]) {
+            h->sched_depth[g]++;
+            return true;
+        }
+        if (!counted) {
+            counted = true;
+            if (g == SCHED_ASYNC) {
+                h->stats.async_stops++;
+            } else {
+                h->stats.periodic_stops++;
+            }
+        }
+        if (ehci_hc_halted(bus)) {
+            /* not running: no schedule is processed (status reads 0) */
+            usbcmd_update(bus, cmd, 0);
+            h->sched_stuck[g] = 0;
+            h->sched_depth[g] = 1;
+            return true;
+        }
+        en = (op_rd(bus, EHCI_NXP_USBCMD) & cmd) != 0;
+        st = (op_rd(bus, EHCI_NXP_USBSTS) & sts) != 0;
+        if (en && st) {
+            usbcmd_update(bus, cmd, 0); /* status equals enable: it may change now */
+            en = false;
+        } else if (!en && !st) {
+            h->sched_stuck[g] = 0;
+            h->sched_depth[g] = 1;
+            note_handshake(bus, t0, true);
+            return true;
+        }
+        el = usb_ehci_time_us() - t0;
+        if (el > wait_us) {
             note_handshake(bus, t0, false);
+            if (!en) {
+                h->sched_stuck[g] = 1;
+                h->pending = 1; /* ehci_nxp_service() finishes the stop and starts it again */
+            }
             return false;
         }
-        usbcmd_update(bus, cmd, 0);
+        if (el >= CONFIG_USB_EHCI_NXP_SPIN_US && wait_us > CONFIG_USB_EHCI_NXP_SPIN_US && ehci_may_sleep(h)) {
+            size_t depth = usb_osal_crit_suspend();
+
+            h->stats.handshake_sleeps++;
+            usb_osal_msleep(1);
+            usb_osal_crit_resume(depth);
+        }
     }
-    st = ehci_wait_sts(bus, sts, false, t0, wait_us);
-    note_handshake(bus, t0, st);
-    if (!st) {
-        h->sched_stuck[g] = 1;
-        h->pending = 1; /* ehci_nxp_service() finishes the stop and starts it again */
-        return false;
-    }
-    h->sched_stuck[g] = 0;
-    h->sched_depth[g] = 1;
-    return true;
 }
 
 /*
  * Start it again (NXP USB_HostEhciStartAsync/StartPeriodic) after the last nested stop: list
  * base rewritten (the async head: the controller never resumes at an unlinked QH), barrier,
- * enable bit set (status and enable both read 0 here), wait for the status.
+ * enable bit set (status and enable both read 0 here), then the status awaited like the stop
+ * (spin, then 1 ms sleeps with the critical section released when no edit is open). Callers
+ * re-check their objects afterwards. A status that never follows only counts a miss: the next
+ * stop waits until it equals the enable bit.
  */
 static void ehci_sched_start(struct usbh_bus *bus, int g)
 {
     struct ehci_nxp_hcd *h = hcd_of(bus);
-    uint32_t t0;
-    bool ok;
+    uint32_t t0, el;
 
     if (h->sched_depth[g] == 0 || --h->sched_depth[g] != 0) {
         return;
@@ -258,12 +283,25 @@ static void ehci_sched_start(struct usbh_bus *bus, int g)
     }
     ehci_dma_wmb();
     usbcmd_update(bus, 0, sched_cmd_bit(g));
-    if (ehci_hc_halted(bus)) {
-        return;
-    }
     t0 = usb_ehci_time_us();
-    ok = ehci_wait_sts(bus, sched_sts_bit(g), true, t0, CONFIG_USB_EHCI_NXP_HANDSHAKE_US);
-    note_handshake(bus, t0, ok);
+    while (!ehci_hc_halted(bus) && !(op_rd(bus, EHCI_NXP_USBSTS) & sched_sts_bit(g))) {
+        el = usb_ehci_time_us() - t0;
+        if (el > CONFIG_USB_EHCI_NXP_HANDSHAKE_US || h->sched_depth[g] != 0 ||
+            !(op_rd(bus, EHCI_NXP_USBCMD) & sched_cmd_bit(g))) {
+            /* missed, or another thread stopped it again during a sleep */
+            if (el > CONFIG_USB_EHCI_NXP_HANDSHAKE_US) {
+                note_handshake(bus, t0, false);
+            }
+            return;
+        }
+        if (el >= CONFIG_USB_EHCI_NXP_SPIN_US && ehci_may_sleep(h)) {
+            size_t depth = usb_osal_crit_suspend();
+
+            h->stats.handshake_sleeps++;
+            usb_osal_msleep(1);
+            usb_osal_crit_resume(depth);
+        }
+    }
 }
 
 static bool ehci_stop_schedule(struct usbh_bus *bus, struct ehci_nxp_pipe *p)
@@ -758,14 +796,24 @@ static bool ehci_pipe_set_toggle(struct usbh_bus *bus, struct ehci_nxp_pipe *p, 
         return true;
     }
     if (((tok & QTD_TOKEN_TOGGLE) != 0) != dt) {
-        if (p->linked && !ehci_stop_schedule(bus, p)) {
+        bool linked = p->linked;
+        int g = p->periodic ? SCHED_PERIODIC : SCHED_ASYNC;
+
+        if (linked && !ehci_stop_schedule(bus, p)) {
             return false;
+        }
+        /* others may have run while the stop slept */
+        if (!p->inuse || p->closing || p->head != NULL) {
+            if (linked) {
+                ehci_sched_start(bus, g);
+            }
+            return p->inuse && !p->closing;
         }
         tok = p->qh->hw.overlay.token;
         p->qh->hw.overlay.token = (tok & ~QTD_TOKEN_TOGGLE) | (dt ? QTD_TOKEN_TOGGLE : 0);
         hcd_of(bus)->stats.toggle_sets++;
-        if (p->linked) {
-            ehci_start_schedule(bus, p);
+        if (linked) {
+            ehci_sched_start(bus, g);
         }
     }
     return true;
@@ -819,7 +867,15 @@ static int ehci_xfer_queue(struct usbh_bus *bus, struct ehci_nxp_pipe *p, struct
         bool dt = p->reset_toggle ? false : urb->data_toggle != 0;
 
         if (!ehci_pipe_set_toggle(bus, p, dt)) {
-            return -USB_ERR_BUSY; /* schedule handshake missed: nothing queued */
+            /* schedule handshake missed, or the pipe closed meanwhile: nothing queued */
+            return p->inuse && !p->closing ? -USB_ERR_BUSY : -USB_ERR_NOTCONN;
+        }
+        if (!p->inuse || p->closing) {
+            return -USB_ERR_NOTCONN; /* closed while the handshake slept */
+        }
+        if (h->qtd_free_count < nq) {
+            h->stats.no_qtd++;
+            return -USB_ERR_NOMEM;
         }
         p->reset_toggle = 0;
     }
@@ -1695,12 +1751,20 @@ int usbh_submit_urb(struct usbh_urb *urb)
                     usb_osal_leave_critical_section(flags);
                     return -USB_ERR_BUSY;
                 }
+                if (!p->inuse || p->closing || p->head) {
+                    ehci_sched_start(bus, SCHED_ASYNC);
+                    usb_osal_leave_critical_section(flags);
+                    return -USB_ERR_BUSY;
+                }
                 p->qh->hw.epchar = epchar;
                 p->qh->hw.epcap = epcap;
                 p->epchar = epchar;
                 p->epcap = epcap;
                 h->stats.ep_updates++;
                 ehci_sched_start(bus, SCHED_ASYNC);
+                if (!p->inuse || p->closing) {
+                    p = NULL; /* closed while the handshake slept: a new pipe */
+                }
             }
         }
     }
