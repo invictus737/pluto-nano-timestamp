@@ -40,7 +40,14 @@
 /* the driver knows CN and US tables only; CN allows 2.4 GHz channels 1-13 as in the EU */
 #define AIC8800_WIFI_COUNTRY_CODE               "CN"
 #define AIC8800_WIFI_5GHZ
-#define AIC8800_WIFI_COMMAND_TIMEOUT_MS         15000 /* RF calibration can exceed 5 s; late CFMs were seen */
+/* confirmation wait of the slow firmware commands only (RF calibration, firmware/stack start,
+ * reset: late CFMs were seen above 5 s) and of the ROM-stage firmware download */
+#define AIC8800_WIFI_COMMAND_TIMEOUT_MS         15000
+/* every other confirmation: Linux RWNX_80211_CMD_TIMEOUT_MS is 4 s */
+#define AIC8800_WIFI_CFM_TIMEOUT_MS             5000
+/* a message bulk OUT (command, firmware block): Linux aicwf_txrxif.h CMD_TX_TIMEOUT, then
+ * usb_kill_urb() without touching the endpoint */
+#define AIC8800_WIFI_MSG_OUT_TIMEOUT_MS         5000
 #define AIC8800_WIFI_MGMT_CONFIRM_TIMEOUT_MS    1000
 #define AIC8800_WIFI_TX_BUFFER_SIZE             2048
 #define AIC8800_WIFI_RX_REORDER_FLOWS           128

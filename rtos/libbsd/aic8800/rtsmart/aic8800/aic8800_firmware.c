@@ -485,7 +485,12 @@ static rt_err_t aic_firmware_usb_transmit(
     }
     usbh_bulk_urb_fill(&context->tx_urb, context->hport, endpoint,
                        (rt_uint8_t *)data,
-                       length, AIC8800_WIFI_COMMAND_TIMEOUT_MS,
+                       length,
+#ifdef AIC8800_WIFI_MSG_OUT_TIMEOUT_MS
+                       AIC8800_WIFI_MSG_OUT_TIMEOUT_MS,
+#else
+                       AIC8800_WIFI_COMMAND_TIMEOUT_MS,
+#endif
                        RT_NULL, RT_NULL);
     context->tx_urb.transfer_flags = URB_ZERO_PACKET;
     result = usbh_submit_urb(&context->tx_urb);

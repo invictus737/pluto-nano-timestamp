@@ -2011,7 +2011,12 @@ static rt_err_t aic8800_usb_transmit_endpoint(
     }
     usbh_bulk_urb_fill(&context->tx_urb, context->hport, endpoint,
                        (rt_uint8_t *)data, length,
-                       AIC8800_WIFI_COMMAND_TIMEOUT_MS, RT_NULL, RT_NULL);
+#ifdef AIC8800_WIFI_MSG_OUT_TIMEOUT_MS
+                       AIC8800_WIFI_MSG_OUT_TIMEOUT_MS,
+#else
+                       AIC8800_WIFI_COMMAND_TIMEOUT_MS,
+#endif
+                       RT_NULL, RT_NULL);
     context->tx_urb.transfer_flags = URB_ZERO_PACKET;
     result = aic8800_usb_submit_urb(context, &context->tx_urb);
     if (result)
@@ -2020,13 +2025,15 @@ static rt_err_t aic8800_usb_transmit_endpoint(
               endpoint->bEndpointAddress, result);
     }
 #if defined(AICWF_RTEMS) && defined(CHERRY_USB_HC_DRV_DWC2)
-    /* As Linux usb_clear_halt(): a failed command leaves the message endpoint halted
-     * (STALL) or its data toggle unknown; CLEAR_FEATURE(ENDPOINT_HALT) and the host toggle
-     * back to DATA0 so the next command is not dropped or refused. Only on the dedicated
-     * message endpoint: the data endpoint has its own recovery (tx_recovery_work) and URBs
-     * of the transmit worker in flight. tx_mutex is held: nothing else is on it. */
-    if ((result == -USB_ERR_TIMEOUT || result == -USB_ERR_IO ||
-         result == -USB_ERR_STALL || result == -USB_ERR_SHUTDOWN) &&
+    /* As Linux usb_clear_halt() after -EPIPE: only a real STALL handshake (halted without
+     * transaction errors or babble) leaves the message endpoint halted; then
+     * CLEAR_FEATURE(ENDPOINT_HALT) and the host toggle back to DATA0, as the device resets
+     * its own. A timeout is cancelled like Linux usb_kill_urb() and keeps the data toggle
+     * from the QH overlay: resetting it there desynchronises host and device, and the next
+     * command is dropped as a repeat. Only on the dedicated message endpoint: the data
+     * endpoint has its own recovery (tx_recovery_work) and URBs of the transmit worker in
+     * flight. tx_mutex is held: nothing else is on it. */
+    if (result == -USB_ERR_STALL &&
         endpoint == context->message_out && endpoint != context->data_out &&
         !aic8800_usb_check_disconnected(context, 0))
     {

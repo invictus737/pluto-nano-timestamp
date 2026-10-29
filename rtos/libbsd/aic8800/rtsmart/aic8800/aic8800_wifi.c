@@ -1789,6 +1789,26 @@ static void aic_clear_vif_hardware_keys(
     }
 }
 
+#if defined(AICWF_RTEMS) && defined(AIC8800_WIFI_CFM_TIMEOUT_MS)
+/* confirmation wait: the slow commands keep AIC8800_WIFI_COMMAND_TIMEOUT_MS (RF calibration,
+ * firmware and stack start, reset), every other one Linux's (RWNX_80211_CMD_TIMEOUT_MS) */
+static rt_uint32_t aic8800_command_timeout_ms(rt_uint16_t request_id)
+{
+    switch (request_id)
+    {
+    case AIC_MM_RESET_REQ:
+    case AIC_MM_START_REQ:
+    case AIC_MM_SET_STACK_START_REQ:
+    case AIC_MM_SET_RF_CALIB_REQ:
+        return AIC8800_WIFI_COMMAND_TIMEOUT_MS;
+    default:
+        return AIC8800_WIFI_CFM_TIMEOUT_MS;
+    }
+}
+#else
+#define aic8800_command_timeout_ms(request_id) AIC8800_WIFI_COMMAND_TIMEOUT_MS
+#endif
+
 rt_err_t aic8800_protocol_command(struct aic8800_context *context,
                                 rt_uint16_t request_id,
                                 rt_uint16_t confirmation_id,
@@ -1853,7 +1873,7 @@ rt_err_t aic8800_protocol_command(struct aic8800_context *context,
     result = rt_wlan_offload_command_execute(
         &context->commands, request_id, confirmation_id,
         request, request_length, response, response_capacity, response_length,
-        rt_tick_from_millisecond(AIC8800_WIFI_COMMAND_TIMEOUT_MS), RT_NULL);
+        rt_tick_from_millisecond(aic8800_command_timeout_ms(request_id)), RT_NULL);
     rt_sem_release(&context->command_gate);
 #ifdef AICWF_RTEMS
     if (result != RT_EOK)
