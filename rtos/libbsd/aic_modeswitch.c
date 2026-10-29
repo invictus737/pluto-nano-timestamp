@@ -179,12 +179,6 @@ aicms_autoinst(void *arg, struct usb_device *udev, struct usb_attach_arg *uaa)
 	    iface->idesc->bInterfaceClass != UICLASS_MASS)
 		return;
 
-	if (vid == AIC_VID && pid == 0x5721) {
-		/* isolation test: leave the DC driver CD alone (quirks keep umass off) */
-		printf("aic8800: %04x:%04x storage mode, left alone (isolation test)\n", vid, pid);
-		uaa->dev_state = UAA_DEV_EJECTING;
-		return;
-	}
 	err = aicms_switch(udev, iface->idesc->bInterfaceNumber, vid, pid);
 	printf("aic8800: %04x:%04x storage mode, switch command %s\n", vid, pid,
 	    err == 0 ? "sent" : usbd_errstr(err));

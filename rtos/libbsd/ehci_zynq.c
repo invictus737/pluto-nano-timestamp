@@ -155,6 +155,13 @@ zynq_ehci_post_reset(struct ehci_softc *e)
 	usbmode = EOREAD4(e, EHCI_USBMODE_NOLPM);
 	usbmode &= ~EHCI_UM_CM;
 	usbmode |= EHCI_UM_CM_HOST;
+	/*
+	 * SDIS (stream disable, USBMODE bit 4) in host mode: ChipIdea erratum TAR 9000378958 hangs
+	 * the host on an OUT retry when the buffer is not double-word aligned (Linux sets it for
+	 * host mode for the same reason). Seen here as bulk/control OUT stuck in PING/XACTERR
+	 * retries, IAAD never acknowledged and new QHs never fetched.
+	 */
+	usbmode |= (1U << 4);
 	EOWRITE4(e, EHCI_USBMODE_NOLPM, usbmode);
 
 	portsc = REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1);
