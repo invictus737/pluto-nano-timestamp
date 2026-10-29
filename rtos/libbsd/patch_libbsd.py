@@ -355,6 +355,26 @@ def ehci_trace_c(s):
 	ehci_device_done(xfer, USB_ERR_TIMEOUT);""")
 
 
+PM_MARK = "/* Pluto RTOS: no USB suspend */"
+
+
+def usb_hub_c(s):
+    """USB selective suspend off: hubs attach in USB_POWER_MODE_SAVE and get suspended by the
+    power daemon; a transfer to a self-suspended device has its QH kept off the EHCI schedule
+    (ehci_setup_standard_chain) and times out (seen: hub and rtwn control QHs never fetched).
+    The Pluto is always powered: every device stays ON."""
+    if PM_MARK in s:
+        return s
+    old = """	/* filter input argument */
+	if ((power_mode != USB_POWER_MODE_ON) &&
+	    (power_mode != USB_POWER_MODE_OFF))
+		power_mode = USB_POWER_MODE_SAVE;"""
+    assert s.count(old) == 1, "usbd_set_power_mode anchor"
+    return s.replace(old, """	""" + PM_MARK + """
+	if (power_mode != USB_POWER_MODE_OFF)
+		power_mode = USB_POWER_MODE_ON;""")
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
@@ -365,4 +385,5 @@ edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_trace_c)
 edit("rtemsbsd/rtems/rtems-kernel-bus-dma.c", busdma_c)
+edit("freebsd/sys/dev/usb/usb_hub.c", usb_hub_c)
 print("libbsd patched for the Pluto")
