@@ -271,10 +271,29 @@ static void ep_unqueue(struct nx_ep *ep, struct nx_req *req)
 static void nx_urb_done(void *arg, int nbytes);
 static void nx_zlp_done(void *arg, int nbytes);
 
+/*
+ * Bulk traffic health for the station self-heal (wlan_dev_shim.c): tick of the last bulk IN
+ * that completed, and of the first bulk OUT that completed after it (0: none). Commands go
+ * out and their confirmations come back on bulk IN; OUT completing while IN stays silent for
+ * long means the receive side is gone.
+ */
+static volatile rtems_interval g_io_last_in, g_io_out_since_in;
+
 static void ep_finish(struct nx_ep *ep, struct nx_req *req, int result)
 {
     if (ep->active == req) {
         ep->active = NULL;
+    }
+    if (result >= 0 && req->urb && req->urb->ep &&
+        USB_GET_ENDPOINT_TYPE(req->urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK) {
+        rtems_interval now = rtems_clock_get_ticks_since_boot() | 1U;
+
+        if (req->is_in) {
+            g_io_last_in = now;
+            g_io_out_since_in = 0;
+        } else if (g_io_out_since_in == 0) {
+            g_io_out_since_in = now;
+        }
     }
     req->result = result;
     g_st_complete++;
@@ -905,6 +924,7 @@ static int aicwf_cherry_connect(struct usbh_hubport *hport, uint8_t intf)
             }
             if (!any) {
                 ep_purge(hport);
+                g_io_out_since_in = 0;
             }
         }
         CRIT_LEAVE();
@@ -1024,6 +1044,18 @@ int aicwf_usbh_first_id(rt_uint16_t *vid, rt_uint16_t *pid)
     return found;
 }
 
+/* ms since the first bulk OUT that completed after the last bulk IN; 0 while none waits */
+unsigned aicwf_usbh_in_silence_ms(void)
+{
+    rtems_interval since = g_io_out_since_in;
+
+    if (since == 0) {
+        return 0;
+    }
+    return (unsigned)((uint64_t)(rtems_clock_get_ticks_since_boot() - since) * 1000U /
+                      rtems_clock_get_ticks_per_second());
+}
+
 int aicwf_usbh_reprobe(void)
 {
     struct usbh_hubport *hport = NULL;
@@ -1035,6 +1067,7 @@ int aicwf_usbh_reprobe(void)
             hport = g_dev[i].hport;
         }
     }
+    g_io_out_since_in = 0;
     CRIT_LEAVE();
     return hport ? usbh_hubport_reenumerate(hport) : -USB_ERR_NODEV;
 }

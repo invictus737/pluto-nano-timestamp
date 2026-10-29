@@ -7,6 +7,14 @@
  * connected to the configured network by the aic-wlan thread (scan for the SSID, join
  * the strongest BSS with the security it advertises, retry with backoff).
  *
+ * Self-heal (aic-heal thread, as a Linux USB reset + driver rebind): the stick is
+ * re-enumerated (port reset, enumeration, firmware download, station start, rejoin; the same
+ * as `wifi reprobe`) when WLAN_HEAL_CMD_FAILS firmware commands in a row failed, when bulk
+ * OUT completed but no bulk IN for WLAN_HEAL_IN_SILENCE_MS, or when the station made no
+ * progress (no scan result, join event or start) for WLAN_HEAL_STALL_MS while a network is
+ * configured. Recoveries are spaced by an exponential backoff (WLAN_HEAL_BACKOFF_MIN_MS up to
+ * WLAN_HEAL_BACKOFF_MAX_MS, reset after WLAN_HEAL_STABLE_MS connected); one log line each.
+ *
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <rtthread.h>
@@ -37,6 +45,16 @@ int aicwf_d80_fw_mode;
 #define WLAN_USB_WATCHDOG_FIRST_MS  5000
 #define WLAN_USB_WATCHDOG_SECOND_MS 15000
 
+#define WLAN_HEAL_CMD_FAILS         3
+#define WLAN_HEAL_IN_SILENCE_MS     30000
+#define WLAN_HEAL_STALL_MS          60000
+#define WLAN_HEAL_BACKOFF_MIN_MS    30000
+#define WLAN_HEAL_BACKOFF_MAX_MS    300000
+#define WLAN_HEAL_STABLE_MS         300000
+
+/* CherryUSB adapter (rtos/cherryusb/aic/aicwf_cherry.c); absent with the libbsd USB stack */
+unsigned aicwf_usbh_in_silence_ms(void) __attribute__((weak));
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond;
 static pthread_once_t g_cond_once = PTHREAD_ONCE_INIT;
@@ -66,6 +84,14 @@ static int g_last_error;
 static struct rt_wlan_info g_current;
 
 static rt_bool_t g_started;
+
+/* self-heal (g_lock, except the command streak) */
+static int g_cmd_fail_streak;           /* __atomic: firmware command threads */
+static rt_tick_t g_progress;            /* last sign of a working station */
+static rt_tick_t g_link_since;
+static rt_tick_t g_heal_next;
+static rt_uint32_t g_heal_backoff_ms = WLAN_HEAL_BACKOFF_MIN_MS;
+static unsigned g_heals;
 
 static void shim_now_deadline(struct timespec *ts, int ms)
 {
@@ -281,12 +307,15 @@ void rt_wlan_dev_indicate_event_handle(struct rt_wlan_device *device, rt_wlan_de
         break;
     case RT_WLAN_DEV_EVT_CONNECT:
         g_link_up = RT_TRUE;
+        g_link_since = rt_tick_get();
+        g_progress = g_link_since;
         g_connect_result = 1;
         g_backoff_ms = WLAN_RETRY_MIN_MS;
         link = 1;
         break;
     case RT_WLAN_DEV_EVT_CONNECT_FAIL:
         g_connect_result = -1;
+        g_progress = rt_tick_get();
         break;
     case RT_WLAN_DEV_EVT_DISCONNECT:
         if (g_link_up)
@@ -298,6 +327,7 @@ void rt_wlan_dev_indicate_event_handle(struct rt_wlan_device *device, rt_wlan_de
         {
             g_connect_result = -1;
         }
+        g_progress = rt_tick_get();
         g_next_attempt = rt_tick_get() + WLAN_RETRY_MIN_MS;
         link = 0;
         break;
@@ -454,6 +484,7 @@ void aicwf_wlan_attach_done(void)
     g_link_up = RT_FALSE;
     g_next_attempt = rt_tick_get();
     g_backoff_ms = WLAN_RETRY_MIN_MS;
+    g_progress = rt_tick_get();
     pthread_cond_broadcast(&g_cond);
     pthread_mutex_unlock(&g_lock);
     if (!ifnet)
@@ -511,6 +542,10 @@ static int do_scan(const char *ssid, int timeout_ms)
         }
     }
     count = g_scan_done ? g_scan_count : -RT_ETIMEOUT;
+    if (count >= 0)
+    {
+        g_progress = rt_tick_get(); /* the firmware answers */
+    }
     pthread_mutex_unlock(&g_lock);
     return count;
 }
@@ -662,6 +697,80 @@ static void wlan_thread(void *parameter)
     }
 }
 
+/* ---- self-heal ---- */
+
+/* every firmware command result (rtsmart/aic8800/aic8800_wifi.c aic8800_protocol_command) */
+void aicwf_wifi_command_result(int result)
+{
+    if (result == RT_EOK)
+    {
+        __atomic_store_n(&g_cmd_fail_streak, 0, __ATOMIC_RELAXED);
+    }
+    else if (result != -RT_EINVAL)
+    {
+        __atomic_add_fetch(&g_cmd_fail_streak, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static void heal_thread(void *parameter)
+{
+    (void)parameter;
+    for (;;)
+    {
+        const char *reason = RT_NULL;
+        unsigned silence = 0, heal;
+        rt_uint32_t next_s;
+        rt_tick_t now;
+        int streak, result;
+
+        rt_thread_mdelay(1000);
+        if (aicwf_usbh_attach_count() == 0)
+        {
+            continue; /* no stick yet: usb_watchdog_thread's business */
+        }
+        streak = __atomic_load_n(&g_cmd_fail_streak, __ATOMIC_RELAXED);
+        if (aicwf_usbh_in_silence_ms)
+        {
+            silence = aicwf_usbh_in_silence_ms();
+        }
+        now = rt_tick_get();
+        pthread_mutex_lock(&g_lock);
+        if (g_link_up && (rt_int32_t)(now - g_link_since) >= WLAN_HEAL_STABLE_MS)
+        {
+            g_heal_backoff_ms = WLAN_HEAL_BACKOFF_MIN_MS;
+        }
+        if (streak >= WLAN_HEAL_CMD_FAILS)
+        {
+            reason = "firmware commands failing";
+        }
+        else if (g_sta_ready && silence >= WLAN_HEAL_IN_SILENCE_MS)
+        {
+            reason = "bulk OUT without any bulk IN";
+        }
+        else if (g_want && !g_link_up && (rt_int32_t)(now - g_progress) >= WLAN_HEAL_STALL_MS)
+        {
+            reason = g_sta_ready ? "no scan/join progress" : "station did not start";
+        }
+        if (!reason || (rt_int32_t)(now - g_heal_next) < 0)
+        {
+            pthread_mutex_unlock(&g_lock);
+            continue;
+        }
+        heal = ++g_heals;
+        next_s = g_heal_backoff_ms / 1000U;
+        g_heal_next = now + g_heal_backoff_ms;
+        g_heal_backoff_ms = g_heal_backoff_ms * 2 > WLAN_HEAL_BACKOFF_MAX_MS ?
+                                WLAN_HEAL_BACKOFF_MAX_MS : g_heal_backoff_ms * 2;
+        g_progress = now; /* the re-enumeration gets its own WLAN_HEAL_STALL_MS */
+        pthread_mutex_unlock(&g_lock);
+        __atomic_store_n(&g_cmd_fail_streak, 0, __ATOMIC_RELAXED);
+        result = aicwf_usbh_reprobe();
+        LOG_W("self-heal #%u: %s (commands failed %d, bulk IN silent %u ms): re-enumerating "
+              "the stick (%d); next at the earliest in %u s",
+              heal, reason, streak, silence, result, (unsigned)next_s);
+    }
+}
+
 /* ---- application API (aicwf_wifi.h) ---- */
 
 /*
@@ -708,8 +817,10 @@ void aicwf_wifi_fwdiag(void)
 {
     static const char *const modes[] = { "auto (MCU1 -> legacy SDK V3)", "SDK 5.0", "legacy SDK V3" };
 
-    printf("wifi: D80 firmware set: %s; log level %s\n", modes[aicwf_d80_fw_mode % 3],
-           rt_shim_log_level >= DBG_LOG ? "debug" : "normal");
+    printf("wifi: D80 firmware set: %s; log level %s; self-heals %u (firmware command failure "
+           "streak %d)\n", modes[aicwf_d80_fw_mode % 3],
+           rt_shim_log_level >= DBG_LOG ? "debug" : "normal", g_heals,
+           __atomic_load_n(&g_cmd_fail_streak, __ATOMIC_RELAXED));
     aicwf_fw_dump();
     aicwf_usbh_dump();
 }
@@ -753,6 +864,11 @@ int aicwf_wifi_start(void)
     {
         LOG_W("USB watchdog thread failed to start");
     }
+    thread = rt_thread_create("aic-heal", heal_thread, RT_NULL, 8192, 20, 0);
+    if (!thread || rt_thread_startup(thread) != RT_EOK)
+    {
+        LOG_W("self-heal thread failed to start");
+    }
     return 0;
 }
 
@@ -777,6 +893,7 @@ int aicwf_wifi_connect(const char *ssid, const char *psk)
     }
     g_want = RT_TRUE;
     g_generation++;
+    g_progress = rt_tick_get();
     g_next_attempt = rt_tick_get();
     g_backoff_ms = WLAN_RETRY_MIN_MS;
     if (g_connect_result == 0)

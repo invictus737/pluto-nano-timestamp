@@ -1864,6 +1864,12 @@ rt_err_t aic8800_protocol_command(struct aic8800_context *context,
               request_id, confirmation_id, result, RT_NAME_MAX,
               self ? self->parent.name : "?");
     }
+    {
+        /* station self-heal (shim/wlan_dev_shim.c): consecutive failed commands */
+        extern void aicwf_wifi_command_result(int result);
+
+        aicwf_wifi_command_result(result);
+    }
 #endif
     return result;
 }

@@ -2019,6 +2019,28 @@ static rt_err_t aic8800_usb_transmit_endpoint(
         LOG_E("bulk OUT ep 0x%02x failed: %d",
               endpoint->bEndpointAddress, result);
     }
+#if defined(AICWF_RTEMS) && defined(CHERRY_USB_HC_DRV_DWC2)
+    /* As Linux usb_clear_halt(): a failed command leaves the message endpoint halted
+     * (STALL) or its data toggle unknown; CLEAR_FEATURE(ENDPOINT_HALT) and the host toggle
+     * back to DATA0 so the next command is not dropped or refused. Only on the dedicated
+     * message endpoint: the data endpoint has its own recovery (tx_recovery_work) and URBs
+     * of the transmit worker in flight. tx_mutex is held: nothing else is on it. */
+    if ((result == -USB_ERR_TIMEOUT || result == -USB_ERR_IO ||
+         result == -USB_ERR_STALL || result == -USB_ERR_SHUTDOWN) &&
+        endpoint == context->message_out && endpoint != context->data_out &&
+        !aic8800_usb_check_disconnected(context, 0))
+    {
+        int reset = aic8800_usb_clear_halt(context, endpoint->bEndpointAddress);
+
+        if (reset == RT_EOK)
+        {
+            reset = usbh_dwc2_reset_endpoint(context->hport,
+                                             endpoint->bEndpointAddress);
+        }
+        LOG_W("bulk OUT ep 0x%02x: halt cleared, toggle reset (%d)",
+              endpoint->bEndpointAddress, reset);
+    }
+#endif
     transfer_result = aic8800_usb_result(result);
     if (transfer_result == RT_EOK &&
         context->tx_urb.actual_length != length)
