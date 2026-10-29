@@ -341,8 +341,19 @@ int qspi_nor_read(uint32_t addr, void *buf, size_t len)
   return rc;
 }
 
+static volatile int fw_open;
+
+void qspi_nor_fw_window(int open)
+{
+  fw_open = open;
+}
+
 static int in_window(uint32_t addr, size_t len)
 {
+  if (fw_open && addr >= QSPI_NOR_FW_OFF && addr < QSPI_NOR_FW_END &&
+      len <= (size_t)(QSPI_NOR_FW_END - addr)) {
+    return 1;
+  }
   return addr >= QSPI_NOR_WRITE_LO && addr < QSPI_NOR_WRITE_HI &&
          len <= (size_t)(QSPI_NOR_WRITE_HI - addr);
 }

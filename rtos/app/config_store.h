@@ -34,6 +34,7 @@ int nexus_config_set(const char *key, const char *value);
 /* Wi-Fi network by priority: index 0 = ssid_wlan (highest), 1..4 = ssid_wlan1..4. Returns 0 and
  * the pointers (psk may be "" = open network), -1 when that slot is empty */
 int nexus_config_wifi(int index, const char **ssid, const char **psk);
+int nexus_uboot_env_set(const char *const *kv_pairs, int n); /* raw U-Boot variables */
 
 /* called (from the thread that applied the change) after every applied change; up to 8 */
 void nexus_config_on_change(void (*cb)(void));

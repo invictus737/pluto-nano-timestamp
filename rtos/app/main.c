@@ -45,6 +45,7 @@
 
 #include "config_store.h"
 #include "netcmd.h"
+void nexus_fwupdate_register(void);
 #include "ssh_server.h"
 /* ---- Bluetooth (rtos/bt) ---- */
 #include "nexus_bt.h"
@@ -646,6 +647,7 @@ static void Init(rtems_task_argument arg)
     printf("ssh: not started\n");
   }
   nexus_config_shell_register();
+  nexus_fwupdate_register(); /* fwupdate.c */
   rtems_shell_add_cmd("abi", "misc", "abi [-v]: C layouts/constants vs the Rust libc crate", nexus_shell_abi);
   /* ---- Bluetooth (rtos/bt): `bt` command; powers on when bt.enabled, reconnects the last sink ---- */
   nexus_bt_shell_register();

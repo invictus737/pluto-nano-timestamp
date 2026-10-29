@@ -29,4 +29,10 @@ int qspi_nor_read(uint32_t addr, void *buf, size_t len);
 int qspi_nor_write(uint32_t addr, const void *buf, size_t len); /* erased area only */
 int qspi_nor_erase_sector(uint32_t addr);                     /* 64 KiB aligned */
 
+/* The boot image area (FIT at 0x200000, up to the end of the 32 MiB chip) is writable only
+ * between qspi_nor_fw_window(1) and qspi_nor_fw_window(0): the network firmware update. */
+#define QSPI_NOR_FW_OFF 0x200000u
+#define QSPI_NOR_FW_END 0x2000000u
+void qspi_nor_fw_window(int open);
+
 #endif

@@ -63,6 +63,10 @@ $(B)/qspi_nor.o: qspi_nor.c qspi_nor.h | $(B)
 CONFIG_OBJS += $(B)/netcmd.o
 $(B)/netcmd.o: netcmd.c netcmd.h config_store.h ../libbsd/aic8800/aicwf_wifi.h | $(B)
 	$(CC) $(CFLAGS) -I../libbsd/aic8800 -c $< -o $@
+# Network firmware update (fwupdate.c): FIT over TCP into the QSPI boot slot
+CONFIG_OBJS += $(B)/fwupdate.o
+$(B)/fwupdate.o: fwupdate.c config_store.h qspi_nor.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) $(RUST_LIB)
 	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -ljffs2 -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map

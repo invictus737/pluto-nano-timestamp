@@ -423,6 +423,46 @@ static int env_flash(const uint8_t *img)
   return qspi_nor_write(QSPI_NOR_ENV_OFF, img, QSPI_NOR_ENV_SIZE);
 }
 
+/* Set raw U-Boot variables (n pairs), with the same backups as env_update. 0 = written. */
+int nexus_uboot_env_set(const char *const *kv_pairs, int n)
+{
+  if (!flash_ok || !data_ok) {
+    printf("config: U-Boot environment not updated (no flash or no /data for the backup)\n");
+    return -1;
+  }
+  uint8_t *old = malloc(QSPI_NOR_ENV_SIZE);
+  uint8_t *img = malloc(QSPI_NOR_ENV_SIZE);
+  kv_t env;
+  int rc = -1;
+  kv_init(&env);
+  if (old == NULL || img == NULL || qspi_nor_read(QSPI_NOR_ENV_OFF, old, QSPI_NOR_ENV_SIZE) != 0 ||
+      ubenv_parse(old, QSPI_NOR_ENV_SIZE, &env) != 0) {
+    printf("config: U-Boot environment unreadable or CRC bad: not changed\n");
+    goto out;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (kv_set(&env, kv_pairs[2 * i], kv_pairs[2 * i + 1]) != 0) {
+      goto out;
+    }
+  }
+  if (ubenv_build(&env, img, QSPI_NOR_ENV_SIZE, old[QSPI_NOR_ENV_SIZE - 1]) != 0 ||
+      write_atomic(ENV_BAK, old, QSPI_NOR_ENV_SIZE, 0600) != 0) {
+    printf("config: U-Boot environment not changed (build or backup failed)\n");
+    goto out;
+  }
+  if (env_flash(img) != 0) {
+    printf("config: U-Boot environment write FAILED, restoring the previous image\n");
+    (void)env_flash(old);
+    goto out;
+  }
+  rc = 0;
+out:
+  kv_free(&env);
+  free(old);
+  free(img);
+  return rc;
+}
+
 /* 0 = written or nothing to do, -1 = not written (values stay in /data) */
 static int env_update(const cfg_update_t *u)
 {
