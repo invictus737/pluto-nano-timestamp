@@ -35,6 +35,7 @@ int nexus_config_set(const char *key, const char *value);
  * the pointers (psk may be "" = open network), -1 when that slot is empty */
 int nexus_config_wifi(int index, const char **ssid, const char **psk);
 int nexus_uboot_env_set(const char *const *kv_pairs, int n); /* raw U-Boot variables */
+char *nexus_uboot_env_get(const char *key); /* malloc'd copy or NULL */
 
 /* called (from the thread that applied the change) after every applied change; up to 8 */
 void nexus_config_on_change(void (*cb)(void));

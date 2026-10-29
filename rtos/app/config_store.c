@@ -476,6 +476,28 @@ out:
   return rc;
 }
 
+/* Read one raw U-Boot variable; returns a malloc'd copy or NULL (missing, unreadable, CRC bad). */
+char *nexus_uboot_env_get(const char *key)
+{
+  if (!flash_ok) {
+    return NULL;
+  }
+  uint8_t *img = malloc(QSPI_NOR_ENV_SIZE);
+  char *out = NULL;
+  kv_t env;
+  kv_init(&env);
+  if (img != NULL && qspi_nor_read(QSPI_NOR_ENV_OFF, img, QSPI_NOR_ENV_SIZE) == 0 &&
+      ubenv_parse(img, QSPI_NOR_ENV_SIZE, &env) == 0) {
+    const char *v = kv_get(&env, key);
+    if (v != NULL) {
+      out = strdup(v);
+    }
+  }
+  kv_free(&env);
+  free(img);
+  return out;
+}
+
 /* 0 = written or nothing to do, -1 = not written (values stay in /data) */
 static int env_update(const cfg_update_t *u)
 {

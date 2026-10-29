@@ -287,9 +287,52 @@ static int shell_fwupdate(int argc, char **argv)
   return 0;
 }
 
+/* `reboot [dfu]`: plain reset, or a one-shot boot into U-Boot's DFU (dfu_sf) without the serial
+ * console. bootcmd gets a guard once (backup of the previous value in nexus_bootcmd_orig): when
+ * nexus_boot_dfu is set, U-Boot clears it, saves, and enters DFU; otherwise it boots as before. */
+#define DFU_GUARD "if test -n \"${nexus_boot_dfu}\"; then setenv nexus_boot_dfu; saveenv; run dfu_sf; fi; "
+static int shell_reboot(int argc, char **argv)
+{
+  if (argc >= 2 && strcmp(argv[1], "dfu") == 0) {
+    char *bc = nexus_uboot_env_get("bootcmd");
+    if (bc == NULL) {
+      printf("reboot dfu: U-Boot environment unreadable, nothing changed\n");
+      return 1;
+    }
+    int ok;
+    if (strstr(bc, "nexus_boot_dfu") != NULL) {
+      const char *kv[] = {"nexus_boot_dfu", "1"};
+      ok = nexus_uboot_env_set(kv, 1) == 0;
+    } else {
+      size_t n = strlen(DFU_GUARD) + strlen(bc) + 1;
+      char *nb = malloc(n);
+      if (nb == NULL) {
+        free(bc);
+        return 1;
+      }
+      snprintf(nb, n, "%s%s", DFU_GUARD, bc);
+      const char *kv[] = {"nexus_bootcmd_orig", bc, "bootcmd", nb, "nexus_boot_dfu", "1"};
+      ok = nexus_uboot_env_set(kv, 3) == 0;
+      free(nb);
+    }
+    free(bc);
+    if (!ok) {
+      printf("reboot dfu: U-Boot environment not written, not rebooting\n");
+      return 1;
+    }
+    printf("reboot dfu: next boot enters DFU (dfu-util -a firmware.dfu -D image.itb), resetting\n");
+  } else {
+    printf("reboot: resetting\n");
+  }
+  sleep(1);
+  rtems_fatal(RTEMS_FATAL_SOURCE_EXIT, 0); /* the fatal extension resets the board */
+  return 0;
+}
+
 void nexus_fwupdate_register(void)
 {
   rtems_shell_add_cmd("fwupdate", "misc",
                       "fwupdate [port] [reboot]: receive a FIT image over TCP and flash it",
                       shell_fwupdate);
+  rtems_shell_add_cmd("reboot", "misc", "reboot [dfu]: reset, or boot once into U-Boot DFU", shell_reboot);
 }
