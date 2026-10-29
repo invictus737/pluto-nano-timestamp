@@ -34,9 +34,10 @@ Pointers returned by `nexus_config_get`/`nexus_config_wifi` stay valid for the l
 | 0x000000 | 1 MiB | FSBL + U-Boot: never written |
 | 0x100000 | 128 KiB | U-Boot environment: read; written only for the keys below, with backup |
 | 0x120000 | 896 KiB (14 x 64 KiB) | "nvmfs": JFFS2 `/data` |
-| 0x200000.. | | firmware FIT, bootcopy, apps, UBI data: never written |
+| 0x200000.. | 30 MiB | firmware FIT slot: written only by `fwupdate` (see `rtos/QSPI.md`) |
 
-Writes and erases outside 0x100000..0x1FFFFF are refused by `qspi_nor.c`. The flash is accessed
+Writes and erases outside 0x100000..0x1FFFFF are refused by `qspi_nor.c`, except the FIT slot
+while `fwupdate` holds it open. The flash is accessed
 with the W25Q256's explicit 4-byte-address opcodes (0x13 read, 0x12 program, 0xDC 64 KiB erase):
 the 3/4-byte addressing mode and the extended address register are never changed. SCLK is set
 to <= 25 MHz. Every program and erase is verified by reading back.

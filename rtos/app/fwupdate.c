@@ -3,8 +3,16 @@
  * image (rtos.itb / rtos-nexus2.itb) until EOF, checks it, writes it to QSPI at 0x200000 (the
  * slot U-Boot boots with fit_config config-2) and points fit_size at it. From the Mac:
  *   nc <board> 4444 < rtos.itb
- * Every page is verified by the QSPI driver; the old image is gone once erasing starts, so a
- * failure leaves U-Boot (separate partition) to reload one over serial or DFU.
+ *
+ * The slot is 0x200000..0x2000000 (30 MiB) and crosses the 16 MiB bank boundary; U-Boot reads it
+ * whole (rtos/QSPI.md). The FIT header (magic, totalsize) is checked on the first bytes; the
+ * image is then received into a RAM buffer of its own size, and only a complete image is
+ * written. If that buffer cannot be allocated the image is streamed to flash 64 KiB at a time
+ * (a broken connection then leaves a broken slot and the old fit_size, which U-Boot's iminfo
+ * rejects). Writing goes sector by sector: a sector whose flash content already equals the image
+ * is neither erased nor programmed; every programmed page is verified by the QSPI driver. Once a
+ * changed sector is erased the old image is gone, so a failure leaves U-Boot (separate
+ * partition) to reload one over DFU or serial.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -25,8 +33,73 @@
 #include "qspi_nor.h"
 
 #define FW_MAX (QSPI_NOR_FW_END - QSPI_NOR_FW_OFF)
+#define FW_HDR 64u
+#define FW_TAIL_MAX 0x10000u /* bytes accepted after the FIT totalsize (e.g. an appended md5) */
 
-static int fw_receive(int port, uint8_t **out, size_t *out_len)
+typedef struct {
+  uint8_t *old; /* one sector of current flash content */
+  unsigned long written, skipped;
+} fw_writer_t;
+
+static uint32_t be32(const uint8_t *p)
+{
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+/* recv until n bytes or EOF; returns the byte count, -1 on error */
+static ssize_t recv_full(int s, uint8_t *p, size_t n)
+{
+  size_t got = 0;
+  while (got < n) {
+    ssize_t r = recv(s, p + got, n - got, 0);
+    if (r == 0) {
+      break;
+    }
+    if (r < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    got += (size_t)r;
+  }
+  return (ssize_t)got;
+}
+
+/* one 64 KiB-aligned sector: skip when unchanged, else erase + program (verified) */
+static int fw_sector(fw_writer_t *w, uint32_t addr, const uint8_t *data, size_t n)
+{
+  if (qspi_nor_read(addr, w->old, n) == 0 && memcmp(w->old, data, n) == 0) {
+    w->skipped++;
+    return 0;
+  }
+  if (qspi_nor_erase_sector(addr) != 0 || qspi_nor_write(addr, data, n) != 0) {
+    printf("fwupdate: sector %08lx failed\n", (unsigned long)addr);
+    return -1;
+  }
+  w->written++;
+  return 0;
+}
+
+static void fw_progress(size_t done)
+{
+  if (done % 0x100000u == 0) {
+    printf("fwupdate: %lu MiB\n", (unsigned long)(done >> 20));
+  }
+}
+
+static int fw_write(const uint8_t *img, size_t len, fw_writer_t *w)
+{
+  int rc = 0;
+  for (size_t off = 0; rc == 0 && off < len; off += QSPI_NOR_SECTOR) {
+    size_t n = len - off < QSPI_NOR_SECTOR ? len - off : QSPI_NOR_SECTOR;
+    rc = fw_sector(w, QSPI_NOR_FW_OFF + (uint32_t)off, img + off, n);
+    fw_progress(off + QSPI_NOR_SECTOR);
+  }
+  return rc;
+}
+
+static int fw_listen(int port)
 {
   int ls = socket(AF_INET, SOCK_STREAM, 0);
   if (ls < 0) {
@@ -50,56 +123,85 @@ static int fw_receive(int port, uint8_t **out, size_t *out_len)
   }
   int s = accept(ls, NULL, NULL);
   close(ls);
-  if (s < 0) {
+  if (s >= 0) {
+    struct timeval tv = {.tv_sec = 20};
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  }
+  return s;
+}
+
+/* buffered: the whole image in RAM (cap bytes) before the first erase. *len = bytes to flash. */
+static int fw_buffered(int s, const uint8_t *hdr, uint32_t total, uint8_t *buf, size_t cap,
+                       size_t *len)
+{
+  memcpy(buf, hdr, FW_HDR);
+  ssize_t r = recv_full(s, buf + FW_HDR, cap - FW_HDR);
+  if (r < 0) {
+    printf("fwupdate: receive: %s: nothing written\n", strerror(errno));
     return -1;
   }
-  struct timeval tv = {.tv_sec = 20};
-  (void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  uint8_t *buf = malloc(FW_MAX);
-  size_t len = 0;
-  if (buf == NULL) {
-    close(s);
-    return -1;
-  }
-  for (;;) {
-    ssize_t n = recv(s, buf + len, FW_MAX - len, 0);
-    if (n == 0) {
-      break;
-    }
-    if (n < 0) {
-      printf("fwupdate: receive: %s after %lu bytes\n", strerror(errno), (unsigned long)len);
-      free(buf);
-      close(s);
-      return -1;
-    }
-    len += (size_t)n;
-    if (len == FW_MAX) {
-      printf("fwupdate: image larger than %u bytes\n", (unsigned)FW_MAX);
-      free(buf);
-      close(s);
+  size_t have = FW_HDR + (size_t)r;
+  if (have == cap) {
+    uint8_t probe;
+    if (recv(s, &probe, 1, 0) != 0) {
+      printf("fwupdate: more than %lu bytes or no EOF (FIT totalsize %lu): nothing written\n",
+             (unsigned long)cap, (unsigned long)total);
       return -1;
     }
   }
-  close(s);
-  *out = buf;
-  *out_len = len;
+  if (have < total) {
+    printf("fwupdate: %lu of %lu bytes received: nothing written\n", (unsigned long)have,
+           (unsigned long)total);
+    return -1;
+  }
+  *len = have;
   return 0;
 }
 
-static int fw_write(const uint8_t *img, size_t len)
+/* streamed: no RAM for the whole image, 64 KiB at a time straight to flash */
+static int fw_streamed(int s, const uint8_t *hdr, uint32_t total, fw_writer_t *w, size_t *len)
 {
-  uint32_t end = QSPI_NOR_FW_OFF + (uint32_t)len;
+  uint8_t *sec = malloc(QSPI_NOR_SECTOR);
+  if (sec == NULL) {
+    printf("fwupdate: no memory\n");
+    return -1;
+  }
+  memcpy(sec, hdr, FW_HDR);
+  size_t fill = FW_HDR, off = 0;
   int rc = 0;
-  qspi_nor_fw_window(1);
-  for (uint32_t a = QSPI_NOR_FW_OFF; rc == 0 && a < end; a += QSPI_NOR_SECTOR) {
-    rc = qspi_nor_erase_sector(a);
+  printf("fwupdate: no RAM for the whole image, streaming to flash\n");
+  for (;;) {
+    ssize_t r = recv_full(s, sec + fill, QSPI_NOR_SECTOR - fill);
+    if (r < 0) {
+      printf("fwupdate: receive: %s after %lu bytes\n", strerror(errno),
+             (unsigned long)(off + fill));
+      rc = -1;
+      break;
+    }
+    fill += (size_t)r;
+    if (fill == 0) {
+      break;
+    }
+    if (off + fill > FW_MAX) {
+      printf("fwupdate: image larger than the %u byte slot\n", (unsigned)FW_MAX);
+      rc = -1;
+      break;
+    }
+    rc = fw_sector(w, QSPI_NOR_FW_OFF + (uint32_t)off, sec, fill);
+    off += fill;
+    fw_progress(off);
+    if (rc != 0 || fill < QSPI_NOR_SECTOR) {
+      break; /* error, or a short sector = EOF */
+    }
+    fill = 0;
   }
-  printf("fwupdate: erased, writing\n");
-  for (size_t off = 0; rc == 0 && off < len; off += 0x10000) {
-    size_t n = len - off < 0x10000 ? len - off : 0x10000;
-    rc = qspi_nor_write(QSPI_NOR_FW_OFF + (uint32_t)off, img + off, n);
+  free(sec);
+  if (rc == 0 && off < total) {
+    printf("fwupdate: only %lu of %lu bytes received\n", (unsigned long)off,
+           (unsigned long)total);
+    rc = -1;
   }
-  qspi_nor_fw_window(0);
+  *len = off;
   return rc;
 }
 
@@ -113,28 +215,63 @@ static int shell_fwupdate(int argc, char **argv)
       port = atoi(argv[i]);
     }
   }
-  uint8_t *img = NULL;
-  size_t len = 0;
-  if (fw_receive(port, &img, &len) != 0) {
+  int s = fw_listen(port);
+  if (s < 0) {
     return 1;
   }
   /* FIT = flattened device tree: magic d00dfeed, totalsize at offset 4 */
-  uint32_t magic = (uint32_t)img[0] << 24 | img[1] << 16 | img[2] << 8 | img[3];
-  uint32_t total = (uint32_t)img[4] << 24 | img[5] << 16 | img[6] << 8 | img[7];
-  if (len < 64 || magic != 0xd00dfeedu || total > len) {
-    printf("fwupdate: %lu bytes, not a FIT image (magic %08lx, size %lu): nothing written\n",
-           (unsigned long)len, (unsigned long)magic, (unsigned long)total);
-    free(img);
+  uint8_t hdr[FW_HDR];
+  ssize_t h = recv_full(s, hdr, FW_HDR);
+  uint32_t magic = h == (ssize_t)FW_HDR ? be32(hdr) : 0;
+  uint32_t total = h == (ssize_t)FW_HDR ? be32(hdr + 4) : 0;
+  if (magic != 0xd00dfeedu || total < FW_HDR || total > FW_MAX) {
+    printf("fwupdate: not a FIT image for the %u byte slot (magic %08lx, size %lu): nothing "
+           "written\n",
+           (unsigned)FW_MAX, (unsigned long)magic, (unsigned long)total);
+    close(s);
     return 1;
   }
-  printf("fwupdate: %lu bytes received, writing to QSPI 0x%x\n", (unsigned long)len,
-         (unsigned)QSPI_NOR_FW_OFF);
-  if (fw_write(img, len) != 0) {
-    printf("fwupdate: FLASH WRITE FAILED: reload an image from U-Boot (serial loady or DFU)\n");
-    free(img);
+  fw_writer_t w = {.old = malloc(QSPI_NOR_SECTOR)};
+  if (w.old == NULL) {
+    printf("fwupdate: no memory\n");
+    close(s);
     return 1;
   }
-  free(img);
+  size_t cap = (size_t)total + FW_TAIL_MAX > FW_MAX ? FW_MAX : (size_t)total + FW_TAIL_MAX;
+  uint8_t *img = malloc(cap);
+  size_t len = 0;
+  int rc; /* 0 written, 1 nothing written, 2 slot changed and broken */
+  if (img != NULL) {
+    rc = fw_buffered(s, hdr, total, img, cap, &len) == 0 ? 0 : 1;
+    close(s);
+    if (rc == 0) {
+      printf("fwupdate: %lu bytes received, writing to QSPI 0x%x\n", (unsigned long)len,
+             (unsigned)QSPI_NOR_FW_OFF);
+      qspi_nor_fw_window(1);
+      rc = fw_write(img, len, &w) == 0 ? 0 : 2;
+      qspi_nor_fw_window(0);
+    }
+    free(img);
+  } else {
+    qspi_nor_fw_window(1);
+    rc = fw_streamed(s, hdr, total, &w, &len) == 0 ? 0 : (w.written ? 2 : 1);
+    qspi_nor_fw_window(0);
+    close(s);
+  }
+  free(w.old);
+  if (rc == 1) {
+    return 1;
+  }
+  if (rc == 2) {
+    printf("fwupdate: FLASH WRITE FAILED (%lu sectors changed): reload an image from U-Boot "
+           "(DFU or serial loady)\n",
+           w.written);
+    return 1;
+  }
+  printf("fwupdate: %lu sectors written, %lu unchanged\n", w.written, w.skipped);
+  if (QSPI_NOR_FW_OFF + len > QSPI_NOR_LOWER_BANK_END) {
+    printf("fwupdate: image crosses 16 MiB: the Linux boot copy and UBI data are overwritten\n");
+  }
   char size_hex[16];
   snprintf(size_hex, sizeof(size_hex), "%lX", (unsigned long)len);
   const char *kv[] = {"fit_size", size_hex, "fit_config", "config-2"};

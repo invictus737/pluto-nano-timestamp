@@ -20,6 +20,7 @@
 #include "qspi_nor.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -140,6 +141,30 @@ static int rx_burst(uint8_t *rx, size_t n)
   return 0;
 }
 
+/* Bulk transmit (page program data): queue up to BURST bytes, then drain their RX entries. Used
+ * only when the batched reads passed their self-test (same FIFO path); every programmed page is
+ * still verified by reading it back. */
+static int tx_burst(const uint8_t *tx, size_t n)
+{
+  while (n) {
+    unsigned k = n > BURST ? BURST : (unsigned)n;
+    for (unsigned i = 0; i < k; ++i) {
+      REG32(QSPI_TXD1) = tx[i];
+    }
+    for (unsigned i = 0; i < k; ++i) {
+      for (unsigned w = 0; (REG32(QSPI_ISR) & ISR_RXNEMPTY) == 0; ++w) {
+        if (w > POLL_LIMIT) {
+          return -1;
+        }
+      }
+      (void)REG32(QSPI_RXD);
+    }
+    tx += k;
+    n -= k;
+  }
+  return 0;
+}
+
 /* one SPI transaction under one chip select: cmd bytes, tx bytes, then rx_len bytes clocked in */
 static int xfer(const uint8_t *cmd, size_t cmd_len, const uint8_t *tx, size_t tx_len, uint8_t *rx,
                 size_t rx_len)
@@ -149,8 +174,12 @@ static int xfer(const uint8_t *cmd, size_t cmd_len, const uint8_t *tx, size_t tx
   for (size_t i = 0; rc == 0 && i < cmd_len; ++i) {
     rc = byte_xfer(cmd[i], NULL);
   }
-  for (size_t i = 0; rc == 0 && i < tx_len; ++i) {
-    rc = byte_xfer(tx[i], NULL);
+  if (rc == 0 && burst_ok && tx_len > 1) {
+    rc = tx_burst(tx, tx_len);
+  } else {
+    for (size_t i = 0; rc == 0 && i < tx_len; ++i) {
+      rc = byte_xfer(tx[i], NULL);
+    }
   }
   if (rc == 0 && burst_ok && rx_len > 1) {
     rc = rx_burst(rx, rx_len);
@@ -188,9 +217,13 @@ static void addr4(uint8_t *c, uint8_t op, uint32_t a)
   c[4] = (uint8_t)a;
 }
 
-static int wait_ready(unsigned timeout_ms, unsigned sleep_us)
+/* Poll WIP. The first spin_us are polled back to back (yielding to equal-priority threads): a
+ * page program takes ~0.4..3 ms, and a usleep() rounds up to the 1 ms tick, which made every
+ * page cost 1..2 ms of sleep. After that, sleep sleep_us per poll until timeout_ms. */
+static int wait_ready(unsigned timeout_ms, unsigned spin_us, unsigned sleep_us)
 {
-  unsigned waited_us = 0;
+  uint64_t t0 = rtems_clock_get_uptime_nanoseconds();
+  uint64_t spin_ns = (uint64_t)spin_us * 1000u, limit_ns = (uint64_t)timeout_ms * 1000000u;
   for (;;) {
     uint8_t sr;
     if (read_reg(OP_RDSR1, &sr) != 0) {
@@ -199,11 +232,15 @@ static int wait_ready(unsigned timeout_ms, unsigned sleep_us)
     if ((sr & SR1_WIP) == 0) {
       return 0;
     }
-    if (waited_us >= timeout_ms * 1000u) {
+    uint64_t dt = rtems_clock_get_uptime_nanoseconds() - t0;
+    if (dt >= limit_ns) {
       return -1;
     }
-    usleep(sleep_us);
-    waited_us += sleep_us < 1000 ? 1000 : sleep_us; /* at least one clock tick */
+    if (dt < spin_ns) {
+      sched_yield();
+    } else {
+      usleep(sleep_us);
+    }
   }
 }
 
@@ -283,7 +320,7 @@ int qspi_nor_init(void)
   printf("qspi: W25Q256 id %06lx sr1 %02x sr2 %02x sr3 %02x ear %02x (%s-byte mode, left as is)\n",
          (unsigned long)jedec, sr1, sr2, sr3, ear, (sr3 & 1) ? "4" : "3");
   if (sr1 & SR1_WIP) {
-    (void)wait_ready(3000, 1000);
+    (void)wait_ready(3000, 0, 1000);
   }
   burst_selftest();
   ready = 1;
@@ -333,7 +370,7 @@ static int read_locked(uint32_t addr, uint8_t *p, size_t len)
 
 int qspi_nor_read(uint32_t addr, void *buf, size_t len)
 {
-  if (!ready || addr >= 0x2000000u || len > 0x2000000u - addr) {
+  if (!ready || addr >= QSPI_NOR_SIZE || len > QSPI_NOR_SIZE - addr) {
     return -1;
   }
   pthread_mutex_lock(&lock);
@@ -381,7 +418,7 @@ int qspi_nor_write(uint32_t addr, const void *buf, size_t len)
     if (!blank) {
       uint8_t c[5];
       addr4(c, OP_PP4, addr);
-      if (write_enable() != 0 || xfer(c, 5, p, n, NULL, 0) != 0 || wait_ready(50, 100) != 0) {
+      if (write_enable() != 0 || xfer(c, 5, p, n, NULL, 0) != 0 || wait_ready(50, 5000, 200) != 0) {
         rc = -1;
       } else if (read_locked(addr, verify_buf, n) != 0 || memcmp(verify_buf, p, n) != 0) {
         printf("qspi: verify failed at %08lx\n", (unsigned long)addr);
@@ -409,7 +446,7 @@ int qspi_nor_erase_sector(uint32_t addr)
   uint8_t c[5];
   int rc = 0;
   addr4(c, OP_BE64K4, addr);
-  if (write_enable() != 0 || xfer(c, 5, NULL, 0, NULL, 0) != 0 || wait_ready(3000, 2000) != 0) {
+  if (write_enable() != 0 || xfer(c, 5, NULL, 0, NULL, 0) != 0 || wait_ready(3000, 0, 2000) != 0) {
     rc = -1;
   }
   /* blank check */

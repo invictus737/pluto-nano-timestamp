@@ -119,6 +119,8 @@ and `tetra.tick`.
 
 ## Recovery
 
+QSPI map, image size limits and `fwupdate` (network flash of a new FIT): `QSPI.md`.
+
 U-Boot, its DFU mode and the Linux backup are untouched. To go back to Linux, restore the backup
 with `run dfu_sf` + `dfu-util` and set `fit_config` / `fit_size` back (steps in PLAN.md, "Board
 state").
