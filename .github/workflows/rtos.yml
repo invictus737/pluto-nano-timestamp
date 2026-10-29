@@ -235,6 +235,8 @@ jobs:
           touch nexus/bins/nexus2/src/main.rs
           USB_STACK=cherry rtos/ci/image-nexus2.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $SDR_PREFIX $PWD/nexus xsa/system_top.xsa out-cherry
           cp out-cherry/rtos-nexus2.itb out/rtos-nexus2-cherry.itb
+          cp out-cherry/nexus2.map out/nexus2-cherry.map
+          cp out-cherry/nexus2.elf out/nexus2-cherry.elf
       - name: Save Rust toolchain + cargo target
         if: steps.cargo.outputs.cache-hit != 'true' && steps.n2img.outcome == 'success'
         uses: actions/cache/save@v4
@@ -250,7 +252,7 @@ jobs:
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           [ -f out/abi/abi-report.txt ] && cp out/abi/abi-report.txt out/abi-report.txt && cp out/abi/abi_table.h out/abi-table.h
-          FILES=$(ls out/abi-report.txt out/abi-table.h out/rtos-nexus2.itb out/rtos-nexus2-cherry.itb out/nexus2.map out/nexus2-link.log 2>/dev/null || true)
+          FILES=$(ls out/abi-report.txt out/abi-table.h out/rtos-nexus2.itb out/rtos-nexus2-cherry.itb out/nexus2.map out/nexus2-link.log out/nexus2-cherry.map out/nexus2-cherry.elf 2>/dev/null || true)
           [ -z "$FILES" ] || gh release upload "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --clobber
       # the station steps continue on error so the draft release still gets the logs; the run
       # must not look green when the image the board needs was not built
