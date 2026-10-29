@@ -145,9 +145,25 @@ def diag_rtwn_c(s):
 POLL_MARK = "/* Pluto RTOS: periodic transfer poll */"
 
 
+SCHED_MARK = "/* Pluto RTOS: schedules stay on */"
+
+
 def ehci_c(s):
-    """ehci_zynq_poll(): complete finished transfers without an interrupt (the Zynq glue calls it
-    from a timer); returns how many it completed, so lost completion interrupts become visible."""
+    """1. ehci_set_hw_power toggles USBCMD ASE/PSE with the bus power state without waiting for
+    USBSTS AS/PS to follow (EHCI 4.8: software must not change the enable until the status
+    matches; Linux handshakes). The ChipIdea core on the Zynq then stays in the transition (seen:
+    ASE=0 with AS=1 and an unacknowledged IAAD) and new transfers are never fetched: every driver
+    times out. Keep both schedules enabled.
+    2. ehci_zynq_poll(): complete finished transfers without an interrupt (the Zynq glue calls it
+    from a timer); returns how many it completed."""
+    if SCHED_MARK not in s:
+        old = """	temp &= ~(EHCI_CMD_ASE | EHCI_CMD_PSE);
+
+	if (flags & (USB_HW_POWER_CONTROL |"""
+        assert s.count(old) == 1, "ehci_set_hw_power anchor"
+        s = s.replace(old, """	""" + SCHED_MARK + """
+	temp |= EHCI_CMD_ASE | EHCI_CMD_PSE;
+	if (0 && flags & (USB_HW_POWER_CONTROL |""")
     if POLL_MARK in s:
         return s
     return s + """
