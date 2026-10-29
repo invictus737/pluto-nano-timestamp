@@ -460,9 +460,23 @@ int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
  * write to the slow serial console at all: their bytes also go to a 32 KiB console ring that a
  * low-priority CPU0 thread forwards to the console (nexus_log_drainer_start); when the console
  * falls behind, their output is dropped and counted ("[console: N bytes dropped]"), it is never
- * waited for. Everything else writes synchronously, as before. */
+ * waited for. Everything else writes synchronously, as before.
+ *
+ * The serial shell has the console first. A termios write() holds the tty output mutex (osem)
+ * until its last byte is in the 64-byte raw buffer, i.e. for its whole duration at the UART
+ * rate, and the shell's stdout is line buffered: one write() per line. The drainer used to
+ * forward everything queued in one write() (up to 32 KiB, ~2.8 s at 115200), so under a radio
+ * output flood every shell line waited a whole drainer burst: `log 60000` printed ~3.4 KB and
+ * then ~one line per 2.8 s, the shell looked dead (no prompt, no echo) while nexus2's output
+ * kept flowing. Now the drainer writes at most NEXUS_CON_CHUNK bytes per write() and stays off
+ * the console while a shell thread writes to it and for NEXUS_CON_SHELL_HOLD_MS afterwards;
+ * radio output meanwhile is dropped and counted as before. Shell output (any shell task, see
+ * rtems_shell_get_current_env) is not recorded in the ring either, so `log` never reads back
+ * its own (or an earlier `log`'s) output. */
+#include <rtems/shell.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <time.h>
 
 #define NEXUS_LOG_RING (256u * 1024u) /* powers of two: positions are free-running uint32 */
 #define NEXUS_CON_RING (32u * 1024u)
@@ -475,6 +489,27 @@ static atomic_uint con_done;       /* of those, bytes fully copied */
 static atomic_uint con_read;       /* bytes forwarded (or skipped) by the drainer */
 static atomic_uint con_dropped;    /* radio-thread bytes the console had no room for */
 static atomic_int con_drainer_on;
+static atomic_int con_shell_writers;      /* shell writes in progress on the console */
+static atomic_uint con_shell_last_ms;     /* when the last one ended (monotonic ms, wrapping) */
+#define NEXUS_CON_CHUNK 256u              /* drainer bytes per write(): ~22 ms at 115200 */
+#define NEXUS_CON_SHELL_HOLD_MS 300u      /* drainer stays off after a shell write */
+
+static uint32_t mono_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000);
+}
+
+/* the console belongs to the shell now: a shell write is running or has just ended */
+static int con_shell_active(void)
+{
+  if (atomic_load_explicit(&con_shell_writers, memory_order_acquire) > 0) {
+    return 1;
+  }
+  uint32_t last = atomic_load_explicit(&con_shell_last_ms, memory_order_acquire);
+  return mono_ms() - last < NEXUS_CON_SHELL_HOLD_MS;
+}
 
 ssize_t __real_write(int fd, const void *buf, size_t n);
 
@@ -526,6 +561,14 @@ static int con_put(const char *p, uint32_t n)
 ssize_t __wrap_write(int fd, const void *buf, size_t n)
 {
   if ((fd == 1 || fd == 2) && n > 0 && buf != NULL) {
+    if (!station_thread && rtems_shell_get_current_env() != NULL) {
+      /* a shell command on the console: not recorded, and the drainer keeps off meanwhile */
+      atomic_fetch_add_explicit(&con_shell_writers, 1, memory_order_acq_rel);
+      ssize_t rc = __real_write(fd, buf, n);
+      atomic_store_explicit(&con_shell_last_ms, mono_ms(), memory_order_release);
+      atomic_fetch_sub_explicit(&con_shell_writers, 1, memory_order_acq_rel);
+      return rc;
+    }
     const char *p = buf;
     uint32_t len = n > NEXUS_LOG_RING ? NEXUS_LOG_RING : (uint32_t)n;
     uint32_t start = atomic_fetch_add_explicit(&log_reserved, len, memory_order_relaxed);
@@ -542,35 +585,49 @@ static void *log_drainer(void *arg)
 {
   (void)arg;
   uint32_t reported = 0;
+  uint32_t ready = 0; /* bytes known to be completely copied (con_read <= ready <= con_done) */
   for (;;) {
-    uint32_t rd = atomic_load_explicit(&con_read, memory_order_relaxed);
-    uint32_t r1 = atomic_load_explicit(&con_reserved, memory_order_acquire);
-    uint32_t done = atomic_load_explicit(&con_done, memory_order_acquire);
-    uint32_t r2 = atomic_load_explicit(&con_reserved, memory_order_acquire);
-    /* done == reserved, unchanged around the read: every reserved byte up to r1 is copied */
-    if (r1 != rd && r1 == r2 && done == r1) {
-      uint32_t pos = rd & (NEXUS_CON_RING - 1u);
-      uint32_t n = r1 - rd;
-      uint32_t first = NEXUS_CON_RING - pos;
-      if (first > n) {
-        first = n;
-      }
-      (void)__real_write(1, con_ring + pos, first);
-      if (n > first) {
-        (void)__real_write(1, con_ring, n - first);
-      }
-      atomic_store_explicit(&con_read, r1, memory_order_release);
+    if (con_shell_active()) {
+      /* the shell has the console; radio output that does not fit meanwhile is dropped */
+      usleep(5000);
       continue;
     }
-    uint32_t dropped = atomic_load_explicit(&con_dropped, memory_order_relaxed);
-    if (dropped != reported) {
-      char line[64];
-      int k = snprintf(line, sizeof(line), "[console: %u bytes dropped]\n", (unsigned)(dropped - reported));
-      (void)__real_write(1, line, (size_t)k);
-      reported = dropped;
+    uint32_t rd = atomic_load_explicit(&con_read, memory_order_relaxed);
+    if (ready == rd) {
+      /* between batches (also under a continuous flood): report what the console missed */
+      uint32_t dropped = atomic_load_explicit(&con_dropped, memory_order_relaxed);
+      if (dropped != reported) {
+        char line[64];
+        int k = snprintf(line, sizeof(line), "[console: %u bytes dropped]\n",
+                         (unsigned)(dropped - reported));
+        (void)__real_write(1, line, (size_t)k);
+        reported = dropped;
+      }
+      uint32_t r1 = atomic_load_explicit(&con_reserved, memory_order_acquire);
+      uint32_t done = atomic_load_explicit(&con_done, memory_order_acquire);
+      uint32_t r2 = atomic_load_explicit(&con_reserved, memory_order_acquire);
+      /* done == reserved, unchanged around the read: every reserved byte up to r1 is copied
+       * (and stays so: writers never pass con_read) */
+      if (r1 != rd && r1 == r2 && done == r1) {
+        ready = r1;
+      } else {
+        /* a writer still copying: look again soon; idle: 5 ms */
+        usleep(r1 != rd ? 1000 : 5000);
+        continue;
+      }
     }
-    /* a writer still copying: look again soon; idle: 5 ms */
-    usleep(r1 != rd ? 1000 : 5000);
+    /* short writes only: termios holds the output mutex for a whole write(), and a waiting
+     * shell write gets it as soon as this chunk is out */
+    uint32_t pos = rd & (NEXUS_CON_RING - 1u);
+    uint32_t n = ready - rd;
+    if (n > NEXUS_CON_RING - pos) {
+      n = NEXUS_CON_RING - pos;
+    }
+    if (n > NEXUS_CON_CHUNK) {
+      n = NEXUS_CON_CHUNK;
+    }
+    (void)__real_write(1, con_ring + pos, n);
+    atomic_store_explicit(&con_read, rd + n, memory_order_release);
   }
   return NULL;
 }
@@ -671,7 +728,17 @@ int nexus_log_shell(int argc, char **argv)
       want = (size_t)v;
     }
     const char *start = len > want ? c + (len - want) : c;
-    fwrite(start, 1, strlen(start), stdout);
+    /* a few large writes instead of one line-buffered write() per line */
+    fflush(stdout);
+    size_t left = strlen(start);
+    while (left > 0) {
+      ssize_t k = write(fileno(stdout), start, left > 1024 ? 1024 : left);
+      if (k <= 0) {
+        break;
+      }
+      start += k;
+      left -= (size_t)k;
+    }
     unsigned dropped = atomic_load_explicit(&con_dropped, memory_order_relaxed);
     if (dropped != 0) {
       printf("\n(log: %u bytes of radio-thread output skipped the serial console; the ring keeps them)\n",
