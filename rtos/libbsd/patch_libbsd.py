@@ -352,7 +352,12 @@ def ehci_trace_c(s):
 	}
 
 	/* transfer is transferred */
-	ehci_device_done(xfer, USB_ERR_TIMEOUT);""")
+	ehci_device_done(xfer, USB_ERR_TIMEOUT);
+	{
+		extern void zynq_ehci_kick_async(void);
+		/* a timed-out QH may be the one the controller is parked on */
+		zynq_ehci_kick_async();
+	}""")
 
 
 PM_MARK = "/* Pluto RTOS: no USB suspend */"

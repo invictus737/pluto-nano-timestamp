@@ -225,19 +225,65 @@ zynq_ehci_intr(void *arg)
  * Every 10 ms: completed transfers whose interrupt never arrived are finished here (counted and
  * reported every 10 s), and pending port changes kick an explore.
  */
+/*
+ * Async engine watchdog. The ChipIdea core was seen parked on one QH (ASYNCLISTADDR constant,
+ * IAAD never acknowledged) while that QH's next qTD sat active in memory: the controller kept a
+ * stale copy and never fetched it, so every later transfer timed out. Turning the async schedule
+ * off and on (EHCI 4.8, with the AS status handshake) makes it re-read the list from memory.
+ */
+unsigned zynq_ehci_async_kicks;
+static uint32_t zynq_ehci_last_alist;
+static unsigned zynq_ehci_stuck_ticks;
+
+static void
+zynq_ehci_async_kick(void)
+{
+	volatile uint32_t *cmd = (volatile uint32_t *)(ZY7_USB0_BASE + 0x140);
+	volatile uint32_t *sts = (volatile uint32_t *)(ZY7_USB0_BASE + 0x144);
+	int i;
+
+	*cmd &= ~(1U << 5);
+	for (i = 0; i < 2000 && (*sts & (1U << 15)) != 0; ++i)
+		DELAY(1);
+	*sts = 1U << 5; /* stale IAA */
+	*cmd |= 1U << 5;
+	for (i = 0; i < 2000 && (*sts & (1U << 15)) == 0; ++i)
+		DELAY(1);
+	zynq_ehci_async_kicks++;
+}
+
+void zynq_ehci_kick_async(void); /* also called from ehci_timeout (Pluto patch) */
+void
+zynq_ehci_kick_async(void)
+{
+	zynq_ehci_async_kick();
+}
+
 static void
 zynq_ehci_poll_tick(void *arg)
 {
 	(void)arg;
 	if (zynq_ehci_sc != NULL) {
+		uint32_t c = REG32(ZY7_USB0_BASE + 0x140);
+		uint32_t al = REG32(ZY7_USB0_BASE + 0x158);
+		if ((c & (1U << 6)) != 0 && al == zynq_ehci_last_alist) {
+			if (++zynq_ehci_stuck_ticks >= 5) {
+				zynq_ehci_async_kick();
+				zynq_ehci_stuck_ticks = 0;
+			}
+		} else {
+			zynq_ehci_stuck_ticks = 0;
+		}
+		zynq_ehci_last_alist = al;
 		zynq_ehci_rescued += (unsigned)ehci_zynq_poll(zynq_ehci_sc);
 		if ((REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1) & PORTSC_CHANGE_BITS) != 0 &&
 		    (zynq_ehci_ticks % 50) == 0)
 			usb_needs_explore(&zynq_ehci_sc->sc_bus, 0);
 		if (++zynq_ehci_ticks % 1000 == 0 &&
-		    (zynq_ehci_rescued != 0 || ehci_zynq_ring_repairs != zynq_ehci_repairs_seen)) {
-			printf("ehci: %u transfer(s) completed by the poll, async ring repairs %u\n",
-			    zynq_ehci_rescued, ehci_zynq_ring_repairs);
+		    (zynq_ehci_rescued != 0 || ehci_zynq_ring_repairs != zynq_ehci_repairs_seen ||
+		    zynq_ehci_async_kicks != 0)) {
+			printf("ehci: %u transfer(s) completed by the poll, async ring repairs %u, async kicks %u\n",
+			    zynq_ehci_rescued, ehci_zynq_ring_repairs, zynq_ehci_async_kicks);
 			zynq_ehci_rescued = 0;
 			zynq_ehci_repairs_seen = ehci_zynq_ring_repairs;
 		}

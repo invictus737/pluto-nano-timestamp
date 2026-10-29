@@ -621,6 +621,36 @@ static void usb_tunables_apply(void)
   }
 }
 
+/* mr32 <addr> [count] / mw32 <addr> <value>: 32-bit register access (mdump/medit are byte-wide) */
+static int shell_mr32(int argc, char **argv)
+{
+  if (argc < 2) {
+    printf("usage: mr32 <addr> [count]\n");
+    return 1;
+  }
+  uintptr_t a = (uintptr_t)strtoul(argv[1], NULL, 0) & ~(uintptr_t)3;
+  unsigned n = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 0) : 1;
+  for (unsigned i = 0; i < n && i < 256; ++i) {
+    printf("%s0x%08lx: 0x%08lx", (i % 4) ? "  " : (i ? "\n" : ""), (unsigned long)(a + 4 * i),
+           (unsigned long)*(volatile uint32_t *)(a + 4 * i));
+  }
+  printf("\n");
+  return 0;
+}
+
+static int shell_mw32(int argc, char **argv)
+{
+  if (argc < 3) {
+    printf("usage: mw32 <addr> <value>\n");
+    return 1;
+  }
+  volatile uint32_t *r = (volatile uint32_t *)((uintptr_t)strtoul(argv[1], NULL, 0) & ~(uintptr_t)3);
+  *r = (uint32_t)strtoul(argv[2], NULL, 0);
+  printf("0x%08lx <- 0x%08lx, reads 0x%08lx\n", (unsigned long)(uintptr_t)r,
+         (unsigned long)strtoul(argv[2], NULL, 0), (unsigned long)*r);
+  return 0;
+}
+
 static void Init(rtems_task_argument arg)
 {
   (void)arg;
@@ -676,6 +706,8 @@ static void Init(rtems_task_argument arg)
   }
   nexus_config_shell_register();
   nexus_fwupdate_register(); /* fwupdate.c */
+  rtems_shell_add_cmd("mr32", "mem", "mr32 <addr> [count]: 32-bit reads", shell_mr32);
+  rtems_shell_add_cmd("mw32", "mem", "mw32 <addr> <value>: 32-bit write", shell_mw32);
   rtems_shell_add_cmd("abi", "misc", "abi [-v]: C layouts/constants vs the Rust libc crate", nexus_shell_abi);
   /* ---- Bluetooth (rtos/bt): `bt` command; powers on when bt.enabled, reconnects the last sink ---- */
   nexus_bt_shell_register();
