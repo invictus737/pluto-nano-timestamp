@@ -49,6 +49,11 @@ void nexus_fwupdate_register(void);
 #include "ssh_server.h"
 /* ---- Bluetooth (rtos/bt) ---- */
 #include "nexus_bt.h"
+#ifdef NEXUS_USB_CHERRY
+/* ---- CherryUSB host (USB_STACK=cherry, rtos/cherryusb) ---- */
+#include "nexus_cherryusb.h"
+/* ---- end CherryUSB host ---- */
+#endif
 /* ---- end Bluetooth ---- */
 
 int nexus_wifi_start(const char *ssid, const char *psk);
@@ -679,6 +684,24 @@ static void Init(rtems_task_argument arg)
   if (nexus_config_init() != 0) {
     printf("config: init failed, running with defaults\n");
   }
+#ifdef NEXUS_USB_CHERRY
+  /* ---- CherryUSB host (USB_STACK=cherry, rtos/cherryusb): owns USB0 instead of libbsd; the
+   * [USB] tuning keys below then apply to the running controller ---- */
+  {
+    const char *v = nexus_config_get("usb_aic_dc_switch");
+    nexus_cherryusb_aic_dc_switch = !(v != NULL && v[0] == '0');
+    v = nexus_config_get("usb_sdis"); /* USBMODE stream disable, default off as Linux */
+    if (v != NULL && v[0] != '\0') {
+      nexus_cherryusb_sdis = v[0] != '0';
+    }
+  }
+  if (nexus_cherryusb_start() != 0) {
+    printf("usbh: CherryUSB host not started\n");
+  }
+  rtems_shell_add_cmd("usbh", "misc", "usbh: CherryUSB controller registers and counters", nexus_cherryusb_shell);
+  rtems_shell_add_cmd("lsusb", "misc", "lsusb [-t|-v]: CherryUSB devices", lsusb);
+  /* ---- end CherryUSB host ---- */
+#endif
   usb_tunables_apply();
 
   {
@@ -738,8 +761,13 @@ static void Init(rtems_task_argument arg)
 #include <rtems/bsd/modules.h>
 
 RTEMS_BSD_DRIVER_XILINX_ZYNQ_SLCR;
+#ifndef NEXUS_USB_CHERRY
 RTEMS_BSD_DEFINE_NEXUS_DEVICE(ehci, 0, 0, NULL);
 SYSINIT_DRIVER_REFERENCE(usbus, ehci);
+#else
+/* ---- CherryUSB host (USB_STACK=cherry): CherryUSB owns USB0, so no libbsd EHCI nexus device;
+ * the libbsd USB drivers below stay linked but never see a bus ---- */
+#endif
 RTEMS_BSD_DRIVER_USB;
 RTEMS_BSD_DRIVER_USB_MASS;
 /* AIC8800 Wi-Fi/BT sticks: leave the driver-CD storage mode before umass claims them */

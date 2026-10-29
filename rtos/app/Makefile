@@ -84,6 +84,14 @@ clean:
 FORCE:
 .PHONY: all clean FORCE
 include ../libbsd/aic8800/aicwf.mk
+# USB host stack: libbsd (FreeBSD USB, default) or cherry (CherryUSB EHCI host for the AIC8800
+# stick, rtos/cherryusb; the libbsd EHCI glue then does not attach)
+USB_STACK ?= libbsd
+ifeq ($(USB_STACK),cherry)
+include ../cherryusb/cherryusb.mk
+else ifneq ($(USB_STACK),libbsd)
+$(error USB_STACK must be libbsd or cherry, not $(USB_STACK))
+endif
 # Bluetooth (rtos/bt): BTstack A2DP source; must precede the libnexusrtos.a rule
 include ../bt/bt.mk
 
