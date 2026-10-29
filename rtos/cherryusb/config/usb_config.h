@@ -145,4 +145,28 @@ void usb_osal_dma_barrier(void);
 /* CPU of every CherryUSB thread (the AIC driver threads run on CPU0 as well, AICWF_THREAD_CPU) */
 #define NEXUS_USB_THREAD_CPU 0
 
+/* ================ USB Ethernet (rtos/cherryusb/net; usbnet section, keep last) ================ */
+/*
+ * CherryUSB's own class drivers (class/cdc ECM/NCM, class/vendor/net RTL8152/ASIX), glued to
+ * libbsd ifnets ueN by net/usbnet.c. The class buffers are USB_NOCACHE_RAM_SECTION (16 MiB
+ * NOCACHE region, bsp/config.ini): about 75 KiB with the sizes below.
+ * RTL8152: the chip aggregates up to rx_buf_sz = 16 KiB per transfer (rtl_ops_init); 32 KiB keeps
+ * a second 16 KiB transfer for an aggregate that ends exactly on a packet boundary.
+ * CDC-NCM: the driver sets no NTB input size, the device sends up to its dwNtbInMaxSize.
+ * ASIX: 2048 selects AX_RX_CTL_MFB_2048 (one frame per transfer).
+ */
+#define CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SIZE (32 * 1024)
+#define CONFIG_USBHOST_RTL8152_ETH_MAX_TX_SIZE 2048
+#define CONFIG_USBHOST_CDC_NCM_ETH_MAX_RX_SIZE (32 * 1024)
+#define CONFIG_USBHOST_CDC_NCM_ETH_MAX_TX_SIZE 2048
+#define CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE    2048
+#define CONFIG_USBHOST_ASIX_ETH_MAX_TX_SIZE    2048
+/* rx threads run the libbsd input path (ether_input .. tcp_input) inline: CherryUSB scale, one
+ * below the hub thread as CherryUSB's platform glue does (POSIX 135) */
+#define NEXUS_USBNET_RX_PRIO       (CONFIG_USBHOST_PSC_PRIO + 1)
+#define NEXUS_USBNET_RX_STACKSIZE  (32 * 1024)
+/* link poll of chips whose interrupt endpoint answers every interval (RTL8152, ASIX); CDC
+ * ECM/NCM only notify on change and are waited on without a period */
+#define NEXUS_USBNET_LINK_POLL_MS  500
+
 #endif /* NEXUS_CHERRYUSB_CONFIG_H */

@@ -5,7 +5,9 @@
 # libbsd usbh shim: the RT-Smart driver objects of aicwf.mk are recompiled against CherryUSB
 # (compat usbh_core.h first on their include path) and shim/usbh_shim.c leaves the link.
 # The libbsd EHCI glue does not attach in this build (main.c, NEXUS_USB_CHERRY), so libbsd has
-# no USB bus: no umass/config drop-in stick, USB Ethernet or net80211 sticks in this image.
+# no USB bus: no umass/config drop-in stick or net80211 sticks in this image. USB Ethernet comes
+# from CherryUSB's own class drivers (RTL8152, CDC-ECM, CDC-NCM, ASIX) glued to libbsd ifnets
+# ueN by net/usbnet.c (CHERRY_USBNET=1, default; 0 leaves them out).
 CHERRY_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 CHERRY_SRC ?= $(CHERRY_DIR)/CherryUSB
 
@@ -49,6 +51,20 @@ AICWF_CFLAGS := $(CFLAGS) -std=gnu11 -Wno-unused-function -Wno-format \
 CHERRY_OBJS := $(addprefix $(B)/cherry_, usbh_core.o usbh_hub.o $(CHERRY_HCD_OBJ) usb_osal_rtems.o \
 	usb_glue_zynq.o aicwf_cherry_classes.o aicwf_cherry_modeswitch.o aicwf_cherry.o)
 
+# ---- USB Ethernet (net/): CherryUSB class drivers + libbsd ifnet glue ----
+# The class table moves to net/usbnet_classes.c (hub, Ethernet classes, then the AIC adapter),
+# so aicwf_cherry_classes.o leaves the link; the glue uses aicwf_ifnet_* from libbsd.a.
+CHERRY_USBNET ?= 1
+ifeq ($(CHERRY_USBNET),1)
+CHERRY_CFLAGS += -I$(CHERRY_SRC)/class/cdc -I$(CHERRY_SRC)/class/vendor/net
+CFLAGS += -DNEXUS_USBNET -I$(CHERRY_DIR)/net
+CHERRY_OBJS := $(filter-out $(B)/cherry_aicwf_cherry_classes.o,$(CHERRY_OBJS)) \
+	$(addprefix $(B)/cherry_, usbh_rtl8152.o usbh_asix.o usbh_cdc_ecm.o usbh_cdc_ncm.o usbnet.o usbnet_classes.o)
+$(B)/netcmd.o: $(CHERRY_DIR)/net/usbnet.h
+else ifneq ($(CHERRY_USBNET),0)
+$(error cherryusb: CHERRY_USBNET must be 0 or 1, not $(CHERRY_USBNET))
+endif
+
 # usbh_shim.c is replaced: out of the link, and its prerequisite slot (already on the image
 # rule from aicwf.mk) becomes an empty object
 CONFIG_OBJS := $(filter-out $(B)/aicwf_usbh_shim.o,$(CONFIG_OBJS)) $(CHERRY_OBJS)
@@ -66,6 +82,14 @@ $(B)/aicwf_usbh_shim.o: | $(B)
 $(B)/cherry_%.o: $(CHERRY_SRC)/core/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
 	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
 $(B)/cherry_%.o: $(CHERRY_SRC)/class/hub/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
+	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
+$(B)/cherry_%.o: $(CHERRY_SRC)/class/cdc/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
+	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
+$(B)/cherry_%.o: $(CHERRY_SRC)/class/vendor/net/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
+	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
+$(B)/cherry_usbnet.o: $(CHERRY_DIR)/net/usbnet.c $(CHERRY_DIR)/net/usbnet.h $(AICWF_DIR)/aicwf_usbif.h $(CHERRY_DIR)/config/usb_config.h | $(B)
+	$(CC) $(CHERRY_CFLAGS) -I$(AICWF_DIR) -c $< -o $@
+$(B)/cherry_usbnet_classes.o: $(CHERRY_DIR)/net/usbnet_classes.c $(CHERRY_DIR)/config/usb_config.h | $(B)
 	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
 $(B)/cherry_%.o: $(CHERRY_SRC)/port/ehci/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
 	$(CC) $(CHERRY_CFLAGS) -c $< -o $@

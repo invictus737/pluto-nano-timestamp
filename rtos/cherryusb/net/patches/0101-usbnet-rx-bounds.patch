@@ -1,0 +1,176 @@
+USB Ethernet class drivers of CherryUSB v1.6.1 (rtos/cherryusb/net): receive-path hardening only.
+- rtl8152, asix, cdc_ncm: an unterminated receive that fills the buffer is dropped and the
+  stream resynchronised instead of spinning forever in while (1) {} at the rx thread's priority.
+- rtl8152: aggregate walk bounded by the received length (a bad descriptor or the missing
+  RX_ALIGN pad after the last frame underflowed the uint32 length and read past the buffer).
+- asix: same bounded walk, frames 2-byte aligned (Linux asix_rx_fixup_internal); ZLP test
+  precedence fixed (!(x) % mps was always 0); rx/tx buffer sizes were swapped.
+- cdc_ncm: NDP and datagram index/length checked against the received block.
+
+diff --git a/class/cdc/usbh_cdc_ncm.c b/class/cdc/usbh_cdc_ncm.c
+index fa2ccc0..9d4f707 100644
+--- a/class/cdc/usbh_cdc_ncm.c
++++ b/class/cdc/usbh_cdc_ncm.c
+@@ -305,6 +305,11 @@ find_class:
+                 continue;
+             }
+ 
++            if ((uint32_t)nth16->wNdpIndex + 8 > g_cdc_ncm_rx_length) {
++                USB_LOG_ERR("invalid rx ndp16 index\r\n");
++                g_cdc_ncm_rx_length = 0;
++                continue;
++            }
+             struct cdc_ncm_ndp16 *ndp16 = (struct cdc_ncm_ndp16 *)&g_cdc_ncm_rx_buffer[nth16->wNdpIndex];
+             if ((ndp16->dwSignature != CDC_NCM_NDP16_SIGNATURE_NCM0) && (ndp16->dwSignature != CDC_NCM_NDP16_SIGNATURE_NCM1)) {
+                 USB_LOG_ERR("invalid rx ndp16\r\n");
+@@ -312,12 +317,16 @@ find_class:
+                 continue;
+             }
+ 
+-            uint16_t datagram_num = (ndp16->wLength - 8) / 4;
++            uint16_t datagram_num = ndp16->wLength >= 8 ? (ndp16->wLength - 8) / 4 : 0;
++            if ((uint32_t)nth16->wNdpIndex + 8 + 4 * datagram_num > g_cdc_ncm_rx_length) {
++                datagram_num = (g_cdc_ncm_rx_length - nth16->wNdpIndex - 8) / 4;
++            }
+ 
+             USB_LOG_DBG("datagram num:%02x\r\n", datagram_num);
+             for (uint16_t i = 0; i < datagram_num; i++) {
+                 struct cdc_ncm_ndp16_datagram *ndp16_datagram = (struct cdc_ncm_ndp16_datagram *)&g_cdc_ncm_rx_buffer[nth16->wNdpIndex + 8 + 4 * i];
+-                if (ndp16_datagram->wDatagramIndex && ndp16_datagram->wDatagramLength) {
++                if (ndp16_datagram->wDatagramIndex && ndp16_datagram->wDatagramLength &&
++                    (uint32_t)ndp16_datagram->wDatagramIndex + ndp16_datagram->wDatagramLength <= g_cdc_ncm_rx_length) {
+                     USB_LOG_DBG("ndp16_datagram index:%02x, length:%02x\r\n", ndp16_datagram->wDatagramIndex, ndp16_datagram->wDatagramLength);
+ 
+                     uint8_t *buf = (uint8_t *)&g_cdc_ncm_rx_buffer[ndp16_datagram->wDatagramIndex];
+@@ -333,8 +342,7 @@ find_class:
+             if ((g_cdc_ncm_rx_length + (16 * 1024)) > CONFIG_USBHOST_CDC_NCM_ETH_MAX_RX_SIZE) {
+ #endif
+                 USB_LOG_ERR("Rx packet is overflow, please reduce tcp window size or increase CONFIG_USBHOST_CDC_NCM_ETH_MAX_RX_SIZE\r\n");
+-                while (1) {
+-                }
++                g_cdc_ncm_rx_length = 0; /* drop the unterminated transfer and resynchronise (was: spin forever) */
+             }
+         }
+     }
+diff --git a/class/vendor/net/usbh_asix.c b/class/vendor/net/usbh_asix.c
+index ffa1ed5..545f8cc 100644
+--- a/class/vendor/net/usbh_asix.c
++++ b/class/vendor/net/usbh_asix.c
+@@ -15,8 +15,8 @@
+ 
+ static struct usbh_asix g_asix_class;
+ 
+-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_asix_rx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_ASIX_ETH_MAX_TX_SIZE, CONFIG_USB_ALIGN_SIZE)];
+-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_asix_tx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE, CONFIG_USB_ALIGN_SIZE)];
++static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_asix_rx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE, CONFIG_USB_ALIGN_SIZE)];
++static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_asix_tx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_ASIX_ETH_MAX_TX_SIZE, CONFIG_USB_ALIGN_SIZE)];
+ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_asix_inttx_buffer[USB_ALIGN_UP(16, CONFIG_USB_ALIGN_SIZE)];
+ 
+ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_asix_buf[USB_ALIGN_UP(32, CONFIG_USB_ALIGN_SIZE)];
+@@ -723,25 +723,20 @@ find_class:
+             USB_LOG_DBG("rxlen:%d\r\n", g_asix_rx_length);
+ 
+             data_offset = 0;
+-            while (g_asix_rx_length > 0) {
++            while (data_offset + 4 <= g_asix_rx_length) {
+                 len = ((uint16_t)g_asix_rx_buffer[data_offset + 0] | ((uint16_t)(g_asix_rx_buffer[data_offset + 1]) << 8)) & 0x7ff;
+                 len_crc = g_asix_rx_buffer[data_offset + 2] | ((uint16_t)(g_asix_rx_buffer[data_offset + 3]) << 8);
+ 
+-                if (len != (~len_crc & 0x7ff)) {
++                if (len != (~len_crc & 0x7ff) || len == 0 || data_offset + 4 + len > g_asix_rx_length) {
+                     USB_LOG_ERR("rx header error\r\n");
+-                    g_asix_rx_length = 0;
+-                    continue;
++                    break;
+                 }
+ 
+                 uint8_t *buf = (uint8_t *)&g_asix_rx_buffer[data_offset + 4];
+                 usbh_asix_eth_input(buf, len);
+-                g_asix_rx_length -= (len + 4);
+-                data_offset += (len + 4);
+-
+-                if (g_asix_rx_length < 4) {
+-                    g_asix_rx_length = 0;
+-                }
++                data_offset += 4 + ((len + 1) & 0xfffe);
+             }
++            g_asix_rx_length = 0;
+         } else {
+ #if CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE <= (16 * 1024)
+             if (g_asix_rx_length == CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE) {
+@@ -749,8 +744,7 @@ find_class:
+             if ((g_asix_rx_length + (16 * 1024)) > CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE) {
+ #endif
+                 USB_LOG_ERR("Rx packet is overflow, please reduce tcp window size or increase CONFIG_USBHOST_ASIX_ETH_MAX_RX_SIZE\r\n");
+-                while (1) {
+-                }
++                g_asix_rx_length = 0; /* drop the unterminated transfer and resynchronise (was: spin forever) */
+             }
+         }
+     }
+@@ -779,7 +773,7 @@ int usbh_asix_eth_output(uint32_t buflen)
+     g_asix_tx_buffer[2] = ~g_asix_tx_buffer[0];
+     g_asix_tx_buffer[3] = ~g_asix_tx_buffer[1];
+ 
+-    if (!(buflen + 4) % USB_GET_MAXPACKETSIZE(g_asix_class.bulkout->wMaxPacketSize)) {
++    if (!((buflen + 4) % USB_GET_MAXPACKETSIZE(g_asix_class.bulkout->wMaxPacketSize))) {
+         USB_LOG_DBG("txlen:%d\r\n", buflen + 8);
+         g_asix_tx_buffer[buflen + 4 + 0] = 0x00;
+         g_asix_tx_buffer[buflen + 4 + 1] = 0x00;
+diff --git a/class/vendor/net/usbh_rtl8152.c b/class/vendor/net/usbh_rtl8152.c
+index 50269f2..5112c89 100644
+--- a/class/vendor/net/usbh_rtl8152.c
++++ b/class/vendor/net/usbh_rtl8152.c
+@@ -2188,27 +2188,30 @@ find_class:
+         */
+         if (g_rtl8152_rx_length % USB_GET_MAXPACKETSIZE(g_rtl8152_class.bulkin->wMaxPacketSize) ||
+             (g_rtl8152_class.bulkin_urb.actual_length < transfer_size)) {
+-            data_offset = 0;
++            uint32_t rx_offset = 0;
+ 
++            (void)data_offset;
+             USB_LOG_DBG("rxlen:%d\r\n", g_rtl8152_rx_length);
+-            while (g_rtl8152_rx_length > 0) {
+-                struct rx_desc *rx_desc = (struct rx_desc *)&g_rtl8152_rx_buffer[data_offset];
++            /* bounded walk (Linux r8152 rx_bottom): a descriptor that runs past the data ends
++             * the aggregate, the last frame needs no RX_ALIGN padding after it */
++            while (rx_offset + sizeof(struct rx_desc) <= g_rtl8152_rx_length) {
++                struct rx_desc *rx_desc = (struct rx_desc *)&g_rtl8152_rx_buffer[rx_offset];
+ 
+                 len = rx_desc->opts1 & RX_LEN_MASK;
++                if (len == 0 || rx_offset + sizeof(struct rx_desc) + len > g_rtl8152_rx_length) {
++                    USB_LOG_ERR("rx desc at %u: len %u past %u\r\n", (unsigned int)rx_offset, (unsigned int)len, (unsigned int)g_rtl8152_rx_length);
++                    break;
++                }
+ 
+-                USB_LOG_DBG("data_offset:%d, eth len:%d\r\n", data_offset, len);
++                USB_LOG_DBG("data_offset:%d, eth len:%d\r\n", rx_offset, len);
+ 
+-                uint8_t *buf = (uint8_t *)&g_rtl8152_rx_buffer[data_offset + sizeof(struct rx_desc)];
++                uint8_t *buf = (uint8_t *)&g_rtl8152_rx_buffer[rx_offset + sizeof(struct rx_desc)];
+                 usbh_rtl8152_eth_input(buf, len);
+ 
+-                data_offset += (len + sizeof(struct rx_desc));
+-                g_rtl8152_rx_length -= (len + sizeof(struct rx_desc));
+-
+-                if (len & (RX_ALIGN - 1)) {
+-                    data_offset += (RX_ALIGN - (len & (RX_ALIGN - 1)));
+-                    g_rtl8152_rx_length -= (RX_ALIGN - (len & (RX_ALIGN - 1)));
+-                }
++                rx_offset += sizeof(struct rx_desc) + len;
++                rx_offset = (rx_offset + RX_ALIGN - 1) & ~(uint32_t)(RX_ALIGN - 1);
+             }
++            g_rtl8152_rx_length = 0;
+         } else {
+ #if CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SIZE <= (16 * 1024)
+             if (g_rtl8152_rx_length == CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SIZE) {
+@@ -2216,8 +2219,7 @@ find_class:
+             if ((g_rtl8152_rx_length + (16 * 1024)) > CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SIZE) {
+ #endif
+                 USB_LOG_ERR("Rx packet is overflow, please reduce tcp window size or increase CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SIZE\r\n");
+-                while (1) {
+-                }
++                g_rtl8152_rx_length = 0; /* drop the unterminated transfer and resynchronise (was: spin forever) */
+             }
+         }
+     }

@@ -1,0 +1,30 @@
+USB Ethernet (rtos/cherryusb/net): the RTL8152 and ASIX class driver objects get external
+linkage like cdc_ecm_class_driver/cdc_ncm_class_driver already have, so the image's own class
+table (net/usbnet_classes.c; the RTEMS link has no .usbh_class_info section) can name them.
+
+diff --git a/class/vendor/net/usbh_asix.c b/class/vendor/net/usbh_asix.c
+index 545f8cc..95444c1 100644
+--- a/class/vendor/net/usbh_asix.c
++++ b/class/vendor/net/usbh_asix.c
+@@ -795,7 +795,7 @@ static const uint16_t asix_id_table[][2] = {
+     { 0, 0 },
+ };
+ 
+-static const struct usbh_class_driver asix_class_driver = {
++const struct usbh_class_driver asix_class_driver = {
+     .driver_name = "asix",
+     .connect = usbh_asix_connect,
+     .disconnect = usbh_asix_disconnect
+diff --git a/class/vendor/net/usbh_rtl8152.c b/class/vendor/net/usbh_rtl8152.c
+index 5112c89..59687fc 100644
+--- a/class/vendor/net/usbh_rtl8152.c
++++ b/class/vendor/net/usbh_rtl8152.c
+@@ -2258,7 +2258,7 @@ static const uint16_t rtl_id_table[][2] = {
+     { 0, 0 },
+ };
+ 
+-static const struct usbh_class_driver rtl8152_class_driver = {
++const struct usbh_class_driver rtl8152_class_driver = {
+     .driver_name = "rtl8152",
+     .connect = usbh_rtl8152_connect,
+     .disconnect = usbh_rtl8152_disconnect
