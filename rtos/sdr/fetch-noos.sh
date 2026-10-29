@@ -4,6 +4,7 @@
 # minimal no_os_* utility, allocation, delay, SPI and GPIO interfaces the driver needs. Only that
 # subset is extracted. The native Pluto driver (rtos/sdr/pluto_rtems) provides the RTEMS platform
 # layer (platform_*.c) and its own AXI DMAC streaming engine.
+# Then applies rtos/sdr/noos-patches/*.patch (error unwinding fixes of the driver).
 # usage: rtos/sdr/fetch-noos.sh <destination dir>   (creates <dest>/no-OS)
 set -euo pipefail
 DEST=${1:?destination}
@@ -22,6 +23,11 @@ tar xzf "$W/noos.tar.gz" -C "$W" \
   "$P/drivers/api/no_os_spi.c" "$P/drivers/api/no_os_gpio.c" \
   "$P/util/no_os_util.c" "$P/util/no_os_alloc.c" "$P/util/no_os_mutex.c" \
   "$P/include" "$P/LICENSE"
+HERE=$(cd "$(dirname "$0")" && pwd)
+for p in $(ls "$HERE"/noos-patches/*.patch 2>/dev/null | sort); do
+  echo "no-OS patch $(basename "$p")"
+  patch -d "$W/$P" -p1 --no-backup-if-mismatch -s < "$p"
+done
 rm -rf "$DEST/no-OS"
 mkdir -p "$DEST"
 mv "$W/$P" "$DEST/no-OS"

@@ -1,0 +1,161 @@
+ad9361_init: check every resource and release it on failure; ad9361_remove frees the ADC core;
+the sampling frequency setters fail when the clock chain did not apply (as Linux does).
+
+- axi_adc_init() fails ("cf-ad9361-lpc: Status errors", no DATA_CLK from the transceiver) and
+  leaves phy->rx_adc NULL; ad9361_init ignored that and dereferenced it in axi_adc_read() and
+  ad9361_post_setup(): a data abort. Now -EIO and a clean unwind.
+- the GPIO and SPI descriptors (and the ADC core) leaked on every failed init; a caller that
+  retries the init leaked them on every attempt. *ad9361_phy is NULL after a failure.
+- ad9361_set_rx/tx_sampling_freq ignored the ad9361_set_trx_clock_chain() result and went on to
+  the RF bandwidth update and TX quadrature calibration on a half-applied clock chain.
+
+--- a/drivers/rf-transceiver/ad9361/ad9361_api.c	2026-10-29 12:08:06
++++ b/drivers/rf-transceiver/ad9361/ad9361_api.c	2026-10-29 12:08:28
+@@ -483,17 +483,30 @@
+ 
+ 	phy->pdata->debug_mode = true;
+ 
+-	no_os_gpio_get(&phy->gpio_desc_resetb, &init_param->gpio_resetb);
++	/* Nexus: every resource is checked and released on failure (out_res) */
++	ret = no_os_gpio_get(&phy->gpio_desc_resetb, &init_param->gpio_resetb);
++	if (ret < 0)
++		goto out_res;
+ 	/* Optional: next three GPIOs are used for MCS synchronization */
+-	no_os_gpio_get_optional(&phy->gpio_desc_sync, &init_param->gpio_sync);
+-	no_os_gpio_get_optional(&phy->gpio_desc_cal_sw1, &init_param->gpio_cal_sw1);
+-	no_os_gpio_get_optional(&phy->gpio_desc_cal_sw2, &init_param->gpio_cal_sw2);
++	ret = no_os_gpio_get_optional(&phy->gpio_desc_sync, &init_param->gpio_sync);
++	if (ret < 0)
++		goto out_res;
++	ret = no_os_gpio_get_optional(&phy->gpio_desc_cal_sw1, &init_param->gpio_cal_sw1);
++	if (ret < 0)
++		goto out_res;
++	ret = no_os_gpio_get_optional(&phy->gpio_desc_cal_sw2, &init_param->gpio_cal_sw2);
++	if (ret < 0)
++		goto out_res;
+ 
+ 	no_os_gpio_direction_output(phy->gpio_desc_resetb, 0);
+ 
+ 	no_os_gpio_direction_output(phy->gpio_desc_sync, 0);
+ 
+-	no_os_spi_init(&phy->spi, &init_param->spi_param);
++	ret = no_os_spi_init(&phy->spi, &init_param->spi_param);
++	if (ret < 0) {
++		phy->spi = NULL;
++		goto out_res;
++	}
+ 
+ 	phy->pdata->port_ctrl.digital_io_ctrl = 0;
+ 	phy->pdata->port_ctrl.lvds_invert[0] = init_param->lvds_invert1_control;
+@@ -533,10 +546,10 @@
+ 	ad9361_reset(phy);
+ 
+ 	ret = ad9361_spi_read(phy->spi, REG_PRODUCT_ID);
+-	if ((ret & PRODUCT_ID_MASK) != PRODUCT_ID_9361) {
+-		printf("%s : Unsupported PRODUCT_ID 0x%X", __func__, (unsigned int)ret);
++	if (ret < 0 || (ret & PRODUCT_ID_MASK) != PRODUCT_ID_9361) {
++		printf("%s : Unsupported PRODUCT_ID 0x%X\n", __func__, (unsigned int)ret);
+ 		ret = -ENODEV;
+-		goto out;
++		goto out_res;
+ 	}
+ 	rev = ret & REV_MASK;
+ 
+@@ -546,14 +559,22 @@
+ 
+ 	ret = ad9361_register_clocks(phy);
+ 	if (ret < 0)
+-		goto out;
++		goto out_clk;
+ 
+ 	ret = ad9361_setup(phy);
+ 	if (ret < 0)
+ 		goto out_clk;
+ 
+ #ifndef AXI_ADC_NOT_PRESENT
+-	axi_adc_init(&phy->rx_adc, init_param->rx_adc_init);
++	/* a failed core init leaves rx_adc NULL: everything below dereferences it */
++	ret = axi_adc_init(&phy->rx_adc, init_param->rx_adc_init);
++	if (ret != 0 || !phy->rx_adc) {
++		phy->rx_adc = NULL;
++		printf("%s : AXI ADC core not ready (no data clock from the AD936x)\n",
++		       __func__);
++		ret = -EIO;
++		goto out_clk;
++	}
+ 	axi_adc_read(phy->rx_adc, ADI_REG_VERSION, &phy->adc_state->pcore_version);
+ 	/* platform specific wrapper to call ad9361_post_setup() */
+ 	ret = ad9361_post_setup(phy);
+@@ -569,17 +590,28 @@
+ 
+ out_clk:
+ 	ad9361_unregister_clocks(phy);
+-out:
++out_res:
+ #ifndef AXI_ADC_NOT_PRESENT
++	if (phy->rx_adc)
++		axi_adc_remove(phy->rx_adc);
++#endif
++	if (phy->spi)
++		no_os_spi_remove(phy->spi);
++	no_os_gpio_remove(phy->gpio_desc_resetb);
++	no_os_gpio_remove(phy->gpio_desc_sync);
++	no_os_gpio_remove(phy->gpio_desc_cal_sw1);
++	no_os_gpio_remove(phy->gpio_desc_cal_sw2);
++#ifndef AXI_ADC_NOT_PRESENT
+ 	no_os_free(phy->adc_conv);
+ 	no_os_free(phy->adc_state);
+ #endif
+ 	no_os_free(phy->clk_refin);
+ 	no_os_free(phy->pdata);
+ 	no_os_free(phy);
+-	printf("%s : AD936x initialization error\n", __func__);
++	*ad9361_phy = NULL;
++	printf("%s : AD936x initialization error (%d)\n", __func__, (int)ret);
+ 
+-	return -ENODEV;
++	return ret < 0 ? ret : -ENODEV;
+ }
+ 
+ /**
+@@ -589,8 +621,15 @@
+  */
+ int32_t ad9361_remove(struct ad9361_rf_phy *phy)
+ {
++	if (!phy)
++		return -EINVAL;
+ 	ad9361_unregister_clocks(phy);
+-	no_os_spi_remove(phy->spi);
++#ifndef AXI_ADC_NOT_PRESENT
++	if (phy->rx_adc)
++		axi_adc_remove(phy->rx_adc);
++#endif
++	if (phy->spi)
++		no_os_spi_remove(phy->spi);
+ 	no_os_gpio_remove(phy->gpio_desc_resetb);
+ 	no_os_gpio_remove(phy->gpio_desc_sync);
+ 	no_os_gpio_remove(phy->gpio_desc_cal_sw1);
+@@ -835,7 +874,10 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ad9361_set_trx_clock_chain(phy, rx, tx);
++	/* Linux: a clock chain that did not apply is an error, no BW update/TX quad cal */
++	ret = ad9361_set_trx_clock_chain(phy, rx, tx);
++	if (ret < 0)
++		return ret;
+ 
+ 	ret = ad9361_update_rf_bandwidth(phy, phy->current_rx_bw_Hz,
+ 					 phy->current_tx_bw_Hz);
+@@ -1475,7 +1517,10 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ad9361_set_trx_clock_chain(phy, rx, tx);
++	/* Linux: a clock chain that did not apply is an error, no BW update/TX quad cal */
++	ret = ad9361_set_trx_clock_chain(phy, rx, tx);
++	if (ret < 0)
++		return ret;
+ 
+ 	ret = ad9361_update_rf_bandwidth(phy, phy->current_rx_bw_Hz,
+ 					 phy->current_tx_bw_Hz);
