@@ -191,6 +191,8 @@ static void *reader_main(void *arg)
     if (n > 0) {
       parse(&p, chunk, (size_t)n);
     } else if (n < 0) {
+      /* the controller went away (a shim that reports it): the manager restarts Bluetooth */
+      atomic_store(&st_failed, 1);
       struct timespec ts = {0, 50 * 1000000L};
       nanosleep(&ts, NULL);
     }
