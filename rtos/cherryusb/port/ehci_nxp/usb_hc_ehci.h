@@ -158,6 +158,7 @@ struct ehci_nxp_stats {
     uint32_t xacterr_restarts, stalls, halted_restarts;
     uint32_t no_qtd, no_xfer, no_pipe;
     uint32_t ep_updates;          /* endpoint characteristics rewritten in place (EP0 address/mps) */
+    uint32_t toggle_sets;         /* idle pipe toggle changed (URB data_toggle, CLEAR_FEATURE(HALT)) */
     uint32_t max_handshake_us;
 };
 

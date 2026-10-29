@@ -724,8 +724,14 @@ void ehci_nxp_close_hport(struct usbh_bus *bus, struct usbh_hubport *hport)
     }
 }
 
-/* data toggle of an idle bulk/interrupt pipe (overlay inactive, no qTD active behind it) */
-static void ehci_pipe_set_toggle(struct ehci_nxp_pipe *p, bool dt)
+static void ehci_stop_schedule(struct usbh_bus *bus, struct ehci_nxp_pipe *p);
+static void ehci_start_schedule(struct usbh_bus *bus, struct ehci_nxp_pipe *p);
+
+/*
+ * data toggle of an idle bulk/interrupt pipe (overlay inactive, no qTD active behind it); the
+ * overlay of a linked QH is only written with its schedule stopped, so only when it changes
+ */
+static void ehci_pipe_set_toggle(struct usbh_bus *bus, struct ehci_nxp_pipe *p, bool dt)
 {
     uint32_t tok = p->qh->hw.overlay.token;
 
@@ -733,7 +739,15 @@ static void ehci_pipe_set_toggle(struct ehci_nxp_pipe *p, bool dt)
         return;
     }
     if (((tok & QTD_TOKEN_TOGGLE) != 0) != dt) {
+        if (p->linked) {
+            ehci_stop_schedule(bus, p);
+        }
+        tok = p->qh->hw.overlay.token;
         p->qh->hw.overlay.token = (tok & ~QTD_TOKEN_TOGGLE) | (dt ? QTD_TOKEN_TOGGLE : 0);
+        hcd_of(bus)->stats.toggle_sets++;
+        if (p->linked) {
+            ehci_start_schedule(bus, p);
+        }
     }
 }
 
@@ -855,9 +869,9 @@ static int ehci_xfer_queue(struct usbh_bus *bus, struct ehci_nxp_pipe *p, struct
     if (p->head == NULL) {
         if (p->reset_toggle) {
             p->reset_toggle = 0;
-            ehci_pipe_set_toggle(p, false);
+            ehci_pipe_set_toggle(bus, p, false);
         } else {
-            ehci_pipe_set_toggle(p, urb->data_toggle != 0);
+            ehci_pipe_set_toggle(bus, p, urb->data_toggle != 0);
         }
     }
 
@@ -955,7 +969,7 @@ static void ehci_note_clear_halt(struct usbh_bus *bus, struct ehci_nxp_pipe *ctr
         return;
     }
     if (p->head == NULL) {
-        ehci_pipe_set_toggle(p, false);
+        ehci_pipe_set_toggle(bus, p, false);
     } else {
         p->reset_toggle = 1;
     }
