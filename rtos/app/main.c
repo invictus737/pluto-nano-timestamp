@@ -44,6 +44,7 @@
 #include <bsp.h>
 
 #include "config_store.h"
+#include "netcmd.h"
 #include "ssh_server.h"
 
 int nexus_wifi_start(const char *ssid, const char *psk);
@@ -228,6 +229,10 @@ static void resolv_conf_write_locked(void)
   if (o == 0) {
     return; /* keep the last servers while no interface has a lease */
   }
+  /* 2 s per server and 2 rounds (default 5 s x 2): a server behind a lost link costs less */
+  if (o < sizeof(buf) - 32) {
+    o += (size_t)snprintf(buf + o, sizeof(buf) - o, "options timeout:2 attempts:2\n");
+  }
   int fd = open("/etc/resolv.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd >= 0) {
     (void)write(fd, buf, o);
@@ -246,8 +251,10 @@ static void dhcpcd_hook_handler(rtems_dhcpcd_hook *hook, char *const *env)
   int bound = strcmp(reason, "BOUND") == 0 || strcmp(reason, "RENEW") == 0 ||
               strcmp(reason, "REBIND") == 0 || strcmp(reason, "REBOOT") == 0 ||
               strcmp(reason, "INFORM") == 0 || strcmp(reason, "STATIC") == 0;
+  /* NOCARRIER too: a dead link's servers would cost every lookup a resolver timeout */
   int gone = strcmp(reason, "EXPIRE") == 0 || strcmp(reason, "RELEASE") == 0 ||
-             strcmp(reason, "STOP") == 0 || strcmp(reason, "DEPARTED") == 0;
+             strcmp(reason, "STOP") == 0 || strcmp(reason, "DEPARTED") == 0 ||
+             strcmp(reason, "NOCARRIER") == 0;
   if (!bound && !gone) {
     return;
   }
@@ -445,18 +452,14 @@ static void *sntp_main(void *arg)
 
 static void start_dhcpcd(void)
 {
-  /* fast lease: no ARP collision probe, IPv4 only (no IPv6 router solicitation wait); DNS and
-   * NTP servers reach dhcpcd_hook_handler; the host name goes to the DHCP server */
-  static const char cfg[] = "clientid nexus-rtos\nbackground\nhostname\n"
-                            "option domain_name_servers, domain_name, ntp_servers\n"
-                            "noarp\nipv4only\nnoipv6rs\n";
+  /* /etc/dhcpcd.conf from netcmd.c: fast lease (no ARP collision probe; the kernel still sends
+   * a gratuitous ARP for every new address), IPv4 only, DNS and NTP servers to
+   * dhcpcd_hook_handler, the host name to the DHCP server, and per interface either DHCP or the
+   * static [WLAN]/[USB_ETHERNET] address (dhcpcd applies it itself, also on hotplug). Before
+   * nexus_config_init() it holds DHCP for all; nx_net_start() re-applies after the config. */
   rtems_dhcpcd_add_hook(&dhcpcd_hook);
-  int fd = open("/etc/dhcpcd.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-  if (fd >= 0) {
-    (void)write(fd, cfg, sizeof(cfg) - 1);
-    close(fd);
-  }
-  rtems_status_code sc = rtems_dhcpcd_start(NULL);
+  nx_net_dhcpcd_conf_write();
+  rtems_status_code sc = rtems_dhcpcd_start(nx_net_dhcpcd_config());
   if (sc != RTEMS_SUCCESSFUL) {
     printf("dhcpcd: start failed (%d)\n", (int)sc);
   }
@@ -622,6 +625,9 @@ static void Init(rtems_task_argument arg)
       (void)sethostname(hn, strlen(hn));
     }
   }
+  /* ---- netcmd: static addresses from the config, `net` shell command (netcmd.c) ---- */
+  nx_net_start();
+  /* ---- end netcmd ---- */
 
   /* Wi-Fi: first configured network (config.txt / build default); the driver keeps the
    * station connected across link loss and replug, dhcpcd follows wlan0 */
@@ -698,144 +704,13 @@ SYSINIT_DRIVER_REFERENCE(urtw, uhub);
 #endif
 
 /*
- * net80211 sticks (rtwn: Realtek RTL8188/8192/8812/8821): the AIC driver brings its own station,
- * these need wlan0 cloned on the parent device and wpa_supplicant. A thread waits for the first
- * parent in net.wlan.devices (USB hotplug), then creates wlan0 and starts the supplicant; dhcpcd
- * already follows every interface. Checked every 200 ms, nothing else to do once running.
+ * net80211 sticks (rtwn, run, rum, ural, zyd, urtw): the AIC driver brings its own station,
+ * these need a wlan clone and wpa_supplicant. netcmd.c supervises both across hotplug (wlan1 /
+ * wlan2 per stick, one supplicant instance restarted when the set of sticks changes).
  */
-#include <sys/sysctl.h>
-#include <machine/rtems-bsd-commands.h>
-
-static const char *w80211_ssid, *w80211_psk;
-
-static int w80211_parent(char *dev, size_t cap)
-{
-  char list[128];
-  size_t len = sizeof(list) - 1;
-  if (sysctlbyname("net.wlan.devices", list, &len, NULL, 0) != 0 || len == 0) {
-    return -1;
-  }
-  list[len] = '\0';
-  char *save = NULL;
-  for (char *t = strtok_r(list, " ", &save); t != NULL; t = strtok_r(NULL, " ", &save)) {
-    if (strncmp(t, "aicwf", 5) != 0 && strlen(t) < cap) { /* the AIC driver has its own station */
-      strcpy(dev, t);
-      return 0;
-    }
-  }
-  return -1;
-}
-
-static void w80211_quote(FILE *f, const char *k, const char *v)
-{
-  fprintf(f, "\t%s=\"", k);
-  for (; *v != '\0'; v++) {
-    if (*v == '"' || *v == '\\') {
-      fputc('\\', f);
-    }
-    fputc(*v, f);
-  }
-  fputs("\"\n", f);
-}
-
-static void w80211_network(FILE *f, const char *ssid, const char *psk, int prio)
-{
-  fputs("network={\n", f);
-  w80211_quote(f, "ssid", ssid);
-  size_t n = psk != NULL ? strlen(psk) : 0;
-  if (n == 0) {
-    fputs("\tkey_mgmt=NONE\n", f);
-  } else if (n == 64 && strspn(psk, "0123456789abcdefABCDEF") == 64) {
-    fprintf(f, "\tpsk=%s\n", psk); /* raw 256-bit key, unquoted */
-  } else {
-    w80211_quote(f, "psk", psk);
-  }
-  fprintf(f, "\tscan_ssid=1\n\tpriority=%d\n}\n", prio);
-}
-
-/* every configured network (config.txt [WIFI] slots), the first slot preferred */
-static int w80211_conf(void)
-{
-  FILE *f = fopen("/etc/wpa_supplicant.conf", "w");
-  if (f == NULL) {
-    return -1;
-  }
-  fputs("ap_scan=1\n", f);
-  int count = 0;
-  for (int i = 0; i < 16; i++) {
-    const char *ssid = NULL, *psk = NULL;
-    if (nexus_config_wifi(i, &ssid, &psk) == 0 && ssid != NULL && ssid[0] != '\0') {
-      w80211_network(f, ssid, psk, 16 - i);
-      count++;
-    }
-  }
-  if (count == 0 && w80211_ssid != NULL) {
-    w80211_network(f, w80211_ssid, w80211_psk, 1);
-    count = 1;
-  }
-  fclose(f);
-  return count;
-}
-
-/*
- * Hotplug: a parent device (rtwn0, run0, ...) can arrive or leave at any time. wlan0 is cloned
- * on it when it appears (wlan1 if the AIC station already owns wlan0) and wpa_supplicant is
- * started for that interface; when the stick leaves, net80211 destroys the clone with it and the
- * loop waits for the next one. One supplicant per interface name, started once.
- */
-static void *w80211_main(void *arg)
-{
-  (void)arg;
-  static bool supplicant[2];
-  char dev[32];
-  for (;;) {
-    while (w80211_parent(dev, sizeof(dev)) != 0) {
-      usleep(200000);
-    }
-    unsigned int n = if_nametoindex("wlan0") != 0 && if_nametoindex("wlan1") == 0 ? 1 : 0;
-    char ifn[8];
-    snprintf(ifn, sizeof(ifn), "wlan%u", n);
-    if (if_nametoindex(ifn) == 0) {
-      printf("wifi: %s (net80211), creating %s\n", dev, ifn);
-      char *av[] = {"ifconfig", ifn, "create", "wlandev", dev, "up", NULL};
-      optind = 0; /* newlib getopt keeps its state across libbsd programs: 0 = reinitialise */
-      if (rtems_bsd_command_ifconfig(6, av) != 0) {
-        printf("wifi: %s on %s not created\n", ifn, dev);
-        sleep(2);
-        continue;
-      }
-    }
-    if (!supplicant[n]) {
-      int nets = w80211_conf();
-      if (nets > 0) {
-        char iarg[12];
-        snprintf(iarg, sizeof(iarg), "-i%s", ifn);
-        char *wv[] = {"wpa_supplicant", "-s", "-Dbsd", iarg, "-c", "/etc/wpa_supplicant.conf", NULL};
-        optind = 0;
-        int rc = rtems_bsd_command_wpa_supplicant_fork(6, wv);
-        supplicant[n] = rc == 0;
-        printf("wifi: wpa_supplicant on %s, %d network(s), %s\n", ifn, nets,
-               rc == 0 ? "started" : "failed");
-      }
-    }
-    /* stay on this parent until it leaves (the clone goes with it) */
-    while (w80211_parent(dev, sizeof(dev)) == 0 && if_nametoindex(ifn) != 0) {
-      usleep(500000);
-    }
-  }
-  return NULL;
-}
-
 static void wifi80211_start(const char *ssid, const char *psk)
 {
-#ifdef RTEMS_BSD_MODULE_NET80211
-  w80211_ssid = ssid;
-  w80211_psk = psk;
-  spawn(w80211_main, 5, 16384);
-#else
-  (void)ssid;
-  (void)psk;
-#endif
+  nx_wifi80211_start(ssid, psk);
 }
 
 #define RTEMS_BSD_CONFIG_NET_PF_UNIX

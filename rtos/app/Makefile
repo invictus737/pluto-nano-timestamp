@@ -58,6 +58,12 @@ $(B)/config_kv.o: config_kv.c config_kv.h | $(B)
 $(B)/qspi_nor.o: qspi_nor.c qspi_nor.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Network control (netcmd.c): `net` command, static/DHCP per interface, net80211 Wi-Fi
+# supervisor, tun. Rides along with the configuration objects (image and libnexusrtos.a).
+CONFIG_OBJS += $(B)/netcmd.o
+$(B)/netcmd.o: netcmd.c netcmd.h config_store.h ../libbsd/aic8800/aicwf_wifi.h | $(B)
+	$(CC) $(CFLAGS) -I../libbsd/aic8800 -c $< -o $@
+
 $(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) $(RUST_LIB)
 	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -ljffs2 -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
 	$(SIZE) $@

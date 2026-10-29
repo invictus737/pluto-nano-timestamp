@@ -8,6 +8,8 @@
  * set.
  *
  * Shell: wifi status | wifi scan | wifi join <ssid> [passphrase] | wifi leave
+ *        (connect/disconnect are aliases; without an AIC stick but with a net80211 stick
+ *        the command goes to the wpa_supplicant path in netcmd.c)
  *        | wifi wait [seconds]
  * Diagnostics: wifi fwdiag | wifi debug on|off | wifi fw auto|sdk5|legacy
  *        | wifi rescan | wifi reprobe
@@ -19,6 +21,7 @@
 #include <rtems/shell.h>
 
 #include "aicwf_wifi.h"
+#include "netcmd.h"
 
 int nexus_wifi_start(const char *ssid, const char *psk);
 int nexus_wifi_scan(void);
@@ -74,6 +77,14 @@ int nexus_wifi_scan(void)
 
 static int wifi_cmd(int argc, char **argv)
 {
+  struct aicwf_wifi_status ast;
+
+  if (nx_wifi80211_present() && (aicwf_wifi_status(&ast) != 0 || !ast.device_present))
+    return nx_wifi80211_cmd(argc, argv);
+  if (argc >= 2 && strcmp(argv[1], "connect") == 0)
+    argv[1] = "join";
+  else if (argc >= 2 && strcmp(argv[1], "disconnect") == 0)
+    argv[1] = "leave";
   if (argc < 2 || strcmp(argv[1], "status") == 0) {
     nexus_wifi_status();
     return 0;
