@@ -49,6 +49,14 @@ int pluto_rtems_pin_to_cpu(int cpu);
 /* create a driver thread with the RT attribute + hook; 0 ok, else errno */
 int pluto_rt_thread_create(pthread_t *thread, const char *name, void *(*fn)(void *), void *arg);
 
+/*
+ * Housekeeping thread of the driver (level/overflow log): SCHED_FIFO one step above the lowest
+ * POSIX priority, far below the radio and every nexus2 worker, pinned to CPU0 (away from a radio
+ * pinned to CPU1); without the pin when the scheduler refuses CPU0. The attribute hook is not
+ * applied. 0 ok, else errno.
+ */
+int pluto_rt_low_thread_create(pthread_t *thread, const char *name, void *(*fn)(void *), void *arg);
+
 /* apply the configured interrupt CPU (if pluto_rtems_pin_to_cpu was used) to one vector */
 void pluto_rt_irq_affinity(unsigned vector);
 

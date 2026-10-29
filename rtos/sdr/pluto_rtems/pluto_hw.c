@@ -41,17 +41,45 @@
 #include "pluto_probe.h"
 #include "pluto_regs.h"
 
-/* every phy access holds hw_lock; phy is only ever NULL or fully initialised */
-static pthread_mutex_t hw_lock = PTHREAD_MUTEX_INITIALIZER;
+/* every phy access holds hw_lock; phy is only ever NULL or fully initialised. The lock uses
+ * priority inheritance (RTEMS: OMIP on SMP): the low-priority level monitor takes it for the
+ * 0x05E read, and a radio thread waiting behind it must lift its holder. */
+static pthread_mutex_t hw_lock;
+static pthread_once_t hw_lock_once = PTHREAD_ONCE_INIT;
 static struct ad9361_rf_phy *phy;
 static unsigned users;          /* open SoapySDR devices sharing phy */
+static unsigned streams_active; /* active RX/TX streams over all devices (pluto_hw_stream_active) */
 static int suspect;             /* an operation failed: rebuild at the next open without users */
 static uint32_t cur_bb_rate;    /* AD9363 baseband rate last programmed */
 static int cur_fpga_fir = -1;   /* PL x8 FIR on/off */
 static int cur_band = -1;
 static uint32_t tx_fir_scale = 1; /* TX FIR taps x1 (Linux table) or x2 (unity /4 passband) */
 
-#define LOCK() pthread_mutex_lock(&hw_lock)
+static void hw_lock_init(void)
+{
+  pthread_mutexattr_t a;
+  int rc = pthread_mutexattr_init(&a);
+  if (rc == 0) {
+    rc = pthread_mutexattr_setprotocol(&a, PTHREAD_PRIO_INHERIT);
+    if (rc == 0)
+      rc = pthread_mutex_init(&hw_lock, &a);
+    pthread_mutexattr_destroy(&a);
+  }
+  if (rc != 0) {
+    printf("pluto: hw lock: priority inheritance refused (%d), plain mutex\n", rc);
+    pthread_mutex_init(&hw_lock, NULL);
+  } else {
+    printf("pluto: hw lock: priority inheritance\n");
+  }
+}
+
+static void hw_lock_acquire(void)
+{
+  pthread_once(&hw_lock_once, hw_lock_init);
+  pthread_mutex_lock(&hw_lock);
+}
+
+#define LOCK() hw_lock_acquire()
 #define UNLOCK() pthread_mutex_unlock(&hw_lock)
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
@@ -374,6 +402,32 @@ static int health_check(const char *when, int after_init)
   return ok ? 0 : -EIO;
 }
 
+/*
+ * The AD9363 runs full duplex (ENSM FDD, 0xA) whenever it is configured: every no-OS operation that
+ * forces ALERT (FIR load, rate, bandwidth/calibrations) must restore it. Checked and logged after
+ * init and after every rate/bandwidth/FIR change; a state left elsewhere is forced back to FDD once,
+ * and the phy is marked suspect when that fails. Caller holds hw_lock, phy != NULL.
+ */
+static int ensm_assert_fdd(const char *when)
+{
+  struct probe_ctx c = {phy->spi};
+  struct pluto_probe_ops ops = {&c, probe_spi_read, probe_reset, probe_sleep};
+  int st = -1;
+  if (pluto_ensm_wait(&ops, PLUTO_ENSM_FDD, 20, 100, &st) == 0) {
+    printf("pluto: ENSM FDD (0x%x) %s\n", (unsigned)st, when);
+    return 0;
+  }
+  printf("pluto: ENSM 0x%x %s, NOT FDD: forcing FDD\n", (unsigned)st, when);
+  ad9361_ensm_force_state(phy, ENSM_STATE_FDD);
+  if (pluto_ensm_wait(&ops, PLUTO_ENSM_FDD, 20, 100, &st) == 0) {
+    printf("pluto: ENSM FDD (0x%x) %s, after forcing\n", (unsigned)st, when);
+    return 0;
+  }
+  printf("pluto: ENSM 0x%x %s: FDD NOT reached, AD9363 marked suspect\n", (unsigned)st, when);
+  suspect = 1;
+  return -EIO;
+}
+
 static void teardown_locked(void)
 {
   if (!phy)
@@ -434,12 +488,14 @@ static int open_locked(uint32_t refclk_hz)
   if (!np)
     return r < 0 ? (int)r : -ENODEV;
   phy = np;
+  streams_active = 0;
   setup_cores();
   cur_bb_rate = 0;
   cur_fpga_fir = 0;
   cur_band = -1;
   apply_rx_band(p.rx_synthesizer_frequency_hz);
-  if (ad9361_set_rx_gain_control_mode(phy, 0, RF_GAIN_MGC) < 0 || health_check("after init", 1) < 0) {
+  if (ad9361_set_rx_gain_control_mode(phy, 0, RF_GAIN_MGC) < 0 || health_check("after init", 1) < 0 ||
+      ensm_assert_fdd("after init") < 0) {
     teardown_locked();
     return -EIO;
   }
@@ -478,6 +534,17 @@ void pluto_hw_close(void)
 #define FIR_RX_GAIN_DB (-6)
 #define FIR_TX_GAIN_DB 0
 
+/*
+ * The FIR sets as loaded by load_fir (taps after tx_fir_scale, dec/int, gains): what the summaries
+ * report. The coefficients are never read back from the AD9363: no-OS ad9361_get_rx/tx_fir_config
+ * set FIR_START_CLK without forcing ALERT (ad9361_api.c) and leave FIR_SELECT at 1 instead of the 3
+ * loaded, which stops the filter's data path while the ENSM is in FDD (the RX DMA froze mid-block
+ * and nexus2 failed with StartupDeadline). Linux answers filter_fir_config from its cache too.
+ * verify_rate checks the loaded state with plain register reads (pluto_fir_decode).
+ */
+static AD9361_RXFIRConfig fir_rx_seen;
+static AD9361_TXFIRConfig fir_tx_seen;
+
 static int load_fir(uint32_t dec, const int16_t *taps, uint32_t ntaps)
 {
   AD9361_RXFIRConfig rx;
@@ -496,9 +563,15 @@ static int load_fir(uint32_t dec, const int16_t *taps, uint32_t ntaps)
   /* tx_fir_scale applies to the /4 table only: the /2 tables are already unity per phase */
   if (pluto_fir_scale_taps(taps, ntaps, dec == 4 ? tx_fir_scale : 1, tx.tx_coef) < 0)
     return -ERANGE;
+  memset(&fir_rx_seen, 0, sizeof(fir_rx_seen));
+  memset(&fir_tx_seen, 0, sizeof(fir_tx_seen));
   int32_t ret = ad9361_set_rx_fir_config(phy, rx);
   if (ret >= 0)
     ret = ad9361_set_tx_fir_config(phy, tx);
+  if (ret >= 0) {
+    fir_rx_seen = rx;
+    fir_tx_seen = tx;
+  }
   return (int)ret;
 }
 
@@ -557,46 +630,56 @@ static int set_bb_rate(const struct pluto_rate_plan *pl)
   return (int)ret;
 }
 
-/* readback against the plan: PHY RX/TX rate within 0.1 %, FIR on in both directions with the
- * planned decimation/interpolation and taps */
-/* FIR configuration as read back right after the rate change (verify_rate). Reading the
- * coefficients back (ad9361_get_*_fir_config) rewrites REG_*_FILTER_CONFIG with FIR_START_CLK and
- * stops the filter's data flow while the ENSM is in FDD: the RX DMA froze mid-block after the
- * stream-start summary. Linux never reads the FIR back at run time either; the summaries use this
- * copy. */
-static AD9361_RXFIRConfig fir_rx_seen;
-static AD9361_TXFIRConfig fir_tx_seen;
+/* FIR state from plain register reads (never the coefficient RAM, START_CLK untouched); -EIO on
+ * an SPI error */
+static int read_fir_regs(struct pluto_fir_state *s)
+{
+  static const uint16_t regs[5] = {PLUTO_REG_RX_FILTER_CONFIG, PLUTO_REG_RX_FILTER_GAIN,
+                                   PLUTO_REG_TX_FILTER_CONF, PLUTO_REG_RX_ENABLE_FILTER_CTRL,
+                                   PLUTO_REG_TX_ENABLE_FILTER_CTRL};
+  uint8_t v[5];
+  for (int i = 0; i < 5; ++i) {
+    int r = (int)ad9361_spi_read(phy->spi, regs[i]);
+    if (r < 0)
+      return -EIO;
+    v[i] = (uint8_t)r;
+  }
+  struct pluto_fir_regs fr = {v[0], v[1], v[2], v[3], v[4]};
+  pluto_fir_decode(&fr, s);
+  return 0;
+}
 
+/* readback against the plan: PHY RX/TX rate within 0.1 %, FIR on in both directions with the
+ * loaded taps, decimation/interpolation and gains, both channels selected, coefficient clocks
+ * stopped (register reads only), ENSM back in FDD */
 static int verify_rate(const struct pluto_rate_plan *pl)
 {
   uint32_t rxr = 0, txr = 0;
   uint8_t rxe = 0, txe = 0;
-  AD9361_RXFIRConfig rf;
-  AD9361_TXFIRConfig tf;
-  memset(&rf, 0, sizeof(rf));
-  memset(&tf, 0, sizeof(tf));
+  struct pluto_fir_state fs;
+  memset(&fs, 0, sizeof(fs));
   ad9361_get_rx_sampling_freq(phy, &rxr);
   ad9361_get_tx_sampling_freq(phy, &txr);
   ad9361_get_rx_fir_en_dis(phy, &rxe);
   ad9361_get_tx_fir_en_dis(phy, &txe);
-  ad9361_get_rx_fir_config(phy, 0, &rf);
-  ad9361_get_tx_fir_config(phy, 0, &tf);
-  fir_rx_seen = rf;
-  fir_tx_seen = tf;
+  int fbad = read_fir_regs(&fs) < 0 ? -1
+                                     : pluto_fir_check(&fs, pl->fir_taps, pl->fir_dec, fir_rx_seen.rx_gain,
+                                                       fir_tx_seen.tx_gain);
   uint32_t rxc[6] = {0}, txc[6] = {0};
   ad9361_get_trx_path_clks(phy, rxc, txc);
   uint32_t tol = pl->phy_hz / 1000u + 1u;
   int ok = rxr + tol >= pl->phy_hz && rxr <= pl->phy_hz + tol && txr + tol >= pl->phy_hz &&
-           txr <= pl->phy_hz + tol && rxe && txe && rf.rx_dec == pl->fir_dec &&
-           tf.tx_int == pl->fir_dec && rf.rx_coef_size == pl->fir_taps &&
-           tf.tx_coef_size == pl->fir_taps;
+           txr <= pl->phy_hz + tol && rxe && txe && fbad == 0 && fir_rx_seen.rx_dec == pl->fir_dec &&
+           fir_tx_seen.tx_int == pl->fir_dec;
   printf("pluto: PHY RX %u / TX %u Hz (plan %u), FIR RX %s %u taps dec %u gain %d dB, TX %s %u taps "
-         "int %u gain %d dB, PL x8 %s -> %u S/s%s\n"
+         "int %u gain %d dB (registers: select RX %u TX %u, start-clk RX %d TX %d, check 0x%x), "
+         "PL x8 %s -> %u S/s%s\n"
          "pluto: RX path BBPLL %u ADC %u R2 %u R1 %u CLKRF %u RXSAMP %u; TX path DAC %u T2 %u T1 %u "
          "CLKTF %u TXSAMP %u\n",
          (unsigned)rxr, (unsigned)txr, (unsigned)pl->phy_hz, rxe ? "on" : "OFF",
-         (unsigned)rf.rx_coef_size, (unsigned)rf.rx_dec, (int)rf.rx_gain, txe ? "on" : "OFF",
-         (unsigned)tf.tx_coef_size, (unsigned)tf.tx_int, (int)tf.tx_gain,
+         (unsigned)fs.rx_taps, (unsigned)fs.rx_dec, fs.rx_gain_db, txe ? "on" : "OFF",
+         (unsigned)fs.tx_taps, (unsigned)fs.tx_int, fs.tx_gain_db, fs.rx_select, fs.tx_select,
+         fs.rx_clk_started, fs.tx_clk_started, (unsigned)fbad,
          pl->fpga_fir ? "on" : "off", (unsigned)pl->stream_hz, ok ? "" : "  MISMATCH",
          (unsigned)rxc[0], (unsigned)rxc[1], (unsigned)rxc[2], (unsigned)rxc[3], (unsigned)rxc[4],
          (unsigned)rxc[5], (unsigned)txc[1], (unsigned)txc[2], (unsigned)txc[3], (unsigned)txc[4],
@@ -621,6 +704,8 @@ int pluto_hw_set_rate(uint32_t rate_hz)
     ret = set_bb_rate(&pl);
     if (ret >= 0)
       ret = verify_rate(&pl);
+    if (ret >= 0)
+      ret = ensm_assert_fdd("after the rate change");
     if (ret < 0) {
       printf("pluto: baseband rate %u failed (%d)\n", (unsigned)pl.phy_hz, ret);
       cur_bb_rate = 0;
@@ -710,9 +795,17 @@ int pluto_hw_lo_power(int tx, int on)
   HW_CALL(tx ? ad9361_tx_lo_powerdown(phy, on ? ON : OFF) : ad9361_rx_lo_powerdown(phy, on ? ON : OFF));
 }
 
+static int set_bw_locked(int tx, uint32_t hz)
+{
+  int ret = (int)(tx ? ad9361_set_tx_rf_bandwidth(phy, hz) : ad9361_set_rx_rf_bandwidth(phy, hz));
+  if (ret < 0)
+    return ret;
+  return ensm_assert_fdd(tx ? "after the TX bandwidth change" : "after the RX bandwidth change");
+}
+
 int pluto_hw_set_bw(int tx, uint32_t hz)
 {
-  HW_CALL(tx ? ad9361_set_tx_rf_bandwidth(phy, hz) : ad9361_set_rx_rf_bandwidth(phy, hz));
+  HW_CALL(set_bw_locked(tx, hz));
 }
 
 uint32_t pluto_hw_get_bw(int tx)
@@ -748,14 +841,29 @@ int pluto_hw_set_rx_gain(int32_t db)
   HW_CALL(ad9361_set_rx_rf_gain(phy, 0, db));
 }
 
-int32_t pluto_hw_get_rx_gain(void)
+int pluto_hw_get_rx_gain(int32_t *db)
 {
-  int32_t db = 0;
+  /* the gain index reads right only with the ENSM back in FDD: a read during an ALERT excursion
+   * (calibration, FIR load) once gave 73 dB for a 16 dB manual gain */
   LOCK();
-  if (phy)
-    ad9361_get_rx_rf_gain(phy, 0, &db);
+  int r = -ENODEV;
+  if (phy) {
+    struct probe_ctx c = {phy->spi};
+    struct pluto_probe_ops ops = {&c, probe_spi_read, probe_reset, probe_sleep};
+    int st = -1;
+    r = pluto_ensm_wait(&ops, PLUTO_ENSM_FDD, 50, 100, &st);
+    if (r < 0) {
+      printf("pluto: RX gain readback skipped: ENSM 0x%x, not FDD\n", (unsigned)st);
+      r = -EAGAIN;
+    } else {
+      int32_t g = 0;
+      r = (int)ad9361_get_rx_rf_gain(phy, 0, &g);
+      if (r >= 0)
+        *db = g;
+    }
+  }
   UNLOCK();
-  return db;
+  return r < 0 ? r : 0;
 }
 
 int pluto_hw_set_tx_atten_mdb(uint32_t mdb)
@@ -815,7 +923,7 @@ int pluto_hw_summary(char *buf, size_t cap)
   ad9361_get_tx_sampling_freq(phy, &txr);
   ad9361_get_rx_fir_en_dis(phy, &rxe);
   ad9361_get_tx_fir_en_dis(phy, &txe);
-  rf = fir_rx_seen; /* never read back while streaming (see fir_rx_seen) */
+  rf = fir_rx_seen; /* as loaded, never read back (see fir_rx_seen) */
   tf = fir_tx_seen;
   ad9361_get_tx_attenuation(phy, 0, &att);
   ad9361_get_rx_gain_control_mode(phy, 0, &mode);
@@ -874,7 +982,7 @@ int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rx
   AD9361_TXFIRConfig tc;
   memset(&rf, 0, sizeof(rf));
   memset(&tc, 0, sizeof(tc));
-  rf = fir_rx_seen; /* never read back while streaming (see fir_rx_seen) */
+  rf = fir_rx_seen; /* as loaded, never read back (see fir_rx_seen) */
   tc = fir_tx_seen;
   uint32_t att = 0, txr = 0, rxr = 0;
   int32_t g = 0;
@@ -919,7 +1027,12 @@ int pluto_hw_set_tx_fir_scale(uint32_t scale)
     return -EINVAL;
   LOCK();
   int ret = 0;
-  if (scale != tx_fir_scale) {
+  if (scale != tx_fir_scale && phy && cur_bb_rate && streams_active > 0) {
+    /* a FIR reload forces the ENSM to ALERT: RF and the stream data path would stop */
+    printf("pluto: TX FIR taps x%u refused while %u stream(s) run (stays x%u)\n", (unsigned)scale,
+           streams_active, (unsigned)tx_fir_scale);
+    ret = -EBUSY;
+  } else if (scale != tx_fir_scale) {
     tx_fir_scale = scale;
     printf("pluto: TX FIR taps x%u (%s)\n", (unsigned)scale,
            scale == 1 ? "libad9361 table, as Linux" : "/4 passband at unity, +6.02 dB over Linux");
@@ -932,6 +1045,8 @@ int pluto_hw_set_tx_fir_scale(uint32_t scale)
         ret = set_bb_rate(&pl);
         if (ret >= 0)
           ret = verify_rate(&pl);
+        if (ret >= 0)
+          ret = ensm_assert_fdd("after the TX FIR reload");
       }
       if (ret < 0) {
         cur_bb_rate = 0;
@@ -941,6 +1056,16 @@ int pluto_hw_set_tx_fir_scale(uint32_t scale)
   }
   UNLOCK();
   return ret;
+}
+
+void pluto_hw_stream_active(int on)
+{
+  LOCK();
+  if (on)
+    streams_active++;
+  else if (streams_active > 0)
+    streams_active--;
+  UNLOCK();
 }
 
 uint32_t pluto_hw_get_tx_fir_scale(void)

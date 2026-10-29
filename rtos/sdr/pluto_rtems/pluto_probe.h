@@ -79,6 +79,61 @@ int pluto_rate_plan(uint32_t stream_hz, struct pluto_rate_plan *plan);
  */
 int pluto_fir_scale_taps(const int16_t *in, uint32_t n, uint32_t scale, int16_t *out);
 
+/*
+ * AD9363 FIR state from plain register reads only. The no-OS ad9361_get_rx/tx_fir_config read the
+ * coefficient RAM: they set FIR_START_CLK without forcing the ENSM to ALERT and leave FIR_SELECT at
+ * the one channel they read (1 instead of the 3 loaded), which stops the filter's data path while
+ * the ENSM is in FDD (RX DMA frozen mid-block). Never call them; decode these registers instead
+ * (names from no-OS ad9361.h):
+ *   0x0F5 REG_RX_FILTER_CONFIG  [7:5] NUMBER_OF_TAPS (n/16-1), [4:3] SELECT_RX_CH, [1] START_RX_CLOCK
+ *   0x0F6 REG_RX_FILTER_GAIN    [1:0] FILTER_GAIN (gain = 6 - 6 * field dB)
+ *   0x065 REG_TX_FILTER_CONF    [7:5] FIR_NUM_TAPS, [4:3] FIR_SELECT, [1] FIR_START_CLK,
+ *                               [0] TX_FIR_GAIN_6DB (-6 dB)
+ *   0x003 REG_RX_ENABLE_FILTER_CTRL [1:0] RX_FIR_ENABLE_DECIMATION (0 off, 1 /1, 2 /2, 3 /4)
+ *   0x002 REG_TX_ENABLE_FILTER_CTRL [1:0] TX_FIR_ENABLE_INTERPOLATION (same coding)
+ * The coefficients themselves are verified once by ad9361_load_fir_filter_coef, in ALERT.
+ */
+#define PLUTO_REG_TX_ENABLE_FILTER_CTRL 0x002u
+#define PLUTO_REG_RX_ENABLE_FILTER_CTRL 0x003u
+#define PLUTO_REG_STATE 0x017u
+#define PLUTO_REG_TX_FILTER_CONF 0x065u
+#define PLUTO_REG_RX_FILTER_CONFIG 0x0f5u
+#define PLUTO_REG_RX_FILTER_GAIN 0x0f6u
+#define PLUTO_ENSM_ALERT 0x5u
+#define PLUTO_ENSM_FDD 0xau
+
+struct pluto_fir_regs {
+  uint8_t rx_conf, rx_gain, tx_conf, rx_en, tx_en;
+};
+struct pluto_fir_state {
+  uint32_t rx_taps, tx_taps;
+  uint32_t rx_dec, tx_int; /* 0 = FIR bypassed */
+  int rx_gain_db, tx_gain_db;
+  unsigned rx_select, tx_select;      /* 3 = both channels, as loaded */
+  int rx_clk_started, tx_clk_started; /* START_CLK left set: coefficient access mode */
+};
+void pluto_fir_decode(const struct pluto_fir_regs *r, struct pluto_fir_state *s);
+/* mismatch bits of pluto_fir_check (0 = matches the loaded set) */
+#define PLUTO_FIR_BAD_RX_TAPS 0x001
+#define PLUTO_FIR_BAD_TX_TAPS 0x002
+#define PLUTO_FIR_BAD_RX_DEC 0x004
+#define PLUTO_FIR_BAD_TX_INT 0x008
+#define PLUTO_FIR_BAD_RX_GAIN 0x010
+#define PLUTO_FIR_BAD_TX_GAIN 0x020
+#define PLUTO_FIR_BAD_RX_SELECT 0x040
+#define PLUTO_FIR_BAD_TX_SELECT 0x080
+#define PLUTO_FIR_BAD_RX_CLK 0x100
+#define PLUTO_FIR_BAD_TX_CLK 0x200
+int pluto_fir_check(const struct pluto_fir_state *s, uint32_t taps, uint32_t dec, int rx_gain_db,
+                    int tx_gain_db);
+
+/*
+ * Poll the ENSM state (REG_STATE [3:0]) until it reads `want`: up to `polls` reads `gap_us` apart.
+ * 0 when reached, -EIO when not (or on an SPI error); *last = the last state read (or the error).
+ */
+int pluto_ensm_wait(const struct pluto_probe_ops *ops, unsigned want, uint32_t polls, uint32_t gap_us,
+                    int *last);
+
 #ifdef __cplusplus
 }
 #endif

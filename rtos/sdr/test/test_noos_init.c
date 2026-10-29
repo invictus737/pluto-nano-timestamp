@@ -132,8 +132,15 @@ static uint8_t chip_read(uint16_t a)
   }
 }
 
+static uint32_t filter_conf_writes, start_clk_in_fdd;
+
 static void chip_write(uint16_t a, uint8_t v)
 {
+  if (a == REG_RX_FILTER_CONFIG || a == REG_TX_FILTER_CONF) {
+    filter_conf_writes++;
+    if ((v & FIR_START_CLK) && (regs[REG_STATE] & 0xf) == ENSM_STATE_FDD)
+      start_clk_in_fdd++;
+  }
   switch (a) {
   case REG_CALIBRATION_CTRL:
     regs[a] = 0; /* every calibration completes at once */
@@ -390,17 +397,30 @@ static void test_success_and_rate(void)
   CHECK(rxc[0] >= MIN_BBPLL_FREQ && rxc[0] <= MAX_BBPLL_FREQ, "BBPLL %u within limits", (unsigned)rxc[0]);
   CHECK((txc[1] / txc[5]) * 16u >= 128u, "TX FIR 128 taps fit (DAC/TXSAMP*16 = %u)",
         (unsigned)((txc[1] / txc[5]) * 16u));
+  /* the driver's verification: plain register reads only (pluto_fir_decode), ENSM back in FDD */
+  struct pluto_fir_regs fr = {chip_read(PLUTO_REG_RX_FILTER_CONFIG), chip_read(PLUTO_REG_RX_FILTER_GAIN),
+                              chip_read(PLUTO_REG_TX_FILTER_CONF), chip_read(PLUTO_REG_RX_ENABLE_FILTER_CTRL),
+                              chip_read(PLUTO_REG_TX_ENABLE_FILTER_CTRL)};
+  struct pluto_fir_state fs;
+  pluto_fir_decode(&fr, &fs);
+  int fbad = pluto_fir_check(&fs, 128, 4, -6, 0);
+  CHECK(fbad == 0, "FIR registers after the rate change: check 0x%x (RX %u/%u/%d sel %u, TX %u/%u/%d sel %u)",
+        (unsigned)fbad, (unsigned)fs.rx_taps, (unsigned)fs.rx_dec, fs.rx_gain_db, fs.rx_select,
+        (unsigned)fs.tx_taps, (unsigned)fs.tx_int, fs.tx_gain_db, fs.tx_select);
+  CHECK((chip_read(REG_STATE) & 0xf) == ENSM_STATE_FDD, "ENSM FDD after the rate change (0x%x)",
+        (unsigned)chip_read(REG_STATE));
+  /* why the driver never calls ad9361_get_rx/tx_fir_config: they write REG_*_FILTER_CONFIG with
+   * FIR_START_CLK without forcing ALERT (ENSM stays FDD) and leave FIR_SELECT at 1 */
+  CHECK(start_clk_in_fdd == 0, "init + FIR load + rate never set START_CLK in FDD (%u)", (unsigned)start_clk_in_fdd);
+  uint32_t writes_before = filter_conf_writes;
   AD9361_RXFIRConfig rf;
-  AD9361_TXFIRConfig tf;
   memset(&rf, 0, sizeof(rf));
-  memset(&tf, 0, sizeof(tf));
   ad9361_get_rx_fir_config(phy, 0, &rf);
-  ad9361_get_tx_fir_config(phy, 0, &tf);
-  CHECK(rf.rx_coef_size == 128 && rf.rx_dec == 4 && rf.rx_gain == -6, "RX FIR readback %u/%u/%d",
-        (unsigned)rf.rx_coef_size, (unsigned)rf.rx_dec, (int)rf.rx_gain);
-  CHECK(tf.tx_coef_size == 128 && tf.tx_int == 4 && tf.tx_gain == 0, "TX FIR readback %u/%u/%d",
-        (unsigned)tf.tx_coef_size, (unsigned)tf.tx_int, (int)tf.tx_gain);
-  /* (coefficient RAM readback is not modelled) */
+  CHECK(filter_conf_writes > writes_before && start_clk_in_fdd > 0,
+        "no-OS FIR readback sets START_CLK while the ENSM is FDD (%u writes)", (unsigned)start_clk_in_fdd);
+  fr.rx_conf = chip_read(PLUTO_REG_RX_FILTER_CONFIG);
+  pluto_fir_decode(&fr, &fs);
+  CHECK(fs.rx_select == 1, "no-OS FIR readback leaves RX FIR_SELECT %u (loaded 3)", fs.rx_select);
 
   /* TX attenuation 0 at SoapySDR TX gain 89 (hardwaregain = gain - 89) */
   CHECK(ad9361_set_tx_attenuation(phy, 0, 0) == 0, "TX attenuation 0");

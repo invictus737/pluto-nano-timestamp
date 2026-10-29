@@ -121,3 +121,69 @@ int pluto_fir_scale_taps(const int16_t *in, uint32_t n, uint32_t scale, int16_t 
     out[i] = (int16_t)((int32_t)in[i] * (int32_t)scale);
   return 0;
 }
+
+static uint32_t fir_factor(uint8_t field)
+{
+  field &= 3u;
+  return field == 3u ? 4u : field; /* 0 bypassed, 1, 2, 3 = /4 */
+}
+
+void pluto_fir_decode(const struct pluto_fir_regs *r, struct pluto_fir_state *s)
+{
+  s->rx_taps = (((uint32_t)r->rx_conf >> 5) + 1u) * 16u;
+  s->tx_taps = (((uint32_t)r->tx_conf >> 5) + 1u) * 16u;
+  s->rx_dec = fir_factor(r->rx_en);
+  s->tx_int = fir_factor(r->tx_en);
+  s->rx_gain_db = 6 - 6 * (int)(r->rx_gain & 3u);
+  s->tx_gain_db = (r->tx_conf & 1u) ? -6 : 0;
+  s->rx_select = (r->rx_conf >> 3) & 3u;
+  s->tx_select = (r->tx_conf >> 3) & 3u;
+  s->rx_clk_started = (r->rx_conf >> 1) & 1u;
+  s->tx_clk_started = (r->tx_conf >> 1) & 1u;
+}
+
+int pluto_fir_check(const struct pluto_fir_state *s, uint32_t taps, uint32_t dec, int rx_gain_db,
+                    int tx_gain_db)
+{
+  int bad = 0;
+  if (s->rx_taps != taps)
+    bad |= PLUTO_FIR_BAD_RX_TAPS;
+  if (s->tx_taps != taps)
+    bad |= PLUTO_FIR_BAD_TX_TAPS;
+  if (s->rx_dec != dec)
+    bad |= PLUTO_FIR_BAD_RX_DEC;
+  if (s->tx_int != dec)
+    bad |= PLUTO_FIR_BAD_TX_INT;
+  if (s->rx_gain_db != rx_gain_db)
+    bad |= PLUTO_FIR_BAD_RX_GAIN;
+  if (s->tx_gain_db != tx_gain_db)
+    bad |= PLUTO_FIR_BAD_TX_GAIN;
+  if (s->rx_select != 3u)
+    bad |= PLUTO_FIR_BAD_RX_SELECT;
+  if (s->tx_select != 3u)
+    bad |= PLUTO_FIR_BAD_TX_SELECT;
+  if (s->rx_clk_started)
+    bad |= PLUTO_FIR_BAD_RX_CLK;
+  if (s->tx_clk_started)
+    bad |= PLUTO_FIR_BAD_TX_CLK;
+  return bad;
+}
+
+int pluto_ensm_wait(const struct pluto_probe_ops *ops, unsigned want, uint32_t polls, uint32_t gap_us,
+                    int *last)
+{
+  int v = -EIO;
+  for (uint32_t i = 0; i < (polls ? polls : 1u); ++i) {
+    if (i > 0 && gap_us)
+      ops->sleep_us(ops->ctx, gap_us);
+    v = ops->spi_read(ops->ctx, PLUTO_REG_STATE);
+    if (v >= 0 && ((unsigned)v & 0xfu) == want) {
+      if (last)
+        *last = (int)((unsigned)v & 0xfu);
+      return 0;
+    }
+  }
+  if (last)
+    *last = v < 0 ? v : (int)((unsigned)v & 0xfu);
+  return -EIO;
+}

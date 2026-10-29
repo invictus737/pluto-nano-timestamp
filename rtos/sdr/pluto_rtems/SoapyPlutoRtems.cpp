@@ -30,13 +30,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <time.h>
@@ -47,6 +51,7 @@
 #include "pluto_dma.h"
 #include "pluto_framing.h"
 #include "pluto_hw.h"
+#include "pluto_rt.h"
 
 extern "C" const char *nexus_config_get(const char *key) __attribute__((weak));
 
@@ -145,6 +150,17 @@ uint32_t pow2_by_rate(double rate)
   return p;
 }
 
+// Real-time rule of the stream path (readStream/writeStream under the stream mutex): no console
+// output (SoapySDR_logf -> console at 115200 baud blocks ~87 us per byte) and no SPI (hw_lock).
+// The path only accumulates; the low-priority monitor thread (CPU0) reads the published windows
+// and counters every kLevelPeriodNs, reads REG 0x05E under hw_lock and logs.
+constexpr int64_t kLevelPeriodNs = 10000000000LL;
+
+struct LevelWindow {
+  pluto_level level{};
+  int64_t span_ns = 0;
+};
+
 struct Stream {
   int dir = 0;
   pluto_format fmt = PLUTO_FMT_CS16;
@@ -152,19 +168,24 @@ struct Stream {
   pluto_dma *dma = nullptr;
   bool active = false;
   std::mutex mutex;
-  // level meter over the samples the stream moves (diagnostics), logged every kLevelPeriodNs
+  // level meter over the samples the stream moves (diagnostics), accumulated by the stream path
   pluto_level level{};
   int64_t level_since_ns = 0;
+  // the last complete window, published by the stream path (seqlock: odd = being written)
+  std::atomic<uint32_t> window_seq{0};
+  LevelWindow window{};
 };
-
-constexpr int64_t kLevelPeriodNs = 10000000000LL;
 
 struct RxStream : Stream {
   pluto_rx_reader reader{};
   pluto_rx_source source{};
-  uint64_t reported_overflows = 0;
-  int64_t last_overflow_log_ns = 0;
-  uint64_t restarts = 0;
+  // published by readStream for the monitor and readSetting
+  std::atomic<uint64_t> overflows{0};
+  std::atomic<uint64_t> lost_samples{0};
+  std::atomic<uint64_t> misframed{0};
+  std::atomic<uint64_t> restarts{0};
+  int64_t last_framing_log_ns = INT64_MIN / 2;
+  uint32_t framing_suppressed = 0;
 };
 
 struct TxStream : Stream {
@@ -330,15 +351,22 @@ private:
   bool hw_now_ticks(uint64_t &ticks) const;
   int restart_rx_locked();
   void log_signal_path(const char *when);
-  void level_account(Stream *s, const void *buf, size_t samples, bool rx);
+  void level_account(Stream *s, const void *buf, size_t samples);
+  static void *monitor_main(void *ctx);
+  void monitor_once();
+  void start_monitor();
+  void stop_monitor();
 
+  // std::mutex / std::recursive_mutex on RTEMS are libgcc gthr-rtems self-contained mutexes
+  // (_Mutex_Acquire), which use priority inheritance like rtems_mutex in pluto_dma.c; only the
+  // POSIX hw_lock in pluto_hw.c needed PTHREAD_PRIO_INHERIT set explicitly.
   mutable std::recursive_mutex dev_mutex_;
   RxStream *rx_ = nullptr;
   TxStream *tx_ = nullptr;
   uint32_t timestamp_every_rx_ = 0;
   uint32_t timestamp_every_tx_ = 0;
   int loopback_ = -1;
-  bool gain_auto_ = false;
+  std::atomic<bool> gain_auto_{false};
   std::atomic<int> rx_gain_db_{-1000};   // last RX gain readback (for the level log)
   std::atomic<uint32_t> tx_atten_mdb_{0}; // last TX attenuation readback
   double rate_ = 1e6;           // nominal stream rate: tick <-> ns conversions
@@ -350,6 +378,14 @@ private:
   uint64_t anchor_ticks_ = 0;
   int64_t anchor_ns_ = 0;
   std::atomic<bool> anchor_valid_{false};
+  // monitor thread (level/overflow log, see kLevelPeriodNs)
+  pthread_t monitor_{};
+  bool monitor_running_ = false;
+  std::mutex monitor_mutex_;
+  std::condition_variable monitor_cv_;
+  bool monitor_stop_ = false;
+  uint32_t mon_rx_seq_ = 0, mon_tx_seq_ = 0;
+  uint64_t mon_rx_overflows_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -381,10 +417,12 @@ SoapyPlutoRtems::SoapyPlutoRtems(const SoapySDR::Kwargs &args)
     pluto_hw_close();
     throw;
   }
+  start_monitor();
 }
 
 SoapyPlutoRtems::~SoapyPlutoRtems()
 {
+  stop_monitor();
   if (rx_)
     closeStream(reinterpret_cast<SoapySDR::Stream *>(rx_));
   if (tx_)
@@ -425,7 +463,10 @@ void SoapyPlutoRtems::handle_args(const SoapySDR::Kwargs &args, int direction)
     if (scale != 1 && scale != 2)
       throw std::runtime_error("invalid value for tx_fir_scale, expected 1 (Linux table) or 2 (unity /4 TX FIR)");
     std::lock_guard<std::recursive_mutex> lock(dev_mutex_);
-    if (pluto_hw_set_tx_fir_scale(scale) < 0)
+    int r = pluto_hw_set_tx_fir_scale(scale);
+    if (r == -EBUSY)
+      throw std::runtime_error("PlutoSDR: tx_fir_scale can only change while no stream is active");
+    if (r < 0)
       throw std::runtime_error("PlutoSDR: TX FIR reload failed");
   }
 
@@ -607,6 +648,7 @@ int SoapyPlutoRtems::activateStream(SoapySDR::Stream *stream, const int flags, c
     if (pluto_dma_start(rx_->dma) != 0)
       return SOAPY_SDR_STREAM_ERROR;
     rx_->active = true;
+    pluto_hw_stream_active(1);
     return 0;
   }
   if (tx_handle(stream)) {
@@ -624,6 +666,7 @@ int SoapyPlutoRtems::activateStream(SoapySDR::Stream *stream, const int flags, c
     if (pluto_dma_start(tx_->dma) != 0)
       return SOAPY_SDR_STREAM_ERROR;
     tx_->active = true;
+    pluto_hw_stream_active(1);
     return 0;
   }
   return SOAPY_SDR_STREAM_ERROR;
@@ -636,6 +679,8 @@ int SoapyPlutoRtems::deactivateStream(SoapySDR::Stream *stream, const int, const
     pluto_dma_stop(rx_->dma);
     std::lock_guard<std::mutex> slock(rx_->mutex);
     pluto_rx_reader_reset(&rx_->reader, nullptr);
+    if (rx_->active)
+      pluto_hw_stream_active(0);
     rx_->active = false;
     anchor_valid_ = false;
     return 0;
@@ -644,6 +689,8 @@ int SoapyPlutoRtems::deactivateStream(SoapySDR::Stream *stream, const int, const
     pluto_dma_stop(tx_->dma);
     std::lock_guard<std::mutex> slock(tx_->mutex);
     pluto_tx_writer_reset(&tx_->writer);
+    if (tx_->active)
+      pluto_hw_stream_active(0);
     tx_->active = false;
     return 0;
   }
@@ -657,7 +704,7 @@ int SoapyPlutoRtems::restart_rx_locked()
   pluto_dma_stop(rx_->dma);
   pluto_rx_reader_reset(&rx_->reader, nullptr);
   anchor_valid_ = false;
-  rx_->restarts++;
+  rx_->restarts.fetch_add(1, std::memory_order_relaxed);
   return pluto_dma_start(rx_->dma);
 }
 
@@ -679,7 +726,18 @@ int SoapyPlutoRtems::readStream(SoapySDR::Stream *stream, void *const *buffs, co
     if (n == PLUTO_ERR_TIMEOUT)
       return SOAPY_SDR_TIMEOUT;
     if (n == PLUTO_ERR_FRAMING) {
-      SoapySDR_logf(SOAPY_SDR_ERROR, "PlutoSDR: RX block without a valid stamp, restarting the RX DMA");
+      // error path: one console line per 10 s at most (the monitor reports the restart count)
+      int64_t now = monotonic_ns();
+      if (now - r->last_framing_log_ns >= kLevelPeriodNs) {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "PlutoSDR: RX block without a valid stamp, restarting the RX DMA (%u more since the "
+                      "last report)",
+                      unsigned(r->framing_suppressed));
+        r->last_framing_log_ns = now;
+        r->framing_suppressed = 0;
+      } else {
+        r->framing_suppressed++;
+      }
       if (!r->active || attempt > 0)
         return SOAPY_SDR_TIMEOUT;
       restart_rx_locked();
@@ -690,18 +748,12 @@ int SoapyPlutoRtems::readStream(SoapySDR::Stream *stream, void *const *buffs, co
       flags |= SOAPY_SDR_HAS_TIME;
       timeNs = SoapySDR::ticksToTimeNs((long long)(stamp + uint64_t(time_offset_ticks_.load())), rate_);
     }
-    if (r->reader.track.overflows != r->reported_overflows) {
-      // samples were lost (the reader fell behind the ring): the stamp jump carries it, like the
-      // gadget, which drops buffers silently; log at most once a second
-      int64_t now = monotonic_ns();
-      if (now - r->last_overflow_log_ns > 1000000000) {
-        SoapySDR_logf(SOAPY_SDR_WARNING, "PlutoSDR: RX overflow, %llu samples lost so far",
-                      (unsigned long long)r->reader.track.lost_samples);
-        r->last_overflow_log_ns = now;
-      }
-      r->reported_overflows = r->reader.track.overflows;
-    }
-    level_account(r, buffs[0], size_t(n), true);
+    // samples lost (the reader fell behind the ring) are carried by the stamp jump, like the
+    // gadget, which drops buffers silently; published here, logged by the monitor
+    r->overflows.store(r->reader.track.overflows, std::memory_order_relaxed);
+    r->lost_samples.store(r->reader.track.lost_samples, std::memory_order_relaxed);
+    r->misframed.store(r->reader.track.misframed, std::memory_order_relaxed);
+    level_account(r, buffs[0], size_t(n));
     return n;
   }
 }
@@ -723,7 +775,7 @@ int SoapyPlutoRtems::writeStream(SoapySDR::Stream *stream, const void *const *bu
                          (flags & SOAPY_SDR_END_BURST) ? 1 : 0, timeoutUs);
   if (n == PLUTO_ERR_TIMEOUT)
     return SOAPY_SDR_TIMEOUT;
-  level_account(t, buffs[0], size_t(n), false);
+  level_account(t, buffs[0], size_t(n));
   return n;
 }
 
@@ -765,39 +817,145 @@ void SoapyPlutoRtems::log_signal_path(const char *when)
   SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR %s", rx);
 }
 
-void SoapyPlutoRtems::level_account(Stream *s, const void *buf, size_t samples, bool rx)
+void SoapyPlutoRtems::level_account(Stream *s, const void *buf, size_t samples)
 {
-  // caller holds s->mutex; the samples are the ones just copied (cached memory)
+  // stream path, caller holds s->mutex: accumulate, and every kLevelPeriodNs publish the window
+  // (no console output, no SPI here; the monitor thread logs it)
   if (samples == 0)
     return;
   pluto_level_add(&s->level, s->fmt, buf, samples);
   int64_t now = monotonic_ns();
   if (now - s->level_since_ns < kLevelPeriodNs)
     return;
-  double pk = 0, rms = 0;
-  if (pluto_level_dbfs(&s->level, s->fmt, rx ? PLUTO_RX_FULL_SCALE : PLUTO_TX_FULL_SCALE, &pk, &rms) == 0) {
-    if (rx)
-      SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR RX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; gain %d dB %s",
-                    pk, rms, double(now - s->level_since_ns) * 1e-9, rx_gain_db_.load(),
-                    gain_auto_ ? "slow_attack" : "manual");
-    else {
-      // REG 0x05E CH1 overflow bits, read only (an SPI read every 10 s)
-      int ov = pluto_hw_tx_overflow();
-      char ovs[64];
-      if (ov < 0)
-        std::snprintf(ovs, sizeof(ovs), "unread (%d)", ov);
-      else
-        std::snprintf(ovs, sizeof(ovs), "0x%02x fir %d hb1 %d qec %d hb2 %d hb3 %d int3 %d", unsigned(ov),
-                      !!(ov & 0x02), !!(ov & 0x04), !!(ov & 0x08), !!(ov & 0x10), !!(ov & 0x20), !!(ov & 0x40));
-      SoapySDR_logf(SOAPY_SDR_INFO,
-                    "PlutoSDR TX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; attenuation %u mdB; FIR x%u; "
-                    "TX overflow: %s",
-                    pk, rms, double(now - s->level_since_ns) * 1e-9, unsigned(tx_atten_mdb_.load()),
-                    unsigned(pluto_hw_get_tx_fir_scale()), ovs);
-    }
-  }
+  s->window_seq.fetch_add(1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release); // odd sequence visible before the data
+  s->window.level = s->level;
+  s->window.span_ns = now - s->level_since_ns;
+  s->window_seq.fetch_add(1, std::memory_order_release);
   pluto_level_reset(&s->level);
   s->level_since_ns = now;
+}
+
+namespace {
+// seqlock read of a stream's published window: false while none is new since *seen
+bool read_window(Stream *s, uint32_t &seen, LevelWindow &out)
+{
+  uint32_t s0, s1;
+  for (int tries = 0; tries < 1000; ++tries) {
+    s0 = s->window_seq.load(std::memory_order_acquire);
+    if (s0 & 1u)
+      continue;
+    if (s0 == seen)
+      return false;
+    out = s->window;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    s1 = s->window_seq.load(std::memory_order_relaxed);
+    if (s0 == s1) {
+      seen = s0;
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
+void SoapyPlutoRtems::monitor_once()
+{
+  // snapshot under dev_mutex_ (the streams cannot be closed meanwhile; the stream path never
+  // takes it), then SPI and console output with no driver lock held
+  LevelWindow rxw, txw;
+  bool have_rx = false, have_tx = false, rx_ovf = false;
+  uint64_t ovf = 0, lost = 0, misframed = 0, restarts = 0;
+  pluto_format rx_fmt = PLUTO_FMT_CS16, tx_fmt = PLUTO_FMT_CS16;
+  {
+    std::lock_guard<std::recursive_mutex> lock(dev_mutex_);
+    if (rx_) {
+      have_rx = read_window(rx_, mon_rx_seq_, rxw);
+      rx_fmt = rx_->fmt;
+      ovf = rx_->overflows.load(std::memory_order_relaxed);
+      lost = rx_->lost_samples.load(std::memory_order_relaxed);
+      misframed = rx_->misframed.load(std::memory_order_relaxed);
+      restarts = rx_->restarts.load(std::memory_order_relaxed);
+      if (ovf != mon_rx_overflows_) {
+        rx_ovf = ovf > mon_rx_overflows_;
+        mon_rx_overflows_ = ovf;
+      }
+    } else {
+      mon_rx_seq_ = 0;
+      mon_rx_overflows_ = 0;
+    }
+    if (tx_) {
+      have_tx = read_window(tx_, mon_tx_seq_, txw);
+      tx_fmt = tx_->fmt;
+    } else {
+      mon_tx_seq_ = 0;
+    }
+  }
+  if (rx_ovf)
+    SoapySDR_logf(SOAPY_SDR_WARNING, "PlutoSDR: RX overflow, %llu samples lost so far (%llu overflows, "
+                  "%llu misframed, %llu DMA restarts)",
+                  (unsigned long long)lost, (unsigned long long)ovf, (unsigned long long)misframed,
+                  (unsigned long long)restarts);
+  double pk = 0, rms = 0;
+  if (have_rx && pluto_level_dbfs(&rxw.level, rx_fmt, PLUTO_RX_FULL_SCALE, &pk, &rms) == 0)
+    SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR RX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; gain %d dB %s",
+                  pk, rms, double(rxw.span_ns) * 1e-9, rx_gain_db_.load(),
+                  gain_auto_.load() ? "slow_attack" : "manual");
+  if (have_tx && pluto_level_dbfs(&txw.level, tx_fmt, PLUTO_TX_FULL_SCALE, &pk, &rms) == 0) {
+    // REG 0x05E CH1 overflow bits, read only, here under hw_lock (never in the stream path)
+    int ov = pluto_hw_tx_overflow();
+    char ovs[64];
+    if (ov < 0)
+      std::snprintf(ovs, sizeof(ovs), "unread (%d)", ov);
+    else
+      std::snprintf(ovs, sizeof(ovs), "0x%02x fir %d hb1 %d qec %d hb2 %d hb3 %d int3 %d", unsigned(ov),
+                    !!(ov & 0x02), !!(ov & 0x04), !!(ov & 0x08), !!(ov & 0x10), !!(ov & 0x20), !!(ov & 0x40));
+    SoapySDR_logf(SOAPY_SDR_INFO,
+                  "PlutoSDR TX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; attenuation %u mdB; FIR x%u; "
+                  "TX overflow: %s",
+                  pk, rms, double(txw.span_ns) * 1e-9, unsigned(tx_atten_mdb_.load()),
+                  unsigned(pluto_hw_get_tx_fir_scale()), ovs);
+  }
+}
+
+void *SoapyPlutoRtems::monitor_main(void *ctx)
+{
+  auto *self = static_cast<SoapyPlutoRtems *>(ctx);
+  std::unique_lock<std::mutex> lk(self->monitor_mutex_);
+  while (!self->monitor_stop_) {
+    self->monitor_cv_.wait_for(lk, std::chrono::nanoseconds(kLevelPeriodNs));
+    if (self->monitor_stop_)
+      break;
+    lk.unlock();
+    self->monitor_once();
+    lk.lock();
+  }
+  return nullptr;
+}
+
+void SoapyPlutoRtems::start_monitor()
+{
+  monitor_stop_ = false;
+  int rc = pluto_rt_low_thread_create(&monitor_, "PLMN", monitor_main, this);
+  monitor_running_ = rc == 0;
+  if (rc != 0)
+    SoapySDR_logf(SOAPY_SDR_WARNING, "PlutoSDR: no monitor thread (%d): level/overflow log off", rc);
+  else
+    SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR: monitor thread PLMN (low priority, CPU0): level and overflow "
+                  "log every %u s, nothing logged from the stream path", unsigned(kLevelPeriodNs / 1000000000));
+}
+
+void SoapyPlutoRtems::stop_monitor()
+{
+  if (!monitor_running_)
+    return;
+  {
+    std::lock_guard<std::mutex> lk(monitor_mutex_);
+    monitor_stop_ = true;
+  }
+  monitor_cv_.notify_all();
+  pthread_join(monitor_, nullptr);
+  monitor_running_ = false;
 }
 
 void SoapyPlutoRtems::rx_block_hook(void *ctx, const uint8_t *block)
@@ -898,10 +1056,18 @@ void SoapyPlutoRtems::setGain(const int direction, const size_t channel, const d
     double g = std::min(kRxGainMax, std::max(0.0, value));
     if (pluto_hw_set_rx_gain(int32_t(g)) < 0)
       throw std::runtime_error("PlutoSDR: RX gain failed");
-    int32_t rb = pluto_hw_get_rx_gain();
-    rx_gain_db_ = int(rb);
-    SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR: RX gain %d dB (readback %d dB, %s)", int(int32_t(g)), int(rb),
-                  gain_auto_ ? "slow_attack" : "manual");
+    // readback only with the ENSM confirmed back in FDD (pluto_hw_get_rx_gain)
+    int32_t rb = 0;
+    int rr = pluto_hw_get_rx_gain(&rb);
+    if (rr == 0) {
+      rx_gain_db_ = int(rb);
+      SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR: RX gain %d dB (readback %d dB in FDD, %s)", int(int32_t(g)),
+                    int(rb), gain_auto_.load() ? "slow_attack" : "manual");
+    } else {
+      rx_gain_db_ = int(int32_t(g));
+      SoapySDR_logf(SOAPY_SDR_WARNING, "PlutoSDR: RX gain %d dB (readback unavailable: %d, %s)",
+                    int(int32_t(g)), rr, gain_auto_.load() ? "slow_attack" : "manual");
+    }
   } else {
     double g = std::min(kTxGainMax, std::max(0.0, value));
     uint32_t mdb = uint32_t((long long)kTxGainMax - (long long)g) * 1000u;
@@ -918,8 +1084,12 @@ double SoapyPlutoRtems::getGain(const int direction, const size_t channel, const
 {
   check_channel(channel);
   std::lock_guard<std::recursive_mutex> lock(dev_mutex_);
-  if (direction == SOAPY_SDR_RX)
-    return double(pluto_hw_get_rx_gain());
+  if (direction == SOAPY_SDR_RX) {
+    int32_t db = 0;
+    if (pluto_hw_get_rx_gain(&db) == 0)
+      return double(db);
+    return double(rx_gain_db_.load()); // ENSM not in FDD at the moment: the last good value
+  }
   return kTxGainMax - double(pluto_hw_get_tx_atten_mdb()) / 1000.0;
 }
 
@@ -1047,11 +1217,11 @@ std::string SoapyPlutoRtems::readSetting(const std::string &key) const
   if (key == "tx_fir_scale")
     return std::to_string(pluto_hw_get_tx_fir_scale());
   if (key == "rx_overflows" && rx_)
-    return std::to_string(rx_->reader.track.overflows);
+    return std::to_string(rx_->overflows.load());
   if (key == "rx_lost_samples" && rx_)
-    return std::to_string(rx_->reader.track.lost_samples);
+    return std::to_string(rx_->lost_samples.load());
   if (key == "rx_misframed" && rx_)
-    return std::to_string(rx_->reader.track.misframed + rx_->restarts);
+    return std::to_string(rx_->misframed.load() + rx_->restarts.load());
   if ((key == "rx_dma" && rx_) || (key == "tx_dma" && tx_)) {
     pluto_dma_stats s;
     pluto_dma_get_stats(key == "rx_dma" ? rx_->dma : tx_->dma, &s);

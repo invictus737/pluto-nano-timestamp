@@ -1,6 +1,6 @@
 /*
  * AD9363A + axi_ad9361 control for the Pluto Nano through the ADI no-OS ad9361 driver.
- * Not thread safe: the SoapySDR device serialises every call.
+ * Thread safe: every call takes one global lock (priority inheritance).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -48,7 +48,9 @@ int pluto_hw_set_rx_agc(int automatic);
 /* gain control mode readback: 0 manual, 2 slow attack (RF_GAIN_*), negative error */
 int pluto_hw_get_rx_agc(void);
 int pluto_hw_set_rx_gain(int32_t db);
-int32_t pluto_hw_get_rx_gain(void);
+/* RX gain readback, taken only once the ENSM reads FDD (a read during an ALERT excursion gave a
+ * bogus 73 dB): 0 ok, -EAGAIN when the ENSM is not in FDD, other negative errors */
+int pluto_hw_get_rx_gain(int32_t *db);
 int pluto_hw_set_tx_atten_mdb(uint32_t mdb);
 uint32_t pluto_hw_get_tx_atten_mdb(void);
 
@@ -65,8 +67,11 @@ int pluto_hw_summary(char *buf, size_t cap);
 int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rxcap);
 
 /* TX FIR taps x1 (default, the libad9361 table Linux loads: /4 passband -6.02 dB) or x2 (/4
- * passband at unity); a loaded FIR is reloaded at once. 0 ok, -EINVAL */
+ * passband at unity); a loaded FIR is reloaded at once, which forces the ENSM to ALERT, so a
+ * change is refused (-EBUSY, scale unchanged) while any stream is active. 0 ok, -EINVAL, -EBUSY */
 int pluto_hw_set_tx_fir_scale(uint32_t scale);
+/* stream activation bookkeeping (all devices): 1 at activateStream, 0 at deactivateStream */
+void pluto_hw_stream_active(int on);
 uint32_t pluto_hw_get_tx_fir_scale(void);
 /* CH1 TX digital overflow bits of REG 0x05E (INT3 0x40, HB3 0x20, HB2 0x10, QEC 0x08, HB1 0x04,
  * TX FIR 0x02), read only (bit 7 there is BBPLL lock, bit 0 the RX FIR); negative error */
