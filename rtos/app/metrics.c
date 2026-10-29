@@ -43,6 +43,10 @@
 #include "netcmd.h"
 #include "nexus_station.h"
 
+/* defined in main.c only for the nexus2 station image (NEXUS_RUST_MAIN) */
+extern int nexus_station_layout __attribute__((weak));
+extern const char *nexus_station_layout_name(int layout) __attribute__((weak));
+
 #include "../libbsd/aic8800/aicwf_wifi.h"
 
 /* ---- build identity (rtos/app/Makefile passes these; "unknown" in other builds) ---- */
@@ -307,7 +311,11 @@ static void nexus2_json(jw_t *w)
     }
   }
   jw_str(w, "state", state);
-  jw_str(w, "layout", layout[0] ? layout : nexus_station_layout_name(nexus_station_layout));
+  /* the station symbols exist only in the nexus2 image (weak below): the base image reports "none" */
+  jw_str(w, "layout", layout[0] ? layout
+                     : (&nexus_station_layout != NULL && nexus_station_layout_name != NULL)
+                         ? nexus_station_layout_name(nexus_station_layout)
+                         : "none");
   jw_obj_end(w);
 
   if (nexus2_stage_report == NULL) {
