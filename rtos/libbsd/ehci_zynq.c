@@ -17,6 +17,8 @@
 #if defined(LIBBSP_ARM_XILINX_ZYNQ_BSP_H)
 
 #include <bsp/irq.h>
+#include <bsp/linker-symbols.h>
+#include <rtems/rtems/cache.h>
 
 #include <sys/cdefs.h>
 #include <sys/stdint.h>
@@ -150,29 +152,22 @@ zynq_ulpi_read(uint8_t addr)
 static void
 zynq_ehci_post_reset(struct ehci_softc *e)
 {
-	uint32_t usbmode, portsc, fill;
+	uint32_t usbmode, portsc;
 
+	/* as Linux tdi_reset(): host mode only (no SDIS, no TX fill tuning: Zynq Linux sets neither) */
 	usbmode = EOREAD4(e, EHCI_USBMODE_NOLPM);
-	usbmode &= ~EHCI_UM_CM;
+	usbmode &= ~(EHCI_UM_CM | (1U << 4));
 	usbmode |= EHCI_UM_CM_HOST;
-	/*
-	 * SDIS (stream disable, USBMODE bit 4) in host mode: ChipIdea erratum TAR 9000378958 hangs
-	 * the host on an OUT retry when the buffer is not double-word aligned (Linux sets it for
-	 * host mode for the same reason). Seen here as bulk/control OUT stuck in PING/XACTERR
-	 * retries, IAAD never acknowledged and new QHs never fetched.
-	 */
-	usbmode |= (1U << 4);
 	EOWRITE4(e, EHCI_USBMODE_NOLPM, usbmode);
 
+	/* PTS = ULPI (Linux hw_phymode_configure); never write back CSC/PEC/OCC (write-1-to-clear) */
 	portsc = REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1);
-	portsc &= ~(PORTSC_PTS_MASK | PORTSC_PTW | PORTSC_PTS2);
-	portsc |= PORTSC_PTS_ULPI;
-	REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1) = portsc;
-
-	/* TX FIFO threshold 8 bursts: avoids TX underruns on the ULPI path (zy7_ehci.c). */
-	fill = REG32(ZY7_USB0_BASE + ZY7_USB_TXFILLTUNING);
-	fill = (fill & ~(0x3fU << 16)) | (8U << 16);
-	REG32(ZY7_USB0_BASE + ZY7_USB_TXFILLTUNING) = fill;
+	if ((portsc & (PORTSC_PTS_MASK | PORTSC_PTW | PORTSC_PTS2)) != PORTSC_PTS_ULPI) {
+		portsc &= ~((1U << 1) | (1U << 3) | (1U << 5));
+		portsc &= ~(PORTSC_PTS_MASK | PORTSC_PTW | PORTSC_PTS2);
+		portsc |= PORTSC_PTS_ULPI;
+		REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1) = portsc;
+	}
 }
 
 static int
@@ -236,61 +231,11 @@ static uint32_t zynq_ehci_last_alist;
 static unsigned zynq_ehci_stuck_ticks, zynq_ehci_kicks_seen;
 
 unsigned zynq_ehci_hc_resets;
-static volatile int zynq_ehci_reset_wanted;
-
-/* returns 0 when the async schedule obeyed (AS followed ASE), -1 when the engine is hung */
-static int
-zynq_ehci_async_kick(void)
-{
-	volatile uint32_t *cmd = (volatile uint32_t *)(ZY7_USB0_BASE + 0x140);
-	volatile uint32_t *sts = (volatile uint32_t *)(ZY7_USB0_BASE + 0x144);
-	int i, hung;
-
-	*cmd &= ~(1U << 5);
-	for (i = 0; i < 2000 && (*sts & (1U << 15)) != 0; ++i)
-		DELAY(1);
-	hung = (*sts & (1U << 15)) != 0;
-	*sts = 1U << 5; /* stale IAA */
-	*cmd |= 1U << 5;
-	for (i = 0; i < 2000 && (*sts & (1U << 15)) == 0; ++i)
-		DELAY(1);
-	zynq_ehci_async_kicks++;
-	if (hung)
-		zynq_ehci_reset_wanted = 1;
-	return (hung ? -1 : 0);
-}
-
-/*
- * Hard hang of the ChipIdea async engine (seen after bulk IN transaction errors: ASE=0 is
- * ignored, AS stays 1, IAA never comes): reset and re-initialise the controller the way a
- * resume does (HCRESET, our post-reset settings, schedules, interrupts), then explore. Devices
- * that lost their port are re-enumerated; pending transfers end with an error and are retried.
- */
-void ehci_resume(ehci_softc_t *sc); /* ehci.c (exported on RTEMS) */
-static void
-zynq_ehci_hard_reset(ehci_softc_t *e)
-{
-	static int last_tick = -100000;
-	int now = ticks;
-
-	if (now - last_tick < 2 * hz)
-		return;
-	last_tick = now;
-	ehci_resume(e); /* takes the bus lock itself (ehci_do_poll) */
-	USB_BUS_LOCK(&e->sc_bus);
-	e->sc_eintrs |= ZY7_USBSTS_UAI | ZY7_USBSTS_UPI;
-	EOWRITE4(e, EHCI_USBINTR, e->sc_eintrs);
-	USB_BUS_UNLOCK(&e->sc_bus);
-	zynq_ehci_hc_resets++;
-	printf("ehci: async engine hung, controller reset #%u\n", zynq_ehci_hc_resets);
-	usb_needs_explore(&e->sc_bus, 1);
-}
 
 void zynq_ehci_kick_async(void); /* also called from ehci_timeout (Pluto patch) */
 void
 zynq_ehci_kick_async(void)
 {
-	(void)zynq_ehci_async_kick();
 }
 
 static void
@@ -298,21 +243,7 @@ zynq_ehci_poll_tick(void *arg)
 {
 	(void)arg;
 	if (zynq_ehci_sc != NULL) {
-		uint32_t c = REG32(ZY7_USB0_BASE + 0x140);
-		uint32_t al = REG32(ZY7_USB0_BASE + 0x158);
-		if ((c & (1U << 6)) != 0 && al == zynq_ehci_last_alist) {
-			if (++zynq_ehci_stuck_ticks >= 5) {
-				zynq_ehci_async_kick();
-				zynq_ehci_stuck_ticks = 0;
-			}
-		} else {
-			zynq_ehci_stuck_ticks = 0;
-		}
-		zynq_ehci_last_alist = al;
-		if (zynq_ehci_reset_wanted) {
-			zynq_ehci_reset_wanted = 0;
-			zynq_ehci_hard_reset(zynq_ehci_sc);
-		}
+		/* read-only: registers are written only by ehci.c under the bus lock (as Linux) */
 		zynq_ehci_rescued += (unsigned)ehci_zynq_poll(zynq_ehci_sc);
 		if ((REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1) & PORTSC_CHANGE_BITS) != 0 &&
 		    (zynq_ehci_ticks % 50) == 0)
@@ -361,6 +292,13 @@ zynq_ehci_attach(device_t self)
 	device_set_desc(e->sc_bus.bdev, "EHCI");
 	snprintf(e->sc_vendor, sizeof(e->sc_vendor), "Xilinx");
 
+	/* the non-cacheable DMA area must not hold stale L1/L2 lines from earlier use (Linux
+	 * __dma_alloc cleans the outer cache before mapping coherent buffers non-cacheable) */
+	rtems_cache_flush_multiple_data_lines((void *)bsp_section_nocachenoload_begin,
+	    (size_t)(bsp_section_nocachenoload_end - bsp_section_nocachenoload_begin));
+	rtems_cache_invalidate_multiple_data_lines((void *)bsp_section_nocachenoload_begin,
+	    (size_t)(bsp_section_nocachenoload_end - bsp_section_nocachenoload_begin));
+
 	zynq_usb0_controller_reset();
 	zynq_ulpi_phy_reset();
 	{
@@ -381,7 +319,7 @@ zynq_ehci_attach(device_t self)
 	device_printf(self, "id 0x%08x caplength 0x%x\n",
 	    (unsigned)REG32(ZY7_USB0_BASE), (unsigned)caplength);
 
-	e->sc_flags |= EHCI_SCFLG_NORESTERM | EHCI_SCFLG_TT;
+	e->sc_flags |= EHCI_SCFLG_NORESTERM | EHCI_SCFLG_TT | EHCI_SCFLG_IAADBUG;
 	e->sc_vendor_post_reset = zynq_ehci_post_reset;
 	e->sc_vendor_get_port_speed = ehci_get_port_speed_portsc;
 
@@ -395,9 +333,6 @@ zynq_ehci_attach(device_t self)
 		device_printf(self, "ehci_init failed: %d\n", (int)ue);
 		goto error;
 	}
-	/* ChipIdea: transfer completions also (and sometimes only) arrive as UAI/UPI */
-	e->sc_eintrs |= ZY7_USBSTS_UAI | ZY7_USBSTS_UPI;
-	EOWRITE4(e, EHCI_USBINTR, e->sc_eintrs);
 
 	/* Host mode is set now: let the PHY drive VBUS and enable the host pull-downs. */
 	if (zynq_ulpi_write(ULPI_OTG_CTRL_SET, ULPI_OTG_HOST_VBUS) != 0)

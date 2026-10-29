@@ -259,7 +259,6 @@ ehci_zynq_poll(ehci_softc_t *sc)
 	int done = 0;
 
 	USB_BUS_LOCK(&sc->sc_bus);
-	ehci_zynq_async_check(sc);
 repeat:
 	TAILQ_FOREACH(xfer, &sc->sc_bus.intr_q.head, wait_entry) {
 		if (ehci_check_transfer(xfer)) {
@@ -293,7 +292,7 @@ def busdma_c(s):
 	    end <= (uintptr_t)bsp_section_nocachenoload_end) {
 		""" + NC_MARK + """
 		if ((op & (BUS_DMASYNC_PREWRITE | BUS_DMASYNC_PREREAD)) != 0)
-			rtems_cache_flush_multiple_data_lines((void *) begin, 1);
+			rtems_cache_flush_multiple_data_lines((void *) begin, size);
 		return;
 	}"""
     return s.replace(old, new)
@@ -358,11 +357,7 @@ def ehci_trace_c(s):
 
 	/* transfer is transferred */
 	ehci_device_done(xfer, USB_ERR_TIMEOUT);
-	{
-		extern void zynq_ehci_kick_async(void);
-		/* a timed-out QH may be the one the controller is parked on */
-		zynq_ehci_kick_async();
-	}""")
+""")
 
 
 PM_MARK = "/* Pluto RTOS: no USB suspend */"
@@ -416,11 +411,20 @@ ehci_zynq_iaa_wait(ehci_softc_t *sc)
 	uint32_t cmd = EOREAD4(sc, EHCI_USBCMD);
 	int i;
 
-	if ((cmd & EHCI_CMD_ASE) == 0)
+	if ((cmd & EHCI_CMD_ASE) == 0 || (EOREAD4(sc, EHCI_USBSTS) & EHCI_STS_ASS) == 0)
 		return;
+	if (cmd & EHCI_CMD_IAAD) {
+		/* one IAA cycle at a time: let the one in flight finish first */
+		for (i = 0; i < 10000 && (EOREAD4(sc, EHCI_USBSTS) & EHCI_STS_IAA) == 0; ++i)
+			DELAY(1);
+		EOWRITE4(sc, EHCI_USBSTS, EHCI_STS_IAA);
+		cmd = EOREAD4(sc, EHCI_USBCMD) & ~EHCI_CMD_IAAD;
+	}
 	EOWRITE4(sc, EHCI_USBSTS, EHCI_STS_IAA);	/* stale */
+	__asm__ volatile("dsb" ::: "memory");
 	EOWRITE4(sc, EHCI_USBCMD, cmd | EHCI_CMD_IAAD);
-	for (i = 0; i < 2000; ++i) {
+	(void)EOREAD4(sc, EHCI_USBCMD);
+	for (i = 0; i < 10000; ++i) {
 		if (EOREAD4(sc, EHCI_USBSTS) & EHCI_STS_IAA) {
 			EOWRITE4(sc, EHCI_USBSTS, EHCI_STS_IAA);
 			return;
@@ -428,6 +432,69 @@ ehci_zynq_iaa_wait(ehci_softc_t *sc)
 		DELAY(1);
 	}
 	ehci_zynq_iaa_timeouts++;
+}
+
+""" + old)
+
+
+XRETRY_MARK = "/* Pluto RTOS: XACTERR retry */"
+
+
+def ehci_xretry_c(s):
+    """Linux ehci-q.c qh_completions: a qTD halted by XACTERR with CERR exhausted is restarted in
+    place (up to 32 times, QH stays linked) instead of failing the transfer: a device that is
+    not ready yet (AIC8800 runtime bulk IN right after re-enumeration) then just gets retried,
+    without the unlink/IAA/CLEAR_FEATURE churn that FreeBSD's error path causes."""
+    if XRETRY_MARK in s:
+        return s
+    old = """			/*
+			 * any kind of error makes the transfer done
+			 */
+			if (status & EHCI_QTD_HALTED) {
+				break;
+			}"""
+    assert s.count(old) == 1, "check_transfer halted anchor"
+    new = """			""" + XRETRY_MARK + """
+			if ((status & (EHCI_QTD_HALTED | EHCI_QTD_XACTERR)) ==
+			    (EHCI_QTD_HALTED | EHCI_QTD_XACTERR) &&
+			    EHCI_QTD_GET_CERR(status) == 0 && ehci_zynq_xretry(td)) {
+				uint32_t nst = (status & ~(EHCI_QTD_HALTED | EHCI_QTD_XACTERR)) |
+				    EHCI_QTD_ACTIVE | EHCI_QTD_SET_CERR(3);
+				td->qtd_status = htohc32(sc, nst);
+				usb_pc_cpu_flush(td->page_cache);
+				qh->qh_qtd.qtd_status = htohc32(sc, nst);
+				usb_pc_cpu_flush(qh->page_cache);
+				xfer->td_transfer_cache = td;
+				goto done;
+			}
+""" + old
+    s = s.replace(old, new)
+    old = "static uint8_t\nehci_check_transfer(struct usb_xfer *xfer)"
+    if s.count(old) != 1:
+        old = "static uint8_t\nehci_check_transfer(struct usb_xfer *xfer)"
+    assert s.count(old) == 1, "check_transfer anchor"
+    return s.replace(old, """unsigned ehci_zynq_xretries;
+static struct { void *td; uint8_t n; } ehci_zynq_xr[16];
+static int
+ehci_zynq_xretry(void *td)
+{
+	static unsigned rr;
+	unsigned i;
+
+	for (i = 0; i < 16; ++i) {
+		if (ehci_zynq_xr[i].td == td) {
+			if (ehci_zynq_xr[i].n >= 32)
+				return (0);
+			ehci_zynq_xr[i].n++;
+			ehci_zynq_xretries++;
+			return (1);
+		}
+	}
+	i = rr++ % 16;
+	ehci_zynq_xr[i].td = td;
+	ehci_zynq_xr[i].n = 1;
+	ehci_zynq_xretries++;
+	return (1);
 }
 
 """ + old)
@@ -443,6 +510,7 @@ edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_trace_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_iaa_c)
+edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_xretry_c)
 edit("rtemsbsd/rtems/rtems-kernel-bus-dma.c", busdma_c)
 edit("freebsd/sys/dev/usb/usb_hub.c", usb_hub_c)
 print("libbsd patched for the Pluto")
