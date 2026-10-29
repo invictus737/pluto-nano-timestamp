@@ -37,7 +37,7 @@ for f in $NOOS_SRCS; do
 done
 
 # Driver
-for f in pluto_framing.c pluto_ring.c pluto_dma.c pluto_rt.c pluto_hw.c platform_spi.c platform_gpio.c platform_misc.c; do
+for f in pluto_framing.c pluto_ring.c pluto_dma.c pluto_rt.c pluto_hw.c pluto_probe.c platform_spi.c platform_gpio.c platform_misc.c; do
   arm-rtems6-gcc $CFLAGS -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE "${INC[@]}" \
     -c "$D/$f" -o "$W/o/${f%.c}.o"
 done

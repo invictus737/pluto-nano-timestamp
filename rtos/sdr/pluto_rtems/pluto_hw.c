@@ -8,11 +8,25 @@
  * External RX band control: the DT adi_rx_band_setting_* table (band-ctl GPIOs 81..83), applied
  * on every RX LO change like the Linux ad9361_ext_band_ctl.
  *
+ * Robustness (first board runs: PRODUCT_ID 0xff/0x00, calibration timeouts, a data abort when the
+ * AXI ADC core never saw DATA_CLK):
+ *  - one global lock around every transceiver access: SoapySDR 0.8 constructs devices outside its
+ *    factory lock, so two opens (e.g. the station and a second make) may run in parallel and
+ *    would otherwise interleave resets and SPI transfers on the one AD9363;
+ *  - before ad9361_init: PL configured, axi_ad9361 core present, then a reset pulse and a bounded,
+ *    repeated PRODUCT_ID check (pluto_probe.c) - nothing is touched on a dead bus;
+ *  - after ad9361_init: BBPLL and both RF synthesizers locked, ENSM in FDD, ADC core status ok,
+ *    otherwise the phy is removed and the open fails (the caller retries);
+ *  - every failure leaves phy == NULL or a fully working phy; a phy that failed a later
+ *    operation is marked suspect and rebuilt from reset at the next open with no other user.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "pluto_hw.h"
 
 #include <errno.h>
+#include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -20,15 +34,24 @@
 #include "ad9361.h"
 #include "axi_adc_core.h"
 #include "axi_dac_core.h"
+#include "no_os_delay.h"
 #include "platform_rtems.h"
 #include "pluto_fir.h"
 #include "pluto_framing.h"
+#include "pluto_probe.h"
 #include "pluto_regs.h"
 
+/* every phy access holds hw_lock; phy is only ever NULL or fully initialised */
+static pthread_mutex_t hw_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct ad9361_rf_phy *phy;
+static unsigned users;          /* open SoapySDR devices sharing phy */
+static int suspect;             /* an operation failed: rebuild at the next open without users */
 static uint32_t cur_bb_rate;    /* AD9363 baseband rate last programmed */
 static int cur_fpga_fir = -1;   /* PL x8 FIR on/off */
 static int cur_band = -1;
+
+#define LOCK() pthread_mutex_lock(&hw_lock)
+#define UNLOCK() pthread_mutex_unlock(&hw_lock)
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
 
@@ -242,48 +265,217 @@ static void setup_cores(void)
   REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT) = 0;
 }
 
-int pluto_hw_is_open(void)
+/* ---- presence checks ---- */
+
+#define DEVCFG_INT_STS 0xf800700cu
+#define DEVCFG_PCFG_DONE (1u << 2)
+
+/* PL configured, level shifters on, FCLK0 out of reset, axi_ad9361 answering: before this the
+ * EMIO SPI/GPIO lines do not reach the AD9363 and a PL register read can hang the AXI bus */
+static int pl_ready(void)
 {
-  return phy != NULL;
+  uint32_t sts = REG32(DEVCFG_INT_STS);
+  uint32_t lvl = REG32(SLCR_LVL_SHFTR_EN);
+  uint32_t rst = REG32(SLCR_FPGA_RST_CTRL);
+  if (!(sts & DEVCFG_PCFG_DONE) || (lvl & 0xfu) != 0xfu || (rst & 1u)) {
+    printf("pluto: PL not ready (devcfg int_sts %08x, lvl_shftr %x, fpga_rst %x)\n", (unsigned)sts,
+           (unsigned)lvl, (unsigned)rst);
+    return -EAGAIN;
+  }
+  uint32_t ver = REG32(PLUTO_ADC_BASE + 0x0000u);
+  if (ver == 0 || ver == 0xffffffffu) {
+    printf("pluto: axi_ad9361 core missing (version %08x)\n", (unsigned)ver);
+    return -ENODEV;
+  }
+  return 0;
 }
 
-int pluto_hw_open(uint32_t refclk_hz)
+struct probe_ctx {
+  struct no_os_spi_desc *spi;
+};
+
+static int probe_spi_read(void *ctx, uint16_t reg)
 {
+  return (int)ad9361_spi_read(((struct probe_ctx *)ctx)->spi, reg);
+}
+
+static void probe_reset(void *ctx, int level)
+{
+  (void)ctx;
+  zynq_gpio_output(PLUTO_GPIO_RESETB, level);
+}
+
+static void probe_sleep(void *ctx, uint32_t us)
+{
+  (void)ctx;
+  no_os_udelay(us);
+}
+
+static void spi_diag(void)
+{
+  printf("pluto: diag spi0 cr %08x isr %08x en %x, slcr spi_clk %08x spi_rst %08x, gpio dirm2 %08x "
+         "oen2 %08x data2 %08x\n",
+         (unsigned)REG32(PLUTO_SPI_BASE + 0x00u), (unsigned)REG32(PLUTO_SPI_BASE + 0x04u),
+         (unsigned)REG32(PLUTO_SPI_BASE + 0x14u), (unsigned)REG32(SLCR_SPI_CLK_CTRL),
+         (unsigned)REG32(SLCR_SPI_RST_CTRL), (unsigned)REG32(PLUTO_GPIO_BASE + 0x284u),
+         (unsigned)REG32(PLUTO_GPIO_BASE + 0x288u), (unsigned)REG32(PLUTO_GPIO_BASE + 0x068u));
+}
+
+/* reset pulse + PRODUCT_ID until it reads back right several times in a row */
+static int probe_transceiver(const AD9361_InitParam *p)
+{
+  struct probe_ctx c = {NULL};
+  int32_t ret = no_os_spi_init(&c.spi, &p->spi_param);
+  if (ret < 0 || !c.spi) {
+    printf("pluto: SPI init failed (%d)\n", (int)ret);
+    return ret < 0 ? (int)ret : -ENODEV;
+  }
+  struct pluto_probe_ops ops = {&c, probe_spi_read, probe_reset, probe_sleep};
+  struct pluto_probe_cfg cfg;
+  struct pluto_probe_result res;
+  pluto_probe_default_cfg(&cfg);
+  int r = pluto_probe_ad9363(&ops, &cfg, &res);
+  if (r == 0)
+    printf("pluto: AD9363 PRODUCT_ID 0x%02x after %u reset pulse(s), %u ms\n", (unsigned)res.id,
+           (unsigned)res.attempts, (unsigned)(res.waited_us / 1000u));
+  else {
+    printf("pluto: AD9363 not answering: PRODUCT_ID 0x%x (first bad 0x%x) after %u reset pulses, "
+           "%u ms\n", (unsigned)res.id, (unsigned)res.first_bad, (unsigned)res.attempts,
+           (unsigned)(res.waited_us / 1000u));
+    spi_diag();
+  }
+  no_os_spi_remove(c.spi);
+  return r;
+}
+
+/*
+ * Transceiver state: 0 healthy. Always required: PRODUCT_ID answers, BBPLL locked, the axi_ad9361
+ * core sees DATA_CLK; right after init also ENSM in FDD. The RF synthesizer locks are reported
+ * only: SoapySDR powers the LOs down at closeStream (as SoapyPlutoSDR does), so an unlocked VCO
+ * on a reused phy is normal, and both are re-locked by the next LO tune.
+ */
+static int health_check(const char *when, int after_init)
+{
+  int id = (int)ad9361_spi_read(phy->spi, REG_PRODUCT_ID);
+  int bb = (int)ad9361_spi_read(phy->spi, REG_CH_1_OVERFLOW);
+  int rx = (int)ad9361_spi_read(phy->spi, REG_RX_CP_OVERRANGE_VCO_LOCK);
+  int tx = (int)ad9361_spi_read(phy->spi, REG_TX_CP_OVERRANGE_VCO_LOCK);
+  int st = (int)ad9361_spi_read(phy->spi, REG_STATE);
+  uint32_t adc = REG32(PLUTO_ADC_BASE + AXI_ADC_REG_STATUS);
+  int ok = pluto_probe_id_ok(id) && bb >= 0 && (bb & BBPLL_LOCK) && (adc & AXI_ADC_STATUS) &&
+           (!after_init || (st >= 0 && (st & 0xf) == ENSM_STATE_FDD));
+  printf("pluto: AD9363 %s %s: id 0x%x bbpll %s rx-vco %s tx-vco %s ensm 0x%x adc-core %s\n",
+         ok ? "healthy" : "UNHEALTHY", when, (unsigned)id,
+         (bb >= 0 && (bb & BBPLL_LOCK)) ? "locked" : "UNLOCKED",
+         (rx >= 0 && (rx & VCO_LOCK)) ? "locked" : "unlocked",
+         (tx >= 0 && (tx & VCO_LOCK)) ? "locked" : "unlocked", (unsigned)(st & 0xf),
+         (adc & AXI_ADC_STATUS) ? "ok" : "NO DATA_CLK");
+  return ok ? 0 : -EIO;
+}
+
+static void teardown_locked(void)
+{
+  if (!phy)
+    return;
+  /* PL FIR and timestamps off, the AD9363 back in reset: a known state for the next probe */
+  REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT) = 0;
+  REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT) = 0;
+  ad9361_remove(phy);
+  phy = NULL;
+  zynq_gpio_output(PLUTO_GPIO_RESETB, 0);
+  cur_bb_rate = 0;
+  cur_fpga_fir = -1;
+  cur_band = -1;
+  suspect = 0;
+}
+
+int pluto_hw_is_open(void)
+{
+  LOCK();
+  int r = phy != NULL;
+  UNLOCK();
+  return r;
+}
+
+static int open_locked(uint32_t refclk_hz)
+{
+  if (phy && users == 0 && (suspect || health_check("at reopen", 0) < 0)) {
+    printf("pluto: rebuilding the AD9363 state from reset\n");
+    teardown_locked();
+  }
   if (phy)
     return 0;
+  int ret = pl_ready();
+  if (ret < 0)
+    return ret;
   AD9361_InitParam p;
   fill_init_param(&p, refclk_hz);
   printf("pluto: AD9363A init, reference %u Hz, 1R1T CMOS\n", (unsigned)refclk_hz);
   /* en_agc low (manual gain control by SPI), band control at the power-up LO */
   zynq_gpio_output(PLUTO_GPIO_EN_AGC, 0);
-  int32_t ret = ad9361_init(&phy, &p);
-  if (ret < 0 || !phy) {
-    printf("pluto: ad9361_init failed (%d)\n", (int)ret);
-    phy = NULL;
-    return ret < 0 ? (int)ret : -ENODEV;
+  /* two full attempts (probe + init) before the error goes to SoapySDR, which retries */
+  struct ad9361_rf_phy *np = NULL;
+  int32_t r = -ENODEV;
+  for (int attempt = 1; attempt <= 2 && !np; ++attempt) {
+    ret = probe_transceiver(&p);
+    if (ret < 0) {
+      r = ret;
+      continue;
+    }
+    r = ad9361_init(&np, &p);
+    if (r < 0 || !np) {
+      /* the patched ad9361_init released everything (noos-patches/0001) */
+      printf("pluto: ad9361_init failed (%d), attempt %d of 2\n", (int)r, attempt);
+      np = NULL;
+      zynq_gpio_output(PLUTO_GPIO_RESETB, 0);
+    }
   }
+  if (!np)
+    return r < 0 ? (int)r : -ENODEV;
+  phy = np;
   setup_cores();
   cur_bb_rate = 0;
   cur_fpga_fir = 0;
   cur_band = -1;
   apply_rx_band(p.rx_synthesizer_frequency_hz);
-  ad9361_set_rx_gain_control_mode(phy, 0, RF_GAIN_MGC);
+  if (ad9361_set_rx_gain_control_mode(phy, 0, RF_GAIN_MGC) < 0 || health_check("after init", 1) < 0) {
+    teardown_locked();
+    return -EIO;
+  }
   int32_t t = 0;
   ad9361_get_temperature(phy, &t);
   printf("pluto: AD9363A ready, %d.%d C\n", (int)(t / 1000), (int)((t < 0 ? -t : t) % 1000 / 100));
   return 0;
 }
 
+int pluto_hw_open(uint32_t refclk_hz)
+{
+  LOCK();
+  int ret = open_locked(refclk_hz);
+  if (ret == 0)
+    users++;
+  UNLOCK();
+  return ret;
+}
+
 void pluto_hw_close(void)
 {
   /* the transceiver stays configured for the next open (like the Linux driver) */
-  if (!phy)
-    return;
-  REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT) &= 1u;
-  REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT) &= 1u;
+  LOCK();
+  if (users > 0)
+    users--;
+  if (phy && users == 0) {
+    REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT) &= 1u;
+    REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT) &= 1u;
+  }
+  UNLOCK();
 }
 
 /* ---- sample rate (libad9361 ad9361_set_bb_rate on the no-OS API) ---- */
+
+/* libad9361 v0.3 ad9361_set_bb_rate: "RX 3 GAIN -6 DEC n" / "TX 3 GAIN 0 INT n", both channels */
+#define FIR_RX_GAIN_DB (-6)
+#define FIR_TX_GAIN_DB 0
 
 static int load_fir(uint32_t dec, const int16_t *taps, uint32_t ntaps)
 {
@@ -292,12 +484,12 @@ static int load_fir(uint32_t dec, const int16_t *taps, uint32_t ntaps)
   memset(&rx, 0, sizeof(rx));
   memset(&tx, 0, sizeof(tx));
   rx.rx = 3;
-  rx.rx_gain = -6;
+  rx.rx_gain = FIR_RX_GAIN_DB;
   rx.rx_dec = dec;
   rx.rx_coef_size = (uint8_t)ntaps;
   memcpy(rx.rx_coef, taps, ntaps * sizeof(int16_t));
   tx.tx = 3;
-  tx.tx_gain = 0;
+  tx.tx_gain = FIR_TX_GAIN_DB;
   tx.tx_int = dec;
   tx.tx_coef_size = (uint8_t)ntaps;
   memcpy(tx.tx_coef, taps, ntaps * sizeof(int16_t));
@@ -307,42 +499,50 @@ static int load_fir(uint32_t dec, const int16_t *taps, uint32_t ntaps)
   return (int)ret;
 }
 
-static int set_bb_rate(uint32_t rate)
+static const int16_t *fir_taps(uint32_t dec, uint32_t ntaps)
 {
-  uint32_t dec, ntaps;
-  const int16_t *fir;
-  if (rate <= 20000000u) {
-    dec = 4; fir = pluto_fir_128_4; ntaps = 128;
-  } else if (rate <= 40000000u) {
-    dec = 2; fir = pluto_fir_128_2; ntaps = 128;
-  } else if (rate <= 53333333u) {
-    dec = 2; fir = pluto_fir_96_2; ntaps = 96;
-  } else {
-    dec = 2; fir = pluto_fir_64_2; ntaps = 64;
-  }
+  if (dec == 4)
+    return pluto_fir_128_4;
+  if (ntaps == 128)
+    return pluto_fir_128_2;
+  return ntaps == 96 ? pluto_fir_96_2 : pluto_fir_64_2;
+}
+
+static int set_bb_rate(const struct pluto_rate_plan *pl)
+{
+  const uint32_t rate = pl->phy_hz, dec = pl->fir_dec, ntaps = pl->fir_taps;
   uint32_t current = 0;
   uint8_t enabled = 0;
   int32_t ret;
   ad9361_get_rx_sampling_freq(phy, &current);
   ad9361_get_rx_fir_en_dis(phy, &enabled);
   if (enabled) {
-    if (current <= 25000000u / 12u)
-      ad9361_set_rx_sampling_freq(phy, 3000000u);
+    /* below 25 MHz/12 there is no FIR-less clock chain: step to 3 MHz before the FIR goes off */
+    if (current <= 25000000u / 12u) {
+      ret = ad9361_set_rx_sampling_freq(phy, 3000000u);
+      if (ret < 0)
+        return (int)ret;
+    }
     ret = ad9361_set_trx_fir_en_dis(phy, 0);
     if (ret < 0)
       return (int)ret;
   }
-  ret = load_fir(dec, fir, ntaps);
+  ret = load_fir(dec, fir_taps(dec, ntaps), ntaps);
   if (ret < 0)
     return (int)ret;
-  if (rate <= 25000000u / 12u) {
+  if (pl->via_fir_first) {
     uint32_t rxc[6], txc[6];
-    ad9361_get_trx_path_clks(phy, rxc, txc);
+    ret = ad9361_get_trx_path_clks(phy, rxc, txc);
+    if (ret < 0)
+      return (int)ret;
     /* TX FIR length limit: DAC clock / TX sample rate * 16 taps */
     if (txc[5] == 0)
       return -EINVAL;
-    if ((txc[1] / txc[5]) * 16u < ntaps)
-      ad9361_set_rx_sampling_freq(phy, 3000000u);
+    if ((txc[1] / txc[5]) * 16u < ntaps) {
+      ret = ad9361_set_rx_sampling_freq(phy, 3000000u);
+      if (ret < 0)
+        return (int)ret;
+    }
     ret = ad9361_set_trx_fir_en_dis(phy, 1);
     if (ret >= 0)
       ret = ad9361_set_rx_sampling_freq(phy, rate);
@@ -354,162 +554,348 @@ static int set_bb_rate(uint32_t rate)
   return (int)ret;
 }
 
+/* readback against the plan: PHY RX/TX rate within 0.1 %, FIR on in both directions with the
+ * planned decimation/interpolation and taps */
+static int verify_rate(const struct pluto_rate_plan *pl)
+{
+  uint32_t rxr = 0, txr = 0;
+  uint8_t rxe = 0, txe = 0;
+  AD9361_RXFIRConfig rf;
+  AD9361_TXFIRConfig tf;
+  memset(&rf, 0, sizeof(rf));
+  memset(&tf, 0, sizeof(tf));
+  ad9361_get_rx_sampling_freq(phy, &rxr);
+  ad9361_get_tx_sampling_freq(phy, &txr);
+  ad9361_get_rx_fir_en_dis(phy, &rxe);
+  ad9361_get_tx_fir_en_dis(phy, &txe);
+  ad9361_get_rx_fir_config(phy, 0, &rf);
+  ad9361_get_tx_fir_config(phy, 0, &tf);
+  uint32_t rxc[6] = {0}, txc[6] = {0};
+  ad9361_get_trx_path_clks(phy, rxc, txc);
+  uint32_t tol = pl->phy_hz / 1000u + 1u;
+  int ok = rxr + tol >= pl->phy_hz && rxr <= pl->phy_hz + tol && txr + tol >= pl->phy_hz &&
+           txr <= pl->phy_hz + tol && rxe && txe && rf.rx_dec == pl->fir_dec &&
+           tf.tx_int == pl->fir_dec && rf.rx_coef_size == pl->fir_taps &&
+           tf.tx_coef_size == pl->fir_taps;
+  printf("pluto: PHY RX %u / TX %u Hz (plan %u), FIR RX %s %u taps dec %u gain %d dB, TX %s %u taps "
+         "int %u gain %d dB, PL x8 %s -> %u S/s%s\n"
+         "pluto: RX path BBPLL %u ADC %u R2 %u R1 %u CLKRF %u RXSAMP %u; TX path DAC %u T2 %u T1 %u "
+         "CLKTF %u TXSAMP %u\n",
+         (unsigned)rxr, (unsigned)txr, (unsigned)pl->phy_hz, rxe ? "on" : "OFF",
+         (unsigned)rf.rx_coef_size, (unsigned)rf.rx_dec, (int)rf.rx_gain, txe ? "on" : "OFF",
+         (unsigned)tf.tx_coef_size, (unsigned)tf.tx_int, (int)tf.tx_gain,
+         pl->fpga_fir ? "on" : "off", (unsigned)pl->stream_hz, ok ? "" : "  MISMATCH",
+         (unsigned)rxc[0], (unsigned)rxc[1], (unsigned)rxc[2], (unsigned)rxc[3], (unsigned)rxc[4],
+         (unsigned)rxc[5], (unsigned)txc[1], (unsigned)txc[2], (unsigned)txc[3], (unsigned)txc[4],
+         (unsigned)txc[5]);
+  return ok ? 0 : -EIO;
+}
+
 int pluto_hw_set_rate(uint32_t rate_hz)
 {
-  if (!phy)
-    return -ENODEV;
-  /* SoapyPlutoSDR with libad9361 (fir = 4): below 25 MHz / 48 the PL x8 FIR is used */
-  int fpga = (double)rate_hz < 25e6 / 48.0;
-  uint64_t bb = fpga ? (uint64_t)rate_hz * 8u : rate_hz;
-  if (fpga && (double)bb < 25e6 / 48.0)
-    printf("pluto: sample rate %u is below the supported minimum\n", (unsigned)rate_hz);
-  if (bb > 61440000u || bb == 0)
+  struct pluto_rate_plan pl;
+  if (pluto_rate_plan(rate_hz, &pl) < 0) {
+    printf("pluto: sample rate %u not supported (65105 S/s .. 61.44 MS/s)\n", (unsigned)rate_hz);
     return -EINVAL;
-  if ((uint32_t)bb != cur_bb_rate) {
-    int ret = set_bb_rate((uint32_t)bb);
-    if (ret < 0) {
-      printf("pluto: baseband rate %u failed (%d)\n", (unsigned)bb, ret);
-      cur_bb_rate = 0;
-      return ret;
-    }
-    cur_bb_rate = (uint32_t)bb;
   }
-  if (fpga != cur_fpga_fir) {
+  LOCK();
+  int ret = 0;
+  if (!phy) {
+    ret = -ENODEV;
+    goto out;
+  }
+  if (pl.phy_hz != cur_bb_rate) {
+    ret = set_bb_rate(&pl);
+    if (ret >= 0)
+      ret = verify_rate(&pl);
+    if (ret < 0) {
+      printf("pluto: baseband rate %u failed (%d)\n", (unsigned)pl.phy_hz, ret);
+      cur_bb_rate = 0;
+      suspect = 1;
+      goto out;
+    }
+    cur_bb_rate = pl.phy_hz;
+  }
+  if (pl.fpga_fir != cur_fpga_fir) {
     uint32_t a = REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT);
     uint32_t d = REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT);
-    REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT) = pluto_gpio_with_fir(a, fpga);
-    REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT) = pluto_gpio_with_fir(d, fpga);
-    cur_fpga_fir = fpga;
+    REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT) = pluto_gpio_with_fir(a, pl.fpga_fir);
+    REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT) = pluto_gpio_with_fir(d, pl.fpga_fir);
+    cur_fpga_fir = pl.fpga_fir;
   }
-  return 0;
+out:
+  UNLOCK();
+  return ret;
 }
 
 int pluto_hw_fpga_fir(void)
 {
-  return cur_fpga_fir > 0;
+  LOCK();
+  int r = cur_fpga_fir > 0;
+  UNLOCK();
+  return r;
 }
 
 double pluto_hw_get_rate(int tx)
 {
-  if (!phy)
-    return 0;
+  LOCK();
   uint32_t r = 0;
-  if (tx)
-    ad9361_get_tx_sampling_freq(phy, &r);
-  else
-    ad9361_get_rx_sampling_freq(phy, &r);
-  return cur_fpga_fir > 0 ? (double)r / 8.0 : (double)r;
+  if (phy) {
+    if (tx)
+      ad9361_get_tx_sampling_freq(phy, &r);
+    else
+      ad9361_get_rx_sampling_freq(phy, &r);
+  }
+  double v = cur_fpga_fir > 0 ? (double)r / 8.0 : (double)r;
+  UNLOCK();
+  return v;
 }
 
-/* ---- LO, bandwidth, gain, ports ---- */
+/* ---- LO, bandwidth, gain, ports (each under hw_lock; a failure marks the phy suspect) ---- */
 
-int pluto_hw_set_lo(int tx, uint64_t hz)
+#define HW_CALL(expr)                                                                             \
+  do {                                                                                            \
+    LOCK();                                                                                       \
+    int r_ = phy ? (int)(expr) : -ENODEV;                                                         \
+    if (r_ < 0 && phy)                                                                            \
+      suspect = 1;                                                                                \
+    UNLOCK();                                                                                     \
+    return r_;                                                                                    \
+  } while (0)
+
+static int set_lo_locked(int tx, uint64_t hz)
 {
-  if (!phy)
-    return -ENODEV;
-  if (hz < AD9363A_MIN_CARRIER_FREQ_HZ || hz > AD9363A_MAX_CARRIER_FREQ_HZ)
-    return -EINVAL;
   int32_t ret = tx ? ad9361_set_tx_lo_freq(phy, hz) : ad9361_set_rx_lo_freq(phy, hz);
   if (ret >= 0 && !tx)
     apply_rx_band(hz);
   return (int)ret;
 }
 
+int pluto_hw_set_lo(int tx, uint64_t hz)
+{
+  if (hz < AD9363A_MIN_CARRIER_FREQ_HZ || hz > AD9363A_MAX_CARRIER_FREQ_HZ)
+    return -EINVAL;
+  HW_CALL(set_lo_locked(tx, hz));
+}
+
 uint64_t pluto_hw_get_lo(int tx)
 {
   uint64_t hz = 0;
-  if (!phy)
-    return 0;
-  if (tx)
-    ad9361_get_tx_lo_freq(phy, &hz);
-  else
-    ad9361_get_rx_lo_freq(phy, &hz);
+  LOCK();
+  if (phy) {
+    if (tx)
+      ad9361_get_tx_lo_freq(phy, &hz);
+    else
+      ad9361_get_rx_lo_freq(phy, &hz);
+  }
+  UNLOCK();
   return hz;
 }
 
 int pluto_hw_lo_power(int tx, int on)
 {
-  if (!phy)
-    return -ENODEV;
-  return (int)(tx ? ad9361_tx_lo_powerdown(phy, on ? ON : OFF)
-                  : ad9361_rx_lo_powerdown(phy, on ? ON : OFF));
+  HW_CALL(tx ? ad9361_tx_lo_powerdown(phy, on ? ON : OFF) : ad9361_rx_lo_powerdown(phy, on ? ON : OFF));
 }
 
 int pluto_hw_set_bw(int tx, uint32_t hz)
 {
-  if (!phy)
-    return -ENODEV;
-  return (int)(tx ? ad9361_set_tx_rf_bandwidth(phy, hz) : ad9361_set_rx_rf_bandwidth(phy, hz));
+  HW_CALL(tx ? ad9361_set_tx_rf_bandwidth(phy, hz) : ad9361_set_rx_rf_bandwidth(phy, hz));
 }
 
 uint32_t pluto_hw_get_bw(int tx)
 {
   uint32_t hz = 0;
-  if (!phy)
-    return 0;
-  if (tx)
-    ad9361_get_tx_rf_bandwidth(phy, &hz);
-  else
-    ad9361_get_rx_rf_bandwidth(phy, &hz);
+  LOCK();
+  if (phy) {
+    if (tx)
+      ad9361_get_tx_rf_bandwidth(phy, &hz);
+    else
+      ad9361_get_rx_rf_bandwidth(phy, &hz);
+  }
+  UNLOCK();
   return hz;
 }
 
 int pluto_hw_set_rx_agc(int automatic)
 {
-  if (!phy)
-    return -ENODEV;
-  return (int)ad9361_set_rx_gain_control_mode(phy, 0,
-                                              automatic ? RF_GAIN_SLOWATTACK_AGC : RF_GAIN_MGC);
+  HW_CALL(ad9361_set_rx_gain_control_mode(phy, 0, automatic ? RF_GAIN_SLOWATTACK_AGC : RF_GAIN_MGC));
+}
+
+int pluto_hw_get_rx_agc(void)
+{
+  uint8_t mode = 0;
+  LOCK();
+  int r = phy ? (int)ad9361_get_rx_gain_control_mode(phy, 0, &mode) : -ENODEV;
+  UNLOCK();
+  return r < 0 ? r : (int)mode;
 }
 
 int pluto_hw_set_rx_gain(int32_t db)
 {
-  if (!phy)
-    return -ENODEV;
-  return (int)ad9361_set_rx_rf_gain(phy, 0, db);
+  HW_CALL(ad9361_set_rx_rf_gain(phy, 0, db));
 }
 
 int32_t pluto_hw_get_rx_gain(void)
 {
   int32_t db = 0;
+  LOCK();
   if (phy)
     ad9361_get_rx_rf_gain(phy, 0, &db);
+  UNLOCK();
   return db;
 }
 
 int pluto_hw_set_tx_atten_mdb(uint32_t mdb)
 {
-  if (!phy)
-    return -ENODEV;
-  return (int)ad9361_set_tx_attenuation(phy, 0, mdb);
+  HW_CALL(ad9361_set_tx_attenuation(phy, 0, mdb));
 }
 
 uint32_t pluto_hw_get_tx_atten_mdb(void)
 {
   uint32_t mdb = 0;
+  LOCK();
   if (phy)
     ad9361_get_tx_attenuation(phy, 0, &mdb);
+  UNLOCK();
   return mdb;
 }
 
 int pluto_hw_set_rx_port(uint32_t port)
 {
-  return phy ? (int)ad9361_set_rx_rf_port_input(phy, port) : -ENODEV;
+  HW_CALL(ad9361_set_rx_rf_port_input(phy, port));
 }
 
 int pluto_hw_set_tx_port(uint32_t port)
 {
-  return phy ? (int)ad9361_set_tx_rf_port_output(phy, port) : -ENODEV;
+  HW_CALL(ad9361_set_tx_rf_port_output(phy, port));
 }
 
 int pluto_hw_set_loopback(int mode)
 {
-  return phy ? (int)ad9361_bist_loopback(phy, mode) : -ENODEV;
+  HW_CALL(ad9361_bist_loopback(phy, mode));
 }
 
 int pluto_hw_temp_mdeg(int32_t *mdeg)
 {
-  return phy ? (int)ad9361_get_temperature(phy, mdeg) : -ENODEV;
+  LOCK();
+  int r = phy ? (int)ad9361_get_temperature(phy, mdeg) : -ENODEV;
+  UNLOCK();
+  return r;
+}
+
+/* one line of readbacks proving the signal path settings (stream start) */
+int pluto_hw_summary(char *buf, size_t cap)
+{
+  LOCK();
+  if (!phy) {
+    UNLOCK();
+    return snprintf(buf, cap, "AD9363 not open");
+  }
+  uint32_t rxr = 0, txr = 0, att = 0, rbw = 0, tbw = 0, rport = 0, tport = 0, bist = 0;
+  int32_t g = 0;
+  uint8_t mode = 0, rxe = 0, txe = 0;
+  AD9361_RXFIRConfig rf;
+  AD9361_TXFIRConfig tf;
+  memset(&rf, 0, sizeof(rf));
+  memset(&tf, 0, sizeof(tf));
+  ad9361_get_rx_sampling_freq(phy, &rxr);
+  ad9361_get_tx_sampling_freq(phy, &txr);
+  ad9361_get_rx_fir_en_dis(phy, &rxe);
+  ad9361_get_tx_fir_en_dis(phy, &txe);
+  ad9361_get_rx_fir_config(phy, 0, &rf);
+  ad9361_get_tx_fir_config(phy, 0, &tf);
+  ad9361_get_tx_attenuation(phy, 0, &att);
+  ad9361_get_rx_gain_control_mode(phy, 0, &mode);
+  ad9361_get_rx_rf_gain(phy, 0, &g);
+  ad9361_get_rx_rf_bandwidth(phy, &rbw);
+  ad9361_get_tx_rf_bandwidth(phy, &tbw);
+  ad9361_get_rx_rf_port_input(phy, &rport);
+  ad9361_get_tx_rf_port_output(phy, &tport);
+  ad9361_get_bist_loopback(phy, (int32_t *)&bist);
+  uint32_t adc = REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT), dac = REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT);
+  uint32_t dsel = REG32(PLUTO_DAC_BASE + PLUTO_REG_DAC_CHAN_CNTRL_7(0)) & 0xfu;
+  uint32_t adcc = REG32(PLUTO_ADC_BASE + PLUTO_REG_ADC_CHAN_CNTRL(0));
+  static const char *const modes[] = {"manual", "fast_attack", "slow_attack", "hybrid"};
+  int n = snprintf(buf, cap,
+                   "PHY RX %u TX %u Hz, PL x8 %s/%s (stream %u S/s); FIR RX %s %u/%u gain %d dB, TX %s "
+                   "%u/%u gain %d dB; TX atten %u mdB; RX gain %d dB %s; RF BW RX %u TX %u Hz; "
+                   "ports RX %u TX %u; BIST loopback %u; DAC sel %u (2 = DMA); ADC ch0 cntrl %08x; "
+                   "samples RX 12-bit LSB aligned sign extended (CF32 /2048), TX 12-bit MSB aligned "
+                   "(CF32 *32768)",
+                   (unsigned)rxr, (unsigned)txr, (adc & 1u) ? "on" : "off", (dac & 1u) ? "on" : "off",
+                   (unsigned)(cur_fpga_fir > 0 ? rxr / 8u : rxr), rxe ? "on" : "OFF",
+                   (unsigned)rf.rx_coef_size, (unsigned)rf.rx_dec, (int)rf.rx_gain, txe ? "on" : "OFF",
+                   (unsigned)tf.tx_coef_size, (unsigned)tf.tx_int, (int)tf.tx_gain, (unsigned)att,
+                   (int)g, mode < 4 ? modes[mode] : "?", (unsigned)rbw, (unsigned)tbw,
+                   (unsigned)rport, (unsigned)tport, (unsigned)bist, (unsigned)dsel, (unsigned)adcc);
+  UNLOCK();
+  return n;
+}
+
+
+/* passband (DC) gain of an AD936x FIR from its taps, in dB: RX = sum / 2^15 + gain field,
+ * TX interpolating by L = mean per-phase sum / 2^15 + gain field (each output phase sums every
+ * L-th tap). Same arithmetic for Linux and here: the taps and gain fields are the libad9361 ones. */
+static double fir_dc_db(const int16_t *h, uint32_t n, uint32_t phases, int gain_db)
+{
+  double sum = 0;
+  for (uint32_t i = 0; i < n; ++i)
+    sum += h[i];
+  double g = sum / (32768.0 * (phases ? phases : 1));
+  return (g > 0 ? 20.0 * log10(g) : -99.0) + gain_db;
+}
+
+/* the TX and RX chains as programmed, from readbacks: one line each */
+int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rxcap)
+{
+  LOCK();
+  if (!phy) {
+    UNLOCK();
+    snprintf(tx_line, txcap, "AD9363 not open");
+    snprintf(rx_line, rxcap, "AD9363 not open");
+    return -ENODEV;
+  }
+  int tf = (int)ad9361_spi_read(phy->spi, REG_TX_ENABLE_FILTER_CTRL);
+  int rfc = (int)ad9361_spi_read(phy->spi, REG_RX_ENABLE_FILTER_CTRL);
+  AD9361_RXFIRConfig rf;
+  AD9361_TXFIRConfig tc;
+  memset(&rf, 0, sizeof(rf));
+  memset(&tc, 0, sizeof(tc));
+  ad9361_get_rx_fir_config(phy, 0, &rf);
+  ad9361_get_tx_fir_config(phy, 0, &tc);
+  uint32_t att = 0, txr = 0, rxr = 0;
+  int32_t g = 0;
+  uint8_t mode = 0;
+  ad9361_get_tx_attenuation(phy, 0, &att);
+  ad9361_get_tx_sampling_freq(phy, &txr);
+  ad9361_get_rx_sampling_freq(phy, &rxr);
+  ad9361_get_rx_rf_gain(phy, 0, &g);
+  ad9361_get_rx_gain_control_mode(phy, 0, &mode);
+  uint32_t dgpio = REG32(PLUTO_DAC_BASE + PLUTO_REG_GPIO_OUT), agpio = REG32(PLUTO_ADC_BASE + PLUTO_REG_GPIO_OUT);
+  uint32_t tint = tc.tx_int ? tc.tx_int : 1, rdec = rf.rx_dec ? rf.rx_dec : 1;
+  /* the loaded taps are ours (load_fir); the readback sizes/gains say they are in place */
+  double tdb = fir_dc_db(fir_taps(tint, tc.tx_coef_size), tc.tx_coef_size, tint, tc.tx_gain);
+  double rdb = fir_dc_db(fir_taps(rdec, rf.rx_coef_size), rf.rx_coef_size, 1, rf.rx_gain);
+  int thb3 = tf >= 0 ? (tf >> 4) & 3 : -1;
+  int rhb3 = rfc >= 0 ? (rfc >> 4) & 3 : -1;
+  snprintf(tx_line, txcap,
+           "TX chain: FPGA interp x%u (stock ADI pluto interpolator, same bitstream as Linux), "
+           "FIR %u taps int %u gain %d dB, taps per output phase sum to %+.2f dB (libad9361 table, as on Linux), HB THB3 %d THB2 %d THB1 %d (reg 0x002 "
+           "= 0x%02x), PHY %u S/s, DAC 12-bit MSB aligned (CS16 +-32767 = full scale), atten %u mdB",
+           (dgpio & 1u) ? 8u : 1u, (unsigned)tc.tx_coef_size, (unsigned)tc.tx_int, (int)tc.tx_gain,
+           tdb, thb3, tf >= 0 ? !!(tf & THB2_EN) : -1, tf >= 0 ? !!(tf & THB1_EN) : -1,
+           (unsigned)(tf & 0xff), (unsigned)txr, (unsigned)att);
+  static const char *const modes[] = {"manual", "fast_attack", "slow_attack", "hybrid"};
+  snprintf(rx_line, rxcap,
+           "RX chain: FIR %u taps dec %u gain %d dB, taps sum + gain %+.2f dB (libad9361 table, as on Linux), HB RHB3 %d RHB2 %d RHB1 %d "
+           "(reg 0x003 = 0x%02x), PHY %u S/s, FPGA decim x%u, ADC 12-bit LSB aligned sign extended "
+           "(CS16 +-2048 = full scale), gain %d dB %s",
+           (unsigned)rf.rx_coef_size, (unsigned)rf.rx_dec, (int)rf.rx_gain, rdb, rhb3,
+           rfc >= 0 ? !!(rfc & RHB2_EN) : -1, rfc >= 0 ? !!(rfc & RHB1_EN) : -1,
+           (unsigned)(rfc & 0xff), (unsigned)rxr, (agpio & 1u) ? 8u : 1u, (int)g,
+           mode < 4 ? modes[mode] : "?");
+  UNLOCK();
+  return 0;
 }
 
 /* ---- timestamping core registers ---- */

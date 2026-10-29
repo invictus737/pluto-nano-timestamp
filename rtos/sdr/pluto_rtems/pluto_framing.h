@@ -164,6 +164,24 @@ int pluto_tx_write(struct pluto_tx_writer *w, const struct pluto_tx_sink *sink, 
                    const void *src, size_t n, int has_time, uint64_t stamp, int end_burst,
                    long timeout_us);
 
+/*
+ * Signal level meter over the samples a stream already moved (no extra copy): peak component and
+ * mean complex power, reported in dBFS of the stream's full scale (RX CS16 2048, TX CS16 32768,
+ * CS8 128, CF32 1.0). A full-scale complex tone reads 0 dBFS RMS and 0 dBFS peak.
+ */
+struct pluto_level {
+  uint64_t sumsq_i; /* CS16/CS8: sum of squared components */
+  uint32_t peak_i;
+  double sumsq_f;   /* CF32 */
+  float peak_f;
+  uint64_t values;  /* components (2 per complex sample) */
+};
+void pluto_level_reset(struct pluto_level *l);
+void pluto_level_add(struct pluto_level *l, enum pluto_format f, const void *buf, size_t samples);
+/* full_scale_cs16: PLUTO_RX_FULL_SCALE or PLUTO_TX_FULL_SCALE. Returns 0, or -1 with no samples */
+int pluto_level_dbfs(const struct pluto_level *l, enum pluto_format f, float full_scale_cs16,
+                     double *peak_dbfs, double *rms_dbfs);
+
 #ifdef __cplusplus
 }
 #endif

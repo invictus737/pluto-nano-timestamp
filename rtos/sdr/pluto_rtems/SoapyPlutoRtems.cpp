@@ -152,7 +152,12 @@ struct Stream {
   pluto_dma *dma = nullptr;
   bool active = false;
   std::mutex mutex;
+  // level meter over the samples the stream moves (diagnostics), logged every kLevelPeriodNs
+  pluto_level level{};
+  int64_t level_since_ns = 0;
 };
+
+constexpr int64_t kLevelPeriodNs = 10000000000LL;
 
 struct RxStream : Stream {
   pluto_rx_reader reader{};
@@ -324,6 +329,8 @@ private:
   static void rx_block_hook(void *ctx, const uint8_t *block);
   bool hw_now_ticks(uint64_t &ticks) const;
   int restart_rx_locked();
+  void log_signal_path(const char *when);
+  void level_account(Stream *s, const void *buf, size_t samples, bool rx);
 
   mutable std::recursive_mutex dev_mutex_;
   RxStream *rx_ = nullptr;
@@ -332,6 +339,8 @@ private:
   uint32_t timestamp_every_tx_ = 0;
   int loopback_ = -1;
   bool gain_auto_ = false;
+  std::atomic<int> rx_gain_db_{-1000};   // last RX gain readback (for the level log)
+  std::atomic<uint32_t> tx_atten_mdb_{0}; // last TX attenuation readback
   double rate_ = 1e6;           // nominal stream rate: tick <-> ns conversions
   uint32_t refclk_hz_ = 0;
   std::string refclk_source_;
@@ -355,11 +364,17 @@ SoapyPlutoRtems::SoapyPlutoRtems(const SoapySDR::Kwargs &args)
   int ret = pluto_hw_open(refclk_hz_);
   if (ret < 0)
     throw std::runtime_error("PlutoSDR: AD9363 initialisation failed (" + std::to_string(ret) + ")");
-  // SoapyPlutoSDR constructor: RX A_BALANCED, manual gain, TX A
-  setAntenna(SOAPY_SDR_RX, 0, "A_BALANCED");
-  setGainMode(SOAPY_SDR_RX, 0, false);
-  setAntenna(SOAPY_SDR_TX, 0, "A");
-  handle_args(args, -1);
+  // the destructor does not run when the constructor throws: release the open here
+  try {
+    // SoapyPlutoSDR constructor: RX A_BALANCED, manual gain, TX A
+    setAntenna(SOAPY_SDR_RX, 0, "A_BALANCED");
+    setGainMode(SOAPY_SDR_RX, 0, false);
+    setAntenna(SOAPY_SDR_TX, 0, "A");
+    handle_args(args, -1);
+  } catch (...) {
+    pluto_hw_close();
+    throw;
+  }
 }
 
 SoapyPlutoRtems::~SoapyPlutoRtems()
@@ -571,7 +586,11 @@ int SoapyPlutoRtems::activateStream(SoapySDR::Stream *stream, const int flags, c
     pluto_hw_dma_status_clear(0);
     pluto_rx_reader_reset(&rx_->reader, nullptr);
     anchor_valid_ = false;
-    pluto_dma_start(rx_->dma);
+    pluto_level_reset(&rx_->level);
+    rx_->level_since_ns = monotonic_ns();
+    log_signal_path("RX stream start");
+    if (pluto_dma_start(rx_->dma) != 0)
+      return SOAPY_SDR_STREAM_ERROR;
     rx_->active = true;
     return 0;
   }
@@ -584,7 +603,11 @@ int SoapyPlutoRtems::activateStream(SoapySDR::Stream *stream, const int flags, c
     pluto_tx_writer_reset(&tx_->writer);
     tx_->discard_base = pluto_hw_tx_discarded();
     tx_->discard_reported = 0;
-    pluto_dma_start(tx_->dma);
+    pluto_level_reset(&tx_->level);
+    tx_->level_since_ns = monotonic_ns();
+    log_signal_path("TX stream start");
+    if (pluto_dma_start(tx_->dma) != 0)
+      return SOAPY_SDR_STREAM_ERROR;
     tx_->active = true;
     return 0;
   }
@@ -663,6 +686,7 @@ int SoapyPlutoRtems::readStream(SoapySDR::Stream *stream, void *const *buffs, co
       }
       r->reported_overflows = r->reader.track.overflows;
     }
+    level_account(r, buffs[0], size_t(n), true);
     return n;
   }
 }
@@ -684,6 +708,7 @@ int SoapyPlutoRtems::writeStream(SoapySDR::Stream *stream, const void *const *bu
                          (flags & SOAPY_SDR_END_BURST) ? 1 : 0, timeoutUs);
   if (n == PLUTO_ERR_TIMEOUT)
     return SOAPY_SDR_TIMEOUT;
+  level_account(t, buffs[0], size_t(n), false);
   return n;
 }
 
@@ -713,6 +738,40 @@ int SoapyPlutoRtems::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask
 }
 
 // ---- hardware time ----
+
+void SoapyPlutoRtems::log_signal_path(const char *when)
+{
+  // at every stream start: readbacks proving the signal path settings on the board
+  char line[640], tx[384], rx[384];
+  pluto_hw_summary(line, sizeof(line));
+  pluto_hw_chain_summary(tx, sizeof(tx), rx, sizeof(rx));
+  SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR %s: %s", when, line);
+  SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR %s", tx);
+  SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR %s", rx);
+}
+
+void SoapyPlutoRtems::level_account(Stream *s, const void *buf, size_t samples, bool rx)
+{
+  // caller holds s->mutex; the samples are the ones just copied (cached memory)
+  if (samples == 0)
+    return;
+  pluto_level_add(&s->level, s->fmt, buf, samples);
+  int64_t now = monotonic_ns();
+  if (now - s->level_since_ns < kLevelPeriodNs)
+    return;
+  double pk = 0, rms = 0;
+  if (pluto_level_dbfs(&s->level, s->fmt, rx ? PLUTO_RX_FULL_SCALE : PLUTO_TX_FULL_SCALE, &pk, &rms) == 0) {
+    if (rx)
+      SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR RX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; gain %d dB %s",
+                    pk, rms, double(now - s->level_since_ns) * 1e-9, rx_gain_db_.load(),
+                    gain_auto_ ? "slow_attack" : "manual");
+    else
+      SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR TX level: peak %.1f dBFS, rms %.1f dBFS over %.1f s; attenuation %u mdB",
+                    pk, rms, double(now - s->level_since_ns) * 1e-9, unsigned(tx_atten_mdb_.load()));
+  }
+  pluto_level_reset(&s->level);
+  s->level_since_ns = now;
+}
 
 void SoapyPlutoRtems::rx_block_hook(void *ctx, const uint8_t *block)
 {
@@ -795,6 +854,9 @@ void SoapyPlutoRtems::setGainMode(const int direction, const size_t channel, con
   if (pluto_hw_set_rx_agc(automatic ? 1 : 0) < 0)
     throw std::runtime_error("PlutoSDR: gain control mode failed");
   gain_auto_ = automatic;
+  int mode = pluto_hw_get_rx_agc();
+  SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR: RX gain control %s (readback %s)", automatic ? "slow_attack" : "manual",
+                mode == 0 ? "manual" : mode == 2 ? "slow_attack" : "?");
 }
 
 void SoapyPlutoRtems::setGain(const int direction, const size_t channel, const double value)
@@ -803,16 +865,25 @@ void SoapyPlutoRtems::setGain(const int direction, const size_t channel, const d
   if (!std::isfinite(value))
     throw std::runtime_error("PlutoSDR: gain must be finite");
   std::lock_guard<std::recursive_mutex> lock(dev_mutex_);
+  // SoapyPlutoSDR: (long long)value written as hardwaregain, i.e. truncated to whole dB; TX
+  // hardwaregain = gain - 89 dB (attenuation 0 at 89). Applied at once, also while streaming.
   if (direction == SOAPY_SDR_RX) {
     double g = std::min(kRxGainMax, std::max(0.0, value));
-    if (pluto_hw_set_rx_gain(int32_t(g)) < 0) // SoapyPlutoSDR truncates to whole dB
+    if (pluto_hw_set_rx_gain(int32_t(g)) < 0)
       throw std::runtime_error("PlutoSDR: RX gain failed");
+    int32_t rb = pluto_hw_get_rx_gain();
+    rx_gain_db_ = int(rb);
+    SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR: RX gain %d dB (readback %d dB, %s)", int(int32_t(g)), int(rb),
+                  gain_auto_ ? "slow_attack" : "manual");
   } else {
     double g = std::min(kTxGainMax, std::max(0.0, value));
-    // hardwaregain = gain - 89 dB in 0.25 dB steps
-    uint32_t mdb = uint32_t(std::lround((kTxGainMax - g) * 4.0)) * 250u;
+    uint32_t mdb = uint32_t((long long)kTxGainMax - (long long)g) * 1000u;
     if (pluto_hw_set_tx_atten_mdb(mdb) < 0)
       throw std::runtime_error("PlutoSDR: TX attenuation failed");
+    uint32_t rb = pluto_hw_get_tx_atten_mdb();
+    tx_atten_mdb_ = rb;
+    SoapySDR_logf(SOAPY_SDR_INFO, "PlutoSDR: TX gain %lld dB: TX attenuation %u mdB (readback %u mdB)",
+                  (long long)g, unsigned(mdb), unsigned(rb));
   }
 }
 

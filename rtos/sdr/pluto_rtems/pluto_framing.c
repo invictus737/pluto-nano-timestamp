@@ -318,3 +318,76 @@ int pluto_tx_write(struct pluto_tx_writer *w, const struct pluto_tx_sink *sink, 
     commit_block(w, sink);
   return (int)items;
 }
+
+/* ---- level meter ---- */
+
+void pluto_level_reset(struct pluto_level *l)
+{
+  memset(l, 0, sizeof(*l));
+}
+
+void pluto_level_add(struct pluto_level *l, enum pluto_format f, const void *buf, size_t samples)
+{
+  const size_t n = samples * 2;
+  switch (f) {
+  case PLUTO_FMT_CS16: {
+    const int16_t *v = (const int16_t *)buf;
+    uint64_t ss = 0;
+    uint32_t pk = l->peak_i;
+    for (size_t i = 0; i < n; ++i) {
+      int32_t x = v[i];
+      uint32_t a = (uint32_t)(x < 0 ? -x : x);
+      ss += (uint64_t)((int64_t)x * x);
+      if (a > pk)
+        pk = a;
+    }
+    l->sumsq_i += ss;
+    l->peak_i = pk;
+    break;
+  }
+  case PLUTO_FMT_CS8: {
+    const int8_t *v = (const int8_t *)buf;
+    uint64_t ss = 0;
+    uint32_t pk = l->peak_i;
+    for (size_t i = 0; i < n; ++i) {
+      int32_t x = v[i];
+      uint32_t a = (uint32_t)(x < 0 ? -x : x);
+      ss += (uint64_t)(x * x);
+      if (a > pk)
+        pk = a;
+    }
+    l->sumsq_i += ss;
+    l->peak_i = pk;
+    break;
+  }
+  case PLUTO_FMT_CF32: {
+    const float *v = (const float *)buf;
+    float ss = 0, pk = l->peak_f;
+    for (size_t i = 0; i < n; ++i) {
+      float x = v[i];
+      ss += x * x;
+      float a = fabsf(x);
+      if (a > pk)
+        pk = a;
+    }
+    l->sumsq_f += ss;
+    l->peak_f = pk;
+    break;
+  }
+  }
+  l->values += n;
+}
+
+int pluto_level_dbfs(const struct pluto_level *l, enum pluto_format f, float full_scale_cs16,
+                     double *peak_dbfs, double *rms_dbfs)
+{
+  if (l->values < 2)
+    return -1;
+  double fs = f == PLUTO_FMT_CF32 ? 1.0 : f == PLUTO_FMT_CS8 ? 128.0 : (double)full_scale_cs16;
+  double ss = f == PLUTO_FMT_CF32 ? l->sumsq_f : (double)l->sumsq_i;
+  double pk = f == PLUTO_FMT_CF32 ? (double)l->peak_f : (double)l->peak_i;
+  double power = ss / ((double)l->values / 2.0) / (fs * fs); /* mean |x|^2 per complex sample */
+  *rms_dbfs = power > 0 ? 10.0 * log10(power) : -200.0;
+  *peak_dbfs = pk > 0 ? 20.0 * log10(pk / fs) : -200.0;
+  return 0;
+}

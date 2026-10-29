@@ -7,13 +7,20 @@
 #ifndef PLUTO_HW_H
 #define PLUTO_HW_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* bring up the AD9363 (reset, SPI, setup, digital interface tuning, cores); 0 ok */
+/*
+ * Bring up the AD9363 (PL check, reset + PRODUCT_ID probe, setup, digital interface tuning,
+ * cores, health check) or reuse the healthy one: 0 ok, negative error with nothing left
+ * initialised. Every pluto_hw_* call is serialised by one lock (thread safe, shared by all
+ * SoapySDR device instances); pluto_hw_close() releases one open. A phy whose operation failed
+ * is rebuilt from reset by the next open made while no other open is held.
+ */
 int pluto_hw_open(uint32_t refclk_hz);
 void pluto_hw_close(void);
 int pluto_hw_is_open(void);
@@ -38,6 +45,8 @@ int pluto_hw_set_bw(int tx, uint32_t hz);
 uint32_t pluto_hw_get_bw(int tx);
 
 int pluto_hw_set_rx_agc(int automatic);
+/* gain control mode readback: 0 manual, 2 slow attack (RF_GAIN_*), negative error */
+int pluto_hw_get_rx_agc(void);
 int pluto_hw_set_rx_gain(int32_t db);
 int32_t pluto_hw_get_rx_gain(void);
 int pluto_hw_set_tx_atten_mdb(uint32_t mdb);
@@ -49,6 +58,11 @@ int pluto_hw_set_tx_port(uint32_t port);
 
 /* AD936x BIST loopback: 0 off, 1 digital (TX->RX in the AD9363), 2 RF */
 int pluto_hw_set_loopback(int mode);
+
+/* one-line readback summary of the signal path (rates, FIR, gains, BW, ports, data select) */
+int pluto_hw_summary(char *buf, size_t cap);
+/* "TX chain: ..." and "RX chain: ..." readback lines (FIR passband gain from the loaded taps) */
+int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rxcap);
 
 /* AD9363 temperature in milli-degrees C */
 int pluto_hw_temp_mdeg(int32_t *mdeg);
