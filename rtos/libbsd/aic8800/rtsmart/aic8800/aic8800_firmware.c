@@ -18,9 +18,13 @@
 extern int aicwf_d80_fw_mode;   /* 0 auto (MCU1 -> legacy), 1 SDK5 only, 2 legacy only */
 static rt_bool_t aicwf_d80_legacy(const struct aic8800_context *context)
 {
-    /* auto = SDK 5.0 (the set the Linux image loads); legacy only on request */
-    (void)context;
-    return aicwf_d80_fw_mode == 2;
+    /* auto: MCU1 units take the legacy SDK V3 set. That is what the Linux image runs on
+     * this stick (firmware/aic8800-intree.sh: shenmintao/aic8800d80 legacy-mcu1, whose
+     * fw/aic8800D80 holds the 327037-byte V3 fmacfw); the SDK 5.0 fmacfw (358072 bytes)
+     * overruns the MCU1 upload window (that repository's issue #58), so its runtime
+     * starts but never confirms MM_SET_RF_CALIB_REQ. */
+    return aicwf_d80_fw_mode == 2 ||
+           (aicwf_d80_fw_mode == 0 && context && context->chip_mcu_id == 1U);
 }
 #endif
 
@@ -1008,7 +1012,16 @@ static rt_err_t aic_firmware_mem_block_write(
     if (result == RT_EOK && response_length >= 4U &&
         aic_fw_get_le32(response) != 0)
     {
+#ifdef AICWF_RTEMS
+        /* Linux (aic_load_fw rwnx_send_dbg_mem_block_write_req) waits for the CFM but
+         * never reads its wstatus, and the SDK V3 fmacfw it loads on MCU1 units ends in a
+         * 381-byte block (offset 0x4fc00) that this ROM answers with a nonzero wstatus.
+         * Log it and carry on, as Linux does. */
+        LOG_W("block write 0x%08x+%u: wstatus=0x%08x (ignored, as Linux)",
+              address, (unsigned int)length, aic_fw_get_le32(response));
+#else
         return -RT_ERROR;
+#endif
     }
     return result;
 }

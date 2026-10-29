@@ -15,7 +15,11 @@ Local changes (RTEMS port), all inside #ifdef AICWF_RTEMS (defined in ../shim/rt
       (as the Linux legacy-mcu1 loader does), record chip_mcu_id, and load the legacy
       SDK V3 set from aic8800D80_mcu1/ (shenmintao/aic8800d80, see ../fetch-firmware.sh)
       with the Linux patch configuration (pairs 0xb4=0xf3010000, 0x170=2); the shim's
-      "wifi fw auto|sdk5|legacy" overrides the choice (aicwf_d80_fw_mode).
+      "wifi fw auto|sdk5|legacy" overrides the choice (aicwf_d80_fw_mode). Auto picks the
+      legacy set for MCU1: the SDK 5.0 fmacfw overruns the MCU1 upload window and its
+      runtime never confirms MM_SET_RF_CALIB_REQ.
+    - DBG_MEM_BLOCK_WRITE_CFM: a nonzero wstatus is logged, not fatal (Linux never reads
+      it; the ROM flags the unaligned last block of the V3 fmacfw).
     - upload verify: a file whose size is not a multiple of 4 compares the first word only;
       on mismatch log a register/region dump; for the legacy D80 set a mismatch is a
       warning (the Linux loader never reads uploads back).
