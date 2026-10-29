@@ -37,6 +37,7 @@
 #include "hci_dump.h"
 #include "hci_transport_aicwf.h"
 
+#include "aicwf_bt.h"
 #include "aicwf_wifi.h"
 #include "config_store.h"
 
@@ -648,6 +649,41 @@ static void disconnect_all(void)
 /* ---- power ---- */
 
 static bool power_waiting; /* a power-on failed: retries are quiet until the controller is up */
+static int power_reason = -1; /* last aicwf_bt_present() reported while waiting */
+
+static const char *presence_text(int p)
+{
+  switch (p) {
+  case AICWF_BT_NO_DEVICE:
+    return "no AIC Wi-Fi/Bluetooth stick attached";
+  case AICWF_BT_STARTING:
+    return "AIC stick attached, its Bluetooth interface is not up yet (firmware loading)";
+  case AICWF_BT_UNSUPPORTED:
+    return "the attached AIC8800DC stick has no Bluetooth (use the D80 stick)";
+  default:
+    return "Bluetooth controller did not open";
+  }
+}
+
+static void power_retry_later(void);
+
+/* not attached / still loading / DC without Bluetooth: say so once per change, keep waiting */
+static bool power_wait_report(int p)
+{
+  if (p != power_reason) {
+    logf_bt("waiting: %s", presence_text(p));
+    power_reason = p;
+  }
+  power_waiting = true;
+  if (pending_op == OP_ON) {
+    outf("%s; Bluetooth comes up when it is there (retrying every %d s)\n", presence_text(p), POWER_RETRY_MS / 1000);
+    finish(OP_ON);
+  }
+  if (want_on) {
+    power_retry_later();
+  }
+  return true;
+}
 
 static void power_try(btstack_timer_source_t *ts)
 {
@@ -655,8 +691,12 @@ static void power_try(btstack_timer_source_t *ts)
   if (!want_on || hci_get_state() != HCI_STATE_OFF) {
     return;
   }
-  /* stick not attached (yet), or the DC variant without Bluetooth: BTSTACK_EVENT_POWERON_FAILED
-   * re-arms the timer; the failure was reported once */
+  int p = aicwf_bt_present();
+  if (p != AICWF_BT_READY) {
+    power_wait_report(p); /* no BTstack attempt: nothing to open */
+    return;
+  }
+  /* bound but the open failed: BTSTACK_EVENT_POWERON_FAILED re-arms the timer, reported once */
   if (power_waiting) {
     hci_dump_enable_log_level(HCI_DUMP_LOG_LEVEL_ERROR, 0);
   }
@@ -680,8 +720,8 @@ static void watch(btstack_timer_source_t *ts)
   btstack_run_loop_add_timer(ts);
   struct hci_transport_aicwf_stats st;
   hci_transport_aicwf_get_stats(&st);
-  if (st.failed && hci_get_state() == HCI_STATE_WORKING) {
-    logf_bt("controller lost, restarting Bluetooth");
+  if (st.failed && hci_get_state() != HCI_STATE_OFF) {
+    logf_bt("controller lost or reset, restarting Bluetooth");
     hci_power_control(HCI_POWER_OFF);
     if (want_on) {
       power_retry_later();
@@ -784,6 +824,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
     uint8_t s = btstack_event_state_get_state(packet);
     if (s == HCI_STATE_WORKING) {
       power_waiting = false;
+      power_reason = -1;
       gap_local_bd_addr(local_addr);
       if (tlv_impl == NULL) {
         tlv_open();
@@ -823,18 +864,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
     break;
   }
   case BTSTACK_EVENT_POWERON_FAILED:
-    if (!power_waiting) {
-      logf_bt("waiting for the Bluetooth controller (AIC8800 D80 stick), retrying every %d s", POWER_RETRY_MS / 1000);
-    }
-    power_waiting = true;
-    if (pending_op == OP_ON) {
-      outf("no Bluetooth controller (AIC8800 D80 stick not attached or not up); retrying every %d s\n",
-           POWER_RETRY_MS / 1000);
-      finish(OP_ON);
-    }
-    if (want_on) {
-      power_retry_later();
-    }
+    power_wait_report(-1);
     break;
   case HCI_EVENT_PIN_CODE_REQUEST:
     /* legacy pairing (pre-2.1 devices): the usual fixed PIN */
@@ -1150,8 +1180,11 @@ static void op_status(void)
 {
   HCI_STATE s = hci_get_state();
   outf("state      %s%s\n", s == HCI_STATE_WORKING ? "on" : (s == HCI_STATE_OFF ? "off" : "starting"),
-       want_on ? (s == HCI_STATE_OFF ? ", enabled: waiting for the controller (AIC8800 D80 stick)" : "")
-               : " (disabled)");
+       want_on ? (s == HCI_STATE_OFF ? ", enabled: waiting" : "") : " (disabled)");
+  if (s != HCI_STATE_WORKING) {
+    int p = aicwf_bt_present();
+    outf("controller %s\n", p == AICWF_BT_READY ? "bound, not open" : presence_text(p));
+  }
   if (s == HCI_STATE_WORKING) {
     outf("controller %s\n", bd_addr_to_str(local_addr));
   }
@@ -1185,8 +1218,15 @@ static void op_status(void)
   }
   struct hci_transport_aicwf_stats ts;
   hci_transport_aicwf_get_stats(&ts);
-  outf("hci        rx %u, tx %u, tx errors %u, rx dropped %u, resync %u\n", (unsigned)ts.rx_packets,
-       (unsigned)ts.tx_packets, (unsigned)ts.tx_errors, (unsigned)ts.rx_dropped, (unsigned)ts.rx_resync);
+  struct aicwf_bt_stats ds;
+  bool have_ds = aicwf_bt_stats(&ds) == 0;
+  outf("hci        rx %u, tx %u, tx errors %u, rx dropped %u (driver ring %u), resync %u", (unsigned)ts.rx_packets,
+       (unsigned)ts.tx_packets, (unsigned)ts.tx_errors, (unsigned)ts.rx_dropped,
+       have_ds ? (unsigned)ds.rx_dropped : 0u, (unsigned)ts.rx_resync);
+  if (ds.vid) {
+    outf(", stick %04x:%04x", ds.vid, ds.pid);
+  }
+  outf("\n");
 }
 
 static void op_devices(void)

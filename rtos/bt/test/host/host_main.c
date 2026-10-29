@@ -17,6 +17,7 @@ extern char host_data_dir[];
 extern rtems_shell_command_t host_bt_cmd;
 extern unsigned host_afh_commands;
 extern int host_controller_present;
+extern int host_bt_presence;
 
 static int run(const char *line)
 {
@@ -42,6 +43,10 @@ int main(int argc, char **argv)
   nexus_bt_start();
   sleep(1);
   fails += run("bt status") != 0;
+  host_bt_presence = 2; /* DC stick: said so, keeps waiting */
+  fails += run("bt on") != 0;
+  fails += run("bt status") != 0;
+  host_bt_presence = -1;
   host_controller_present = 0; /* stick not attached yet: on reports it and retries */
   fails += run("bt on") != 0;
   host_controller_present = 1;

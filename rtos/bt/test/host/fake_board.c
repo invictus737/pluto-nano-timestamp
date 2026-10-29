@@ -109,6 +109,23 @@ static void cmd_status(uint16_t op)
 
 static const uint8_t dev_addr[6] = {0x75, 0x17, 0x89, 0x41, 0xe4, 0x0c}; /* little endian */
 
+int host_bt_presence = -1; /* -1: follow host_controller_present */
+int aicwf_bt_present(void)
+{
+  if (host_bt_presence >= 0) {
+    return host_bt_presence;
+  }
+  return host_controller_present ? AICWF_BT_READY : AICWF_BT_NO_DEVICE;
+}
+
+int aicwf_bt_stats(struct aicwf_bt_stats *st)
+{
+  memset(st, 0, sizeof(*st));
+  st->vid = 0xa69c;
+  st->pid = 0x8d81;
+  return 0;
+}
+
 int aicwf_bt_open(void)
 {
   if (!host_controller_present) {
