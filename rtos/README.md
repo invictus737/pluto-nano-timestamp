@@ -87,11 +87,21 @@ deleted from the stick (secrets are never printed). Format and all keys:
 ## Station placement and load
 
 The station follows the Nexus-Light layout by default (`[SYSTEM] nexus_layout = light`):
-CPU1 runs only the deadline path (RX analysis, drive loop with the modems, TETRA protocol
-tick, TX synthesis, one SCHED_FIFO priority), CPU0 runs the SDR stream I/O (RX/TX workers
-and the Pluto DMA threads and interrupts, above the network stack) and, at a low priority,
-everything else (Brew/TLS, network clients, dashboard, config). `cpu1` is the previous layout
-(whole station on CPU1), `float` keeps priorities without pinning.
+CPU1 runs the radio: the Pluto DMA threads and interrupts, the SDR RX/TX workers (just above
+the DSP group, so DMA buffers are drained first) and the deadline path (RX analysis, drive
+loop with the modems, TETRA protocol tick, TX synthesis, one SCHED_FIFO priority). CPU0
+serves USB, Wi-Fi and the network stack and, at a low priority, the rest of the station
+(Brew/TLS, network clients, dashboard, config): radio I/O on CPU0 delayed the ChipIdea EHCI
+interrupts (IAA timeouts, Wi-Fi lost). `cpu1` is the previous layout (whole station on
+CPU1), `float` keeps priorities without pinning. A/B switches (`nexus env`):
+`NEXUS2_RTEMS_IO_CPU=0` puts the RX/TX workers back on CPU0, `NEXUS2_SYNTHESIS_CPU0=1` moves
+TX synthesis to CPU0 when CPU1 is over budget.
+
+| Layout | CPU1 | CPU0 |
+|---|---|---|
+| light | PLRX/PLTX + DMA IRQs (max-2), nexus2-rx/tx (max-20), analysis, drive, protocol, synthesis (max-21) | USB, Wi-Fi, libbsd; other station threads at base priority 4 |
+| cpu1 | every station thread, DMA IRQs | USB, Wi-Fi, libbsd |
+| float | no pinning, same priorities as cpu1 | |
 
 Shell (UART or SSH):
 
