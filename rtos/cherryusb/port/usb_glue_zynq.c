@@ -554,6 +554,29 @@ int nexus_cherryusb_shell(int argc, char **argv)
                (unsigned long)st->async_kick_iaad, (unsigned long)st->async_kick_no_handshake,
                (unsigned)CONFIG_USB_EHCI_ASYNC_KICK_US, (unsigned)CONFIG_USB_EHCI_BULK_RL_HS);
     }
+#ifdef USB_HC_EHCI_NXP
+    {
+        /* CHERRY_HCD=nxp: the IAA counters above stay zero (no doorbell) */
+        const struct ehci_nxp_stats *ns = &g_ehci_nxp[0].stats;
+        uint32_t open = 0;
+
+        for (uint32_t i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
+            open += g_ehci_nxp[0].pipes[i].inuse;
+        }
+        printf("ehci-nxp: pipes %lu open (opened %lu closed %lu, no free %lu), qTDs free %lu; submits %lu "
+               "ok %lu errors %lu (stall %lu, halted restarts %lu, XACTERR restarts %lu), kills %lu\n",
+               (unsigned long)open, (unsigned long)ns->pipes_opened, (unsigned long)ns->pipes_closed,
+               (unsigned long)ns->no_pipe, (unsigned long)g_ehci_nxp[0].qtd_free_count,
+               (unsigned long)ns->submits, (unsigned long)ns->completions, (unsigned long)ns->errors,
+               (unsigned long)ns->stalls, (unsigned long)ns->halted_restarts,
+               (unsigned long)ns->xacterr_restarts, (unsigned long)ns->kills);
+        printf("ehci-nxp: schedule stops async %lu periodic %lu, handshake misses %lu, longest %lu us; "
+               "EP updates %lu, no qTD %lu, no transfer slot %lu\n",
+               (unsigned long)ns->async_stops, (unsigned long)ns->periodic_stops,
+               (unsigned long)ns->handshake_timeouts, (unsigned long)ns->max_handshake_us,
+               (unsigned long)ns->ep_updates, (unsigned long)ns->no_qtd, (unsigned long)ns->no_xfer);
+    }
+#endif
     if (aicwf_cherry_stats) {
         aicwf_cherry_stats();
     }
