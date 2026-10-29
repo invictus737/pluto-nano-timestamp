@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,3 +312,87 @@ int metrics_stage_table_json(jw_t *w, const char *report)
   }
   return rows;
 }
+
+/* ---- /cmd allowlist (http_status.c) ----
+ * nexus start|stop|status|layout [light|cpu1|float]|env [pluto|save|clear|NEXUS2_*=V|RUST_LOG=V
+ * ...]|stages [reset]|load [1..10]; usbh; lsusb [-t]; net status; wifi status. Words are limited
+ * to [A-Za-z0-9_=.:,/-], so nothing reaches a command that the shell would treat specially. */
+static int word_ok(const char *s)
+{
+  if (*s == '\0' || strlen(s) > 120) {
+    return 0;
+  }
+  for (; *s; ++s) {
+    char ch = *s;
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' ||
+          ch == '=' || ch == '.' || ch == ':' || ch == '-' || ch == ',' || ch == '/')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int is_env_kv(const char *s)
+{
+  return (strncmp(s, "NEXUS2_", 7) == 0 || strncmp(s, "RUST_LOG=", 9) == 0) && strchr(s, '=') != NULL;
+}
+
+int metrics_cmd_allowed(int argc, char **argv)
+{
+  if (argc < 1) {
+    return 0;
+  }
+  for (int i = 0; i < argc; ++i) {
+    if (!word_ok(argv[i])) {
+      return 0;
+    }
+  }
+  const char *c = argv[0], *s = argc > 1 ? argv[1] : "";
+  if (strcmp(c, "usbh") == 0) {
+    return argc == 1;
+  }
+  if (strcmp(c, "lsusb") == 0) {
+    return argc == 1 || (argc == 2 && strcmp(s, "-t") == 0);
+  }
+  if (strcmp(c, "net") == 0 || strcmp(c, "wifi") == 0) {
+    return argc == 2 && strcmp(s, "status") == 0;
+  }
+  if (strcmp(c, "nexus") != 0 || argc < 2) {
+    return 0;
+  }
+  if (strcmp(s, "start") == 0 || strcmp(s, "stop") == 0 || strcmp(s, "status") == 0) {
+    return argc == 2;
+  }
+  if (strcmp(s, "layout") == 0) {
+    return argc == 2 || (argc == 3 && (strcmp(argv[2], "light") == 0 || strcmp(argv[2], "cpu1") == 0 ||
+                                       strcmp(argv[2], "float") == 0));
+  }
+  if (strcmp(s, "stages") == 0) {
+    return argc == 2 || (argc == 3 && strcmp(argv[2], "reset") == 0);
+  }
+  if (strcmp(s, "load") == 0) {
+    if (argc == 2) {
+      return 1;
+    }
+    char *end;
+    long v = strtol(argv[2], &end, 10);
+    return argc == 3 && *end == '\0' && v >= 1 && v <= 10;
+  }
+  if (strcmp(s, "env") == 0) {
+    if (argc == 2) {
+      return 1;
+    }
+    if (argc == 3 && (strcmp(argv[2], "pluto") == 0 || strcmp(argv[2], "save") == 0 ||
+                      strcmp(argv[2], "clear") == 0)) {
+      return 1;
+    }
+    for (int i = 2; i < argc; ++i) {
+      if (!is_env_kv(argv[i])) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  return 0;
+}
+

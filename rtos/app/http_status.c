@@ -37,9 +37,11 @@ extern size_t nexus_log_read(uint32_t since, char *buf, size_t cap, uint32_t *ne
     __attribute__((weak));
 
 #define HTTP_REQ_MAX 2048
-#define HTTP_BODY_MAX 65536   /* /metrics with full=1 and top=64 stays well below */
-#define LOG_CHUNK_MAX 16384   /* raw log bytes per /log response (escaped size <= 6x) */
+#define LOG_CHUNK_MAX 16384   /* raw log bytes per /log response */
 #define CMD_OUT_MAX 16384
+/* JSON escaping is at most 6x (\u00XX per byte): a binary log chunk still fits; /metrics with
+ * full=1 and top=64 stays far below */
+#define HTTP_BODY_MAX (6 * LOG_CHUNK_MAX + 4096)
 
 static char req[HTTP_REQ_MAX + 1];
 static char body[HTTP_BODY_MAX];
@@ -194,81 +196,6 @@ static int cmd_authorized(const char *hdrs, int *configured)
   return ok;
 }
 
-static int word_ok(const char *s)
-{
-  if (*s == '\0' || strlen(s) > 120) {
-    return 0;
-  }
-  for (; *s; ++s) {
-    char ch = *s;
-    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' ||
-          ch == '=' || ch == '.' || ch == ':' || ch == '-' || ch == ',' || ch == '/')) {
-      return 0;
-    }
-  }
-  return 1;
-}
-
-static int is_env_kv(const char *s)
-{
-  return (strncmp(s, "NEXUS2_", 7) == 0 || strncmp(s, "RUST_LOG=", 9) == 0) && strchr(s, '=') != NULL;
-}
-
-/* the allowlist; argv already split and word_ok()-checked */
-static int cmd_allowed(int argc, char **argv)
-{
-  if (argc < 1) {
-    return 0;
-  }
-  const char *c = argv[0], *s = argc > 1 ? argv[1] : "";
-  if (strcmp(c, "usbh") == 0) {
-    return argc == 1;
-  }
-  if (strcmp(c, "lsusb") == 0) {
-    return argc == 1 || (argc == 2 && strcmp(s, "-t") == 0);
-  }
-  if (strcmp(c, "net") == 0 || strcmp(c, "wifi") == 0) {
-    return argc == 2 && strcmp(s, "status") == 0;
-  }
-  if (strcmp(c, "nexus") != 0 || argc < 2) {
-    return 0;
-  }
-  if (strcmp(s, "start") == 0 || strcmp(s, "stop") == 0 || strcmp(s, "status") == 0) {
-    return argc == 2;
-  }
-  if (strcmp(s, "layout") == 0) {
-    return argc == 2 || (argc == 3 && (strcmp(argv[2], "light") == 0 || strcmp(argv[2], "cpu1") == 0 ||
-                                       strcmp(argv[2], "float") == 0));
-  }
-  if (strcmp(s, "stages") == 0) {
-    return argc == 2 || (argc == 3 && strcmp(argv[2], "reset") == 0);
-  }
-  if (strcmp(s, "load") == 0) {
-    if (argc == 2) {
-      return 1;
-    }
-    char *end;
-    long v = strtol(argv[2], &end, 10);
-    return argc == 3 && *end == '\0' && v >= 1 && v <= 10;
-  }
-  if (strcmp(s, "env") == 0) {
-    if (argc == 2) {
-      return 1;
-    }
-    if (argc == 3 && (strcmp(argv[2], "pluto") == 0 || strcmp(argv[2], "save") == 0 ||
-                      strcmp(argv[2], "clear") == 0)) {
-      return 1;
-    }
-    for (int i = 2; i < argc; ++i) {
-      if (!is_env_kv(argv[i])) {
-        return 0;
-      }
-    }
-    return 1;
-  }
-  return 0;
-}
-
 static void serve_cmd(int c, const char *query, const char *hdrs, const char *form)
 {
   int configured;
@@ -286,14 +213,14 @@ static void serve_cmd(int c, const char *query, const char *hdrs, const char *fo
   int argc = 0;
   char *save = NULL;
   for (char *t = strtok_r(line, " ", &save); t != NULL; t = strtok_r(NULL, " ", &save)) {
-    if (argc >= 11 || !word_ok(t)) {
+    if (argc >= 11) {
       respond_error(c, "403 Forbidden", "command not allowed");
       return;
     }
     argv[argc++] = t;
   }
   argv[argc] = NULL;
-  if (!cmd_allowed(argc, argv)) {
+  if (!metrics_cmd_allowed(argc, argv)) {
     respond_error(c, "403 Forbidden", "command not allowed");
     return;
   }

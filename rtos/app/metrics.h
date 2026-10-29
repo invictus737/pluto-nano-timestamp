@@ -53,6 +53,9 @@ size_t jw_finish(jw_t *w);
  */
 int metrics_stage_table_json(jw_t *w, const char *report);
 
+/* /cmd allowlist (http_status.c): 1 when argv (split on spaces) may run */
+int metrics_cmd_allowed(int argc, char **argv);
+
 /* ---- collectors (metrics.c) ---- */
 
 /* request options, from the query string */
