@@ -21,7 +21,7 @@ else
   echo "kernel: cached"
 fi
 LB=$WORK/rtems-libbsd-fb14-$VER
-PATCHED="libbsd.py freebsd/sys/dev/usb/usb_msctest.c freebsd/sys/dev/usb/usb_msctest.h freebsd/sys/dev/usb/quirk/usb_quirk.c freebsd/sys/net80211/ieee80211_proto.c freebsd/sys/net80211/ieee80211_ioctl.c freebsd/sys/dev/rtwn/if_rtwn.c freebsd/sys/dev/usb/controller/ehci.c"
+PATCHED="libbsd.py freebsd/sys/dev/usb/usb_msctest.c freebsd/sys/dev/usb/usb_msctest.h freebsd/sys/dev/usb/quirk/usb_quirk.c freebsd/sys/net80211/ieee80211_proto.c freebsd/sys/net80211/ieee80211_ioctl.c freebsd/sys/dev/rtwn/if_rtwn.c freebsd/sys/dev/usb/controller/ehci.c rtemsbsd/rtems/rtems-kernel-bus-dma.c"
 INI_SUM=$(sha256sum "$HERE/libbsd/pluto.ini" | cut -c1-16)
 if [ ! -f "$LB/.pluto-configured" ]; then
   echo "libbsd: fresh tree"

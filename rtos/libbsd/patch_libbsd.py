@@ -172,6 +172,32 @@ repeat:
 """
 
 
+NC_MARK = "/* Pluto RTOS: drain to the device */"
+
+
+def busdma_c(s):
+    """The non-cacheable DMA area is mapped Normal non-cacheable (unaligned CPU accesses allowed).
+    Such writes can sit in the CPU and L2C-310 store buffers (erratum 769419: visibility needs an
+    explicit Cache Sync), so a descriptor update may never reach the USB controller and the
+    transfer times out. Before the device reads: DSB + L2 Cache Sync (a 1-line range flush ends
+    with both)."""
+    if NC_MARK in s:
+        return s
+    old = """	if (begin >= (uintptr_t)bsp_section_nocache_begin &&
+	    end <= (uintptr_t)bsp_section_nocachenoload_end) {
+		return;
+	}"""
+    assert s.count(old) == 1, "bus_dmamap_sync nocache anchor"
+    new = """	if (begin >= (uintptr_t)bsp_section_nocache_begin &&
+	    end <= (uintptr_t)bsp_section_nocachenoload_end) {
+		""" + NC_MARK + """
+		if ((op & (BUS_DMASYNC_PREWRITE | BUS_DMASYNC_PREREAD)) != 0)
+			rtems_cache_flush_multiple_data_lines((void *) begin, 1);
+		return;
+	}"""
+    return s.replace(old, new)
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
@@ -180,4 +206,5 @@ edit("freebsd/sys/net80211/ieee80211_proto.c", diag_proto_c)
 edit("freebsd/sys/net80211/ieee80211_ioctl.c", diag_ioctl_c)
 edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_c)
+edit("rtemsbsd/rtems/rtems-kernel-bus-dma.c", busdma_c)
 print("libbsd patched for the Pluto")
