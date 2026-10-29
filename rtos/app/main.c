@@ -481,23 +481,11 @@ static void start_dhcpcd(void)
 static void *net_watch(void *arg)
 {
   (void)arg;
-  while (t_net_up < 0) {
-    struct ifaddrs *ifa = NULL;
-    if (getifaddrs(&ifa) == 0) {
-      for (struct ifaddrs *i = ifa; i != NULL; i = i->ifa_next) {
-        if (i->ifa_addr != NULL && i->ifa_addr->sa_family == AF_INET &&
-            strcmp(i->ifa_name, "lo0") != 0 && t_net_up < 0) {
-          char a[INET_ADDRSTRLEN];
-          inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, a, sizeof(a));
-          t_net_up = uptime_s();
-          printf("net: %s %s at %.3f s\n", i->ifa_name, a, t_net_up);
-        }
-      }
-      freeifaddrs(ifa);
-    }
-    if (t_net_up < 0) {
-      usleep(200000);
-    }
+  /* routing-socket events (netcmd.c): no 200 ms getifaddrs() loop while no network exists */
+  char ifn[IFNAMSIZ], a[INET_ADDRSTRLEN];
+  if (nx_net_wait_inet(ifn, sizeof(ifn), a, sizeof(a)) == 0) {
+    t_net_up = uptime_s();
+    printf("net: %s %s at %.3f s\n", ifn, a, t_net_up);
   }
   return NULL; /* first address seen: SNTP and the status page have their time stamp */
 }

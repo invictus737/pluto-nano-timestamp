@@ -59,6 +59,9 @@
 #include "aicwf_wifi.h"
 #include "config_store.h"
 #include "netcmd.h"
+#ifdef NEXUS_USBNET
+#include "usbnet.h" /* rtos/cherryusb/net: CherryUSB USB Ethernet adapters */
+#endif
 
 /* tun/tap: libbsd's if_tuntap.c needs devfs cloning (dev_ref, clone_create, make_dev_alias_p)
  * that RTEMS libbsd does not provide, so the module is not linked; `net tun` reports the
@@ -358,6 +361,24 @@ static int eff_cfg_locked(const char *ifn, nx_ifcfg_t *c)
   return c->mode;
 }
 
+/* route metric of an interface: Ethernet (ueN) 100 + N, Wi-Fi (wlanN) 300 + N, else 0 */
+static int if_metric(const char *ifn)
+{
+  const char *d = ifn;
+  while (*d != '\0' && !isdigit((unsigned char)*d)) {
+    ++d;
+  }
+  int unit = *d != '\0' ? atoi(d) : 0;
+  switch (cfg_family(ifn)) {
+  case 2:
+    return 100 + unit;
+  case 1:
+    return 300 + unit;
+  default:
+    return 0;
+  }
+}
+
 /* the dhcpcd.conf block of one interface */
 static size_t conf_block(const char *ifn, char *out, size_t cap)
 {
@@ -367,6 +388,15 @@ static size_t conf_block(const char *ifn, char *out, size_t cap)
   int mode = eff_cfg_locked(ifn, &c);
   pthread_mutex_unlock(&cfg_lock);
   o += (size_t)snprintf(out + o, cap - o, "interface %s\n", ifn);
+  /* route preference: dhcpcd 6.2.1 keeps one route per destination on BSD (no kernel metrics)
+   * and gives it to the first interface in its order (lease, carrier, then this metric,
+   * if-pref.c), so Ethernet wins the default route over Wi-Fi while both are up and the other
+   * one takes it over when the preferred interface loses carrier or departs (ipv4_buildroutes
+   * deletes and re-adds). Without it the wired ue0 ranked behind wlan0 (200 + ifindex each:
+   * the aicwf station is not an IEEE 802.11 ifnet, so dhcpcd adds no wireless penalty). */
+  if (cfg_family(ifn) != 0 && o < cap) {
+    o += (size_t)snprintf(out + o, cap - o, "metric %d\n", if_metric(ifn));
+  }
   /* one client identifier per interface (two adapters on one LAN must not share a lease);
    * wlan0 keeps the historical id so existing reservations stay valid */
   if (strcmp(ifn, "wlan0") != 0 && o < cap) {
@@ -387,8 +417,8 @@ static size_t conf_block(const char *ifn, char *out, size_t cap)
 }
 
 /* interfaces with a block: the adapters' names plus overridden ones */
-static const char *const known_ifs[] = {"wlan0", "wlan1", "wlan2", "ue0", "ue1", NULL};
-#define NX_BLOCKS (5 + NX_OVR)
+static const char *const known_ifs[] = {"wlan0", "wlan1", "wlan2", "ue0", "ue1", "ue2", "ue3", NULL};
+#define NX_BLOCKS (7 + NX_OVR)
 static struct {
   char ifn[IFNAMSIZ];
   char block[256];
@@ -983,7 +1013,13 @@ void nx_wifi80211_start(const char *ssid, const char *psk)
     rtems_shell_add_cmd("wifi", "network", "wifi status|scan|connect <ssid> [psk]|disconnect|reconnect",
                         wifi_fallback_cmd);
   }
+#ifndef NEXUS_USB_CHERRY
   spawn_thread(w_main, NULL, 5, 16384);
+#else
+  /* CherryUSB owns USB0: libbsd has no USB bus, so no net80211 parent can ever appear and
+   * the supervisor's 500 ms parent check would only cost wake-ups */
+  (void)w_main;
+#endif
 #else
   (void)ssid;
   (void)psk;
@@ -1188,6 +1224,308 @@ static void on_config_change(void)
 
 /* ---- `net` shell command ---- */
 
+/* ---- network event monitor (routing socket) ----
+ *
+ * One thread blocked in read() on a PF_ROUTE socket: interface arrival/departure, link and
+ * flag changes, IPv4 address and default-route changes. It only records them (`net status`:
+ * the last event per interface and the recent ones overall), prints the few an operator cares
+ * about (arrival, departure, link, default route) and wakes nx_net_wait_inet(). dhcpcd acts on
+ * the same messages itself (addresses, routes, DNS through main.c's hook); nothing here polls.
+ */
+#define NM_IFS 8
+#define NM_RING 10
+typedef struct {
+  char ifn[IFNAMSIZ];
+  char what[56];
+  double t;
+} nm_ev_t;
+static nm_ev_t nm_last[NM_IFS];   /* last event per interface name */
+static nm_ev_t nm_ring[NM_RING];  /* recent events, any interface */
+static unsigned nm_head, nm_count;
+static unsigned long nm_gen;       /* bumped on every recorded event */
+static bool nm_running;
+NEXUS_PI_MUTEX(nm_lock)
+static pthread_cond_t nm_cond = PTHREAD_COND_INITIALIZER;
+static char nm_defrt[64];          /* "192.168.1.1 via ue0" or "" */
+
+static void nm_record(const char *ifn, bool show, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void nm_record(const char *ifn, bool show, const char *fmt, ...)
+{
+  char what[56];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(what, sizeof(what), fmt, ap);
+  va_end(ap);
+  double now = mono_s();
+  pthread_mutex_lock(&nm_lock);
+  int slot = -1;
+  for (int i = 0; i < NM_IFS && slot < 0; ++i) {
+    if (strcmp(nm_last[i].ifn, ifn) == 0) {
+      slot = i;
+    }
+  }
+  for (int i = 0; i < NM_IFS && slot < 0; ++i) {
+    if (nm_last[i].ifn[0] == '\0') {
+      slot = i;
+    }
+  }
+  if (slot < 0) { /* table full: replace the oldest */
+    slot = 0;
+    for (int i = 1; i < NM_IFS; ++i) {
+      if (nm_last[i].t < nm_last[slot].t) {
+        slot = i;
+      }
+    }
+  }
+  snprintf(nm_last[slot].ifn, sizeof(nm_last[slot].ifn), "%s", ifn);
+  snprintf(nm_last[slot].what, sizeof(nm_last[slot].what), "%s", what);
+  nm_last[slot].t = now;
+  nm_ev_t *e = &nm_ring[nm_head];
+  snprintf(e->ifn, sizeof(e->ifn), "%s", ifn);
+  snprintf(e->what, sizeof(e->what), "%s", what);
+  e->t = now;
+  nm_head = (nm_head + 1) % NM_RING;
+  if (nm_count < NM_RING) {
+    ++nm_count;
+  }
+  ++nm_gen;
+  pthread_cond_broadcast(&nm_cond);
+  pthread_mutex_unlock(&nm_lock);
+  if (show) {
+    printf("net: %s %s\n", ifn, what);
+  }
+}
+
+/* the sockaddrs after a routing message header, by RTAX index */
+static void nm_addrs(void *start, const char *end, int addrs, struct sockaddr *sa[RTAX_MAX])
+{
+  char *p = start;
+  for (int i = 0; i < RTAX_MAX; ++i) {
+    sa[i] = NULL;
+    if ((addrs & (1 << i)) == 0 || p >= end) {
+      continue;
+    }
+    struct sockaddr *a = (struct sockaddr *)p;
+    sa[i] = a;
+    p += a->sa_len == 0 ? sizeof(long) : 1 + ((a->sa_len - 1) | (sizeof(long) - 1));
+  }
+}
+
+static const char *nm_in(const struct sockaddr *a, char *buf, size_t cap)
+{
+  if (a == NULL || a->sa_family != AF_INET) {
+    snprintf(buf, cap, "?");
+  } else {
+    inet_ntop(AF_INET, &((const struct sockaddr_in *)a)->sin_addr, buf, (socklen_t)cap);
+  }
+  return buf;
+}
+
+static void nm_message(const struct rt_msghdr *rtm, const char *end)
+{
+  char ifn[IFNAMSIZ], a[INET_ADDRSTRLEN], g[INET_ADDRSTRLEN];
+  struct sockaddr *sa[RTAX_MAX];
+  switch (rtm->rtm_type) {
+  case RTM_IFANNOUNCE: {
+    const struct if_announcemsghdr *an = (const void *)rtm;
+    nm_record(an->ifan_name, true, "%s", an->ifan_what == IFAN_ARRIVAL ? "arrived" : "departed");
+    break;
+  }
+  case RTM_IFINFO: {
+    const struct if_msghdr *im = (const void *)rtm;
+    static struct {
+      unsigned short idx;
+      unsigned char link;
+      int up;
+    } seen[NM_IFS];
+    if (if_indextoname(im->ifm_index, ifn) == NULL) {
+      break;
+    }
+    int up = (im->ifm_flags & IFF_UP) != 0;
+    unsigned char link = im->ifm_data.ifi_link_state;
+    int k = -1;
+    for (int i = 0; i < NM_IFS && k < 0; ++i) {
+      if (seen[i].idx == im->ifm_index) {
+        k = i;
+      }
+    }
+    for (int i = 0; i < NM_IFS && k < 0; ++i) {
+      if (seen[i].idx == 0) {
+        k = i;
+        seen[i].idx = im->ifm_index;
+        seen[i].link = 0xff;
+        seen[i].up = -1;
+      }
+    }
+    if (k >= 0 && seen[k].link == link && seen[k].up == up) {
+      break; /* counters only */
+    }
+    bool link_changed = k < 0 || seen[k].link != link;
+    if (k >= 0) {
+      seen[k].link = link;
+      seen[k].up = up;
+    }
+    nm_record(ifn, link_changed, "%s, link %s", up ? "up" : "down",
+              link == LINK_STATE_UP ? "up" : link == LINK_STATE_DOWN ? "down" : "unknown");
+    break;
+  }
+  case RTM_NEWADDR:
+  case RTM_DELADDR: {
+    const struct ifa_msghdr *ifam = (const void *)rtm;
+    nm_addrs((void *)(ifam + 1), end, ifam->ifam_addrs, sa);
+    if (sa[RTAX_IFA] == NULL || sa[RTAX_IFA]->sa_family != AF_INET ||
+        if_indextoname(ifam->ifam_index, ifn) == NULL) {
+      break;
+    }
+    int pfx = sa[RTAX_NETMASK] != NULL && sa[RTAX_NETMASK]->sa_len >= 8
+                  ? mask_to_prefix(((struct sockaddr_in *)sa[RTAX_NETMASK])->sin_addr.s_addr) : 32;
+    nm_record(ifn, false, "%s %s/%d", rtm->rtm_type == RTM_NEWADDR ? "address" : "address removed",
+              nm_in(sa[RTAX_IFA], a, sizeof(a)), pfx);
+    break;
+  }
+  case RTM_ADD:
+  case RTM_DELETE:
+  case RTM_CHANGE: {
+    nm_addrs((void *)(rtm + 1), end, rtm->rtm_addrs, sa);
+    struct sockaddr *dst = sa[RTAX_DST], *mask = sa[RTAX_NETMASK], *gw = sa[RTAX_GATEWAY];
+    bool def = dst != NULL && dst->sa_family == AF_INET &&
+               ((struct sockaddr_in *)dst)->sin_addr.s_addr == INADDR_ANY &&
+               (mask == NULL || mask->sa_len < 8 || ((struct sockaddr_in *)mask)->sin_addr.s_addr == 0);
+    if (!def) {
+      break;
+    }
+    if (if_indextoname(rtm->rtm_index, ifn) == NULL) {
+      snprintf(ifn, sizeof(ifn), "?");
+    }
+    nm_in(gw, g, sizeof(g));
+    pthread_mutex_lock(&nm_lock);
+    if (rtm->rtm_type == RTM_DELETE) {
+      nm_defrt[0] = '\0';
+    } else {
+      snprintf(nm_defrt, sizeof(nm_defrt), "%s via %s", g, ifn);
+    }
+    pthread_mutex_unlock(&nm_lock);
+    nm_record(ifn, true, "default route %s %s", rtm->rtm_type == RTM_DELETE ? "removed," : "->", g);
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+static void *nm_main(void *arg)
+{
+  int s = (int)(intptr_t)arg;
+  static char buf[2048]; /* one routing message at a time (one reader) */
+  for (;;) {
+    ssize_t n = read(s, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR || errno == ENOBUFS) { /* ENOBUFS: messages lost under a burst */
+        if (errno == ENOBUFS) {
+          nm_record("-", false, "routing socket overflow");
+        }
+        continue;
+      }
+      printf("net: routing socket read failed (%d), event monitor stopped\n", errno);
+      break;
+    }
+    const struct rt_msghdr *rtm = (const void *)buf;
+    if ((size_t)n < sizeof(rtm->rtm_msglen) + 2 || rtm->rtm_msglen > n ||
+        rtm->rtm_version != RTM_VERSION) {
+      continue;
+    }
+    nm_message(rtm, buf + rtm->rtm_msglen);
+  }
+  close(s);
+  pthread_mutex_lock(&nm_lock);
+  nm_running = false;
+  pthread_cond_broadcast(&nm_cond);
+  pthread_mutex_unlock(&nm_lock);
+  return NULL;
+}
+
+static void nm_start(void)
+{
+  int s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+  if (s < 0) {
+    printf("net: no routing socket (%d), no event monitor\n", errno);
+    return;
+  }
+  pthread_mutex_lock(&nm_lock);
+  nm_running = true;
+  pthread_mutex_unlock(&nm_lock);
+  spawn_thread(nm_main, (void *)(intptr_t)s, 5, 8192);
+}
+
+/* the first non-loopback IPv4 address, or -1 */
+static int first_inet(char *ifn, size_t icap, char *addr, size_t acap)
+{
+  struct ifaddrs *ifa = NULL;
+  int rc = -1;
+  if (getifaddrs(&ifa) != 0) {
+    return -1;
+  }
+  for (struct ifaddrs *i = ifa; i != NULL && rc != 0; i = i->ifa_next) {
+    if (i->ifa_addr != NULL && i->ifa_addr->sa_family == AF_INET && !(i->ifa_flags & IFF_LOOPBACK)) {
+      snprintf(ifn, icap, "%s", i->ifa_name);
+      inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, addr, (socklen_t)acap);
+      rc = 0;
+    }
+  }
+  freeifaddrs(ifa);
+  return rc;
+}
+
+int nx_net_wait_inet(char *ifn, size_t icap, char *addr, size_t acap)
+{
+  for (;;) {
+    pthread_mutex_lock(&nm_lock);
+    unsigned long gen = nm_gen;
+    pthread_mutex_unlock(&nm_lock);
+    if (first_inet(ifn, icap, addr, acap) == 0) {
+      return 0;
+    }
+    pthread_mutex_lock(&nm_lock);
+    while (nm_gen == gen && nm_running) {
+      pthread_cond_wait(&nm_cond, &nm_lock);
+    }
+    bool running = nm_running;
+    pthread_mutex_unlock(&nm_lock);
+    if (!running) {
+      usleep(500000); /* no event monitor (no routing socket): fall back to a slow check */
+    }
+  }
+}
+
+static void nm_print_last(const char *ifn)
+{
+  double now = mono_s();
+  pthread_mutex_lock(&nm_lock);
+  for (int i = 0; i < NM_IFS; ++i) {
+    if (strcmp(nm_last[i].ifn, ifn) == 0) {
+      printf("      last event: %s (%.0f s ago)\n", nm_last[i].what, now - nm_last[i].t);
+    }
+  }
+  pthread_mutex_unlock(&nm_lock);
+}
+
+static void nm_print_recent(void)
+{
+  double now = mono_s();
+  pthread_mutex_lock(&nm_lock);
+  if (nm_count > 0) {
+    printf("recent events:\n");
+  }
+  for (unsigned k = 0; k < nm_count; ++k) {
+    const nm_ev_t *e = &nm_ring[(nm_head + NM_RING - nm_count + k) % NM_RING];
+    printf("  -%6.0f s  %-6s %s\n", now - e->t, e->ifn, e->what);
+  }
+  if (!nm_running) {
+    printf("  (event monitor not running)\n");
+  }
+  pthread_mutex_unlock(&nm_lock);
+}
+
 static void print_flags(int f)
 {
   printf("%s%s%s%s", (f & IFF_UP) ? "UP" : "DOWN", (f & IFF_RUNNING) ? ",RUNNING" : "",
@@ -1315,7 +1653,7 @@ static int net_status(void)
       pthread_mutex_lock(&cfg_lock);
       int mode = eff_cfg_locked(i->ifa_name, &c);
       pthread_mutex_unlock(&cfg_lock);
-      printf(" [%s]", mode == NX_MODE_STATIC ? "static" : "dhcp");
+      printf(" [%s, metric %d]", mode == NX_MODE_STATIC ? "static" : "dhcp", if_metric(i->ifa_name));
     }
     printf("\n");
     for (struct ifaddrs *k = ifa; k != NULL; k = k->ifa_next) {
@@ -1333,8 +1671,17 @@ static int net_status(void)
       printf("\n");
     }
     print_wifi_of(i->ifa_name);
+    nm_print_last(i->ifa_name);
   }
   freeifaddrs(ifa);
+#ifdef NEXUS_USBNET
+  {
+    char ub[512];
+    if (nexus_usbnet_status(ub, sizeof(ub)) > 0) {
+      printf("usb ethernet:\n%s", ub);
+    }
+  }
+#endif
   char gw[INET_ADDRSTRLEN], gif[IFNAMSIZ];
   if (default_route(gw, sizeof(gw), gif, sizeof(gif)) == 0) {
     printf("gateway %s via %s\n", gw, gif);
@@ -1358,6 +1705,7 @@ static int net_status(void)
     printf(" (exit %d, reboot to restore DHCP)", dhcpcd_exit);
   }
   printf("\n");
+  nm_print_recent();
   return 0;
 }
 
@@ -2013,6 +2361,7 @@ void nx_net_start(void)
   pthread_mutex_lock(&cfg_lock);
   cfg_loaded = true;
   pthread_mutex_unlock(&cfg_lock);
+  nm_start();
   /* interfaces that came up before the configuration was read got DHCP: re-apply */
   conf_apply(true);
   nexus_config_on_change(on_config_change);

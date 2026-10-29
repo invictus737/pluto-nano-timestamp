@@ -13,6 +13,8 @@
 #ifndef NEXUS_NETCMD_H
 #define NEXUS_NETCMD_H
 
+#include <stddef.h>
+
 #include <rtems/dhcpcd.h>
 
 /* (re)write /etc/dhcpcd.conf from the configuration and the runtime overrides; dhcpcd reads it
@@ -23,6 +25,10 @@ const rtems_dhcpcd_config *nx_net_dhcpcd_config(void);
 /* configuration loaded: apply static settings to interfaces already present, follow config
  * changes, network sysctls, register the `net` shell command */
 void nx_net_start(void);
+
+/* block until a non-loopback interface has an IPv4 address (routing-socket events, no polling
+ * while the event monitor of nx_net_start() runs); fills its name and address */
+int nx_net_wait_inet(char *ifn, size_t icap, char *addr, size_t acap);
 
 /* net80211 USB Wi-Fi sticks (rtwn, run, ...): clone wlan1/wlan2, run wpa_supplicant */
 void nx_wifi80211_start(const char *ssid, const char *psk);
