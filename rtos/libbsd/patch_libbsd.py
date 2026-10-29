@@ -385,6 +385,54 @@ def usb_hub_c(s):
 		power_mode = USB_POWER_MODE_ON;""")
 
 
+IAA_MARK = "/* Pluto RTOS: IAA handshake */"
+
+
+def ehci_iaa_c(s):
+    """EHCI 4.8.2: a QH unlinked from the async schedule may still be cached by the controller;
+    software must not change or reuse it until an Interrupt on Async Advance confirms the
+    controller let go. FreeBSD reuses the per-transfer QH right away; the ChipIdea core on the
+    Zynq hangs its async engine on that (USBSTS.AS stays 1 even with ASE cleared). Ring the
+    doorbell after every async unlink and wait for IAA (bus lock held, bounded)."""
+    if IAA_MARK in s:
+        return s
+    old = """		EHCI_REMOVE_QH(xfer->qh_start[xfer->flags_int.curr_dma_set],
+		    sc->sc_async_p_last);
+	}
+	if (methods == &ehci_device_intr_methods) {"""
+    assert s.count(old) == 1, "ehci_device_done async remove anchor"
+    s = s.replace(old, """		EHCI_REMOVE_QH(xfer->qh_start[xfer->flags_int.curr_dma_set],
+		    sc->sc_async_p_last);
+		ehci_zynq_iaa_wait(sc);
+	}
+	if (methods == &ehci_device_intr_methods) {""")
+    old = "static void\nehci_device_done(struct usb_xfer *xfer, usb_error_t error)"
+    assert s.count(old) == 1, "ehci_device_done anchor"
+    return s.replace(old, """""" + IAA_MARK + """
+unsigned ehci_zynq_iaa_timeouts;
+static void
+ehci_zynq_iaa_wait(ehci_softc_t *sc)
+{
+	uint32_t cmd = EOREAD4(sc, EHCI_USBCMD);
+	int i;
+
+	if ((cmd & EHCI_CMD_ASE) == 0)
+		return;
+	EOWRITE4(sc, EHCI_USBSTS, EHCI_STS_IAA);	/* stale */
+	EOWRITE4(sc, EHCI_USBCMD, cmd | EHCI_CMD_IAAD);
+	for (i = 0; i < 2000; ++i) {
+		if (EOREAD4(sc, EHCI_USBSTS) & EHCI_STS_IAA) {
+			EOWRITE4(sc, EHCI_USBSTS, EHCI_STS_IAA);
+			return;
+		}
+		DELAY(1);
+	}
+	ehci_zynq_iaa_timeouts++;
+}
+
+""" + old)
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
@@ -394,6 +442,7 @@ edit("freebsd/sys/net80211/ieee80211_ioctl.c", diag_ioctl_c)
 edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_c)
 edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_trace_c)
+edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_iaa_c)
 edit("rtemsbsd/rtems/rtems-kernel-bus-dma.c", busdma_c)
 edit("freebsd/sys/dev/usb/usb_hub.c", usb_hub_c)
 print("libbsd patched for the Pluto")

@@ -197,7 +197,7 @@ static ehci_softc_t *zynq_ehci_sc;
 
 int ehci_zynq_poll(ehci_softc_t *sc); /* ehci.c (Pluto patch) */
 static unsigned zynq_ehci_rescued, zynq_ehci_ticks, zynq_ehci_repairs_seen;
-extern unsigned ehci_zynq_ring_repairs; /* ehci.c (Pluto patch) */
+extern unsigned ehci_zynq_ring_repairs, ehci_zynq_iaa_timeouts; /* ehci.c (Pluto patch) */
 
 /*
  * ChipIdea (Zynq USB) host: a completed qTD with IOC sets USBSTS.UAI (async) or UPI (periodic),
@@ -283,8 +283,8 @@ zynq_ehci_poll_tick(void *arg)
 		    (ehci_zynq_ring_repairs != zynq_ehci_repairs_seen ||
 		    zynq_ehci_async_kicks != zynq_ehci_kicks_seen)) {
 			zynq_ehci_kicks_seen = zynq_ehci_async_kicks;
-			printf("ehci: %u transfer(s) completed by the poll, async ring repairs %u, async kicks %u\n",
-			    zynq_ehci_rescued, ehci_zynq_ring_repairs, zynq_ehci_async_kicks);
+			printf("ehci: %u transfer(s) completed by the poll, ring repairs %u, async kicks %u, IAA timeouts %u\n",
+			    zynq_ehci_rescued, ehci_zynq_ring_repairs, zynq_ehci_async_kicks, ehci_zynq_iaa_timeouts);
 			zynq_ehci_rescued = 0;
 			zynq_ehci_repairs_seen = ehci_zynq_ring_repairs;
 		}
