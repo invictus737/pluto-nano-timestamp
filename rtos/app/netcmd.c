@@ -59,9 +59,9 @@
 #include "config_store.h"
 #include "netcmd.h"
 
-/* tun/tap (sys/net/if_tuntap.c, part of the always-built `net` module): referencing its module
- * SYSINIT links the object, which also attaches the tun/tap/vmnet interface cloners */
-SYSINIT_MODULE_REFERENCE(if_tuntap);
+/* tun/tap: libbsd's if_tuntap.c needs devfs cloning (dev_ref, clone_create, make_dev_alias_p)
+ * that RTEMS libbsd does not provide, so the module is not linked; `net tun` reports the
+ * cloner as absent and the TETRA IP data carrier needs another transport on RTEMS */
 
 #define DHCPCD_CONF "/etc/dhcpcd.conf"
 #define DHCPCD_LEASE "/var/db/dhcpcd-%s.lease"
