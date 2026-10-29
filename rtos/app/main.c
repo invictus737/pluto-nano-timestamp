@@ -197,7 +197,7 @@ static void *http_status(void *arg)
  * libbsd resolver would only try 127.0.0.1: every host name lookup (nexus2 networks, SNTP)
  * failed. The resolver re-reads the file when its mtime changes (res_state.c, every 2 s).
  */
-#define NET_IFS 4
+#define NET_IFS 6 /* wlan0, ue0..ue3, one more */
 static struct {
   char ifname[16];
   char dns[128];   /* space separated */
@@ -217,40 +217,107 @@ static const char *env_get(char *const *env, const char *name)
   return NULL;
 }
 
+/* add a nameserver unless listed already (max 3: the resolver's MAXNS) */
+static void ns_add(char list[3][48], int *n, const char *ns)
+{
+  if (*n >= 3 || ns == NULL || ns[0] == '\0') {
+    return;
+  }
+  for (int i = 0; i < *n; ++i) {
+    if (strcmp(list[i], ns) == 0) {
+      return;
+    }
+  }
+  snprintf(list[(*n)++], sizeof(list[0]), "%s", ns);
+}
+
+/* first server of a space/comma separated list */
+static void ns_first(const char *in, char *out, size_t cap)
+{
+  size_t a = strspn(in, " ,");
+  size_t b = strcspn(in + a, " ,");
+  snprintf(out, cap, "%.*s", (int)(b < cap ? b : cap - 1), in + a);
+}
+
+/*
+ * One primary server, then 1.1.1.1 and 8.8.8.8 (the resolver uses MAXNS = 3, so the public
+ * fallback is always reachable): the primary is the [NETWORK] dns of config.txt if set, else
+ * the first DHCP/static server of the interface holding the default route, else of any
+ * interface. Rewritten on every lease change and default-route change (failover), as a new
+ * file renamed over the old one, so the resolver never reads a half-written file.
+ */
 static void resolv_conf_write_locked(void)
 {
-  char buf[640];
+  char buf[512], list[3][48], ns[48], defif[IFNAMSIZ] = "", gw[INET_ADDRSTRLEN];
+  int n = 0, holder = -1;
   size_t o = 0;
-  for (int i = 0; i < NET_IFS && o < sizeof(buf) - 80; ++i) {
-    if (net_if[i].ifname[0] != '\0' && net_if[i].domain[0] != '\0') {
-      o += (size_t)snprintf(buf + o, sizeof(buf) - o, "search %s\n", net_if[i].domain);
-      break;
+
+  if (nx_net_default_route(gw, sizeof(gw), defif, sizeof(defif)) == 0) {
+    for (int i = 0; i < NET_IFS && holder < 0; ++i) {
+      if (net_if[i].ifname[0] != '\0' && strcmp(net_if[i].ifname, defif) == 0) {
+        holder = i;
+      }
     }
   }
-  for (int i = -1; i < NET_IFS; ++i) {
-    char tmp[128];
-    char *save = NULL;
-    /* -1: [NETWORK] dns of config.txt, ahead of the DHCP servers */
-    const char *cfg = i < 0 ? nexus_config_get("dns") : NULL;
-    snprintf(tmp, sizeof(tmp), "%s", i < 0 ? (cfg != NULL ? cfg : "") : net_if[i].dns);
-    for (char *t = strtok_r(tmp, " ", &save); t != NULL && o < sizeof(buf) - 64;
-         t = strtok_r(NULL, " ", &save)) {
-      o += (size_t)snprintf(buf + o, sizeof(buf) - o, "nameserver %s\n", t);
+  const char *cfg = nexus_config_get("dns");
+  if (cfg != NULL && cfg[0] != '\0') {
+    ns_first(cfg, ns, sizeof(ns));
+    ns_add(list, &n, ns);
+  }
+  if (n == 0 && holder >= 0) {
+    ns_first(net_if[holder].dns, ns, sizeof(ns));
+    ns_add(list, &n, ns);
+  }
+  for (int i = 0; i < NET_IFS && n == 0; ++i) {
+    if (net_if[i].ifname[0] != '\0') {
+      ns_first(net_if[i].dns, ns, sizeof(ns));
+      ns_add(list, &n, ns);
     }
   }
-  /* public resolvers after the configured and DHCP ones (a router without DNS still resolves) */
-  if (o < sizeof(buf) - 64) {
-    o += (size_t)snprintf(buf + o, sizeof(buf) - o, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+  ns_add(list, &n, "1.1.1.1");
+  ns_add(list, &n, "8.8.8.8");
+  ns_add(list, &n, "9.9.9.9"); /* only if the primary was one of the two above */
+
+  const char *dom = holder >= 0 ? net_if[holder].domain : "";
+  for (int i = 0; i < NET_IFS && dom[0] == '\0'; ++i) {
+    if (net_if[i].ifname[0] != '\0') {
+      dom = net_if[i].domain;
+    }
+  }
+  if (dom[0] != '\0') {
+    o += (size_t)snprintf(buf + o, sizeof(buf) - o, "search %s\n", dom);
+  }
+  for (int i = 0; i < n && o < sizeof(buf) - 64; ++i) {
+    o += (size_t)snprintf(buf + o, sizeof(buf) - o, "nameserver %s\n", list[i]);
   }
   /* 2 s per server and 2 rounds (default 5 s x 2): a server behind a lost link costs less */
   if (o < sizeof(buf) - 32) {
     o += (size_t)snprintf(buf + o, sizeof(buf) - o, "options timeout:2 attempts:2\n");
   }
-  int fd = open("/etc/resolv.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-  if (fd >= 0) {
-    (void)write(fd, buf, o);
-    close(fd);
+  int fd = open("/etc/resolv.conf.new", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) {
+    return;
   }
+  ssize_t w = write(fd, buf, o);
+  close(fd);
+  if (w != (ssize_t)o) {
+    unlink("/etc/resolv.conf.new");
+    return;
+  }
+  /* rename() replaces the target (IMFS; posix_compat.c wrapper in the nexus2 image) */
+  if (rename("/etc/resolv.conf.new", "/etc/resolv.conf") != 0 &&
+      !(errno == EEXIST && unlink("/etc/resolv.conf") == 0 &&
+        rename("/etc/resolv.conf.new", "/etc/resolv.conf") == 0)) {
+    unlink("/etc/resolv.conf.new");
+  }
+}
+
+/* default route changed (netcmd.c event monitor): the primary server follows it */
+static void resolv_conf_route_changed(void)
+{
+  pthread_mutex_lock(&net_if_lock);
+  resolv_conf_write_locked();
+  pthread_mutex_unlock(&net_if_lock);
 }
 
 static void dhcpcd_hook_handler(rtems_dhcpcd_hook *hook, char *const *env)
@@ -471,6 +538,7 @@ static void start_dhcpcd(void)
    * static [WLAN]/[USB_ETHERNET] address (dhcpcd applies it itself, also on hotplug). Before
    * nexus_config_init() it holds DHCP for all; nx_net_start() re-applies after the config. */
   rtems_dhcpcd_add_hook(&dhcpcd_hook);
+  nx_net_on_route_change(resolv_conf_route_changed);
   nx_net_dhcpcd_conf_write();
   rtems_status_code sc = rtems_dhcpcd_start(nx_net_dhcpcd_config());
   if (sc != RTEMS_SUCCESSFUL) {

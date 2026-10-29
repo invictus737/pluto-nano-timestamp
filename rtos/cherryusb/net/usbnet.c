@@ -20,11 +20,16 @@
  *    handle leaks once per thread exit) with a cleanup handler: the driver ends it with
  *    usb_osal_thread_delete(NULL) = pthread_exit when its device is gone, and the handler
  *    records that, so a replug never runs two rx threads on one class object.
- *  - link: the driver's usbh_X_get_connect_status() on the interrupt endpoint. CDC ECM/NCM
- *    notify on change only, so the call blocks until the next notification; RTL8152 and ASIX
- *    answer every interval, so they are asked every NEXUS_USBNET_LINK_POLL_MS. Before the
- *    first link-up the driver's rx thread owns that endpoint (it waits for the link itself);
- *    the link thread then only watches the class object's connect_status.
+ *  - link: the driver's usbh_X_get_connect_status() on the interrupt endpoint. Until the
+ *    driver's rx thread has seen the link and calls usbh_X_linkup() (net/patches/0103) that
+ *    endpoint is the rx thread's and the link thread sleeps without a period; afterwards CDC
+ *    ECM/NCM block until the next notification, RTL8152 and ASIX are read every
+ *    NEXUS_USBNET_LINK_POLL_MS (twice that with the link down) and a link-down needs two
+ *    consecutive reads. A failed bulk IN with the device attached is resubmitted by the
+ *    driver (0103): no re-wait for the link, no chip re-init, no false link-down.
+ *    The link thread also retries a failed ifnet attach or rx thread start (1 s).
+ *  - priorities: rx and link threads at CherryUSB 15 (POSIX 135) on NEXUS_USB_THREAD_CPU
+ *    (CPU0), below the hub thread and far below usbh_irq (max - 18); the radio runs on CPU1.
  * Link changes go to the ifnet (LINK_STATE_UP/DOWN): dhcpcd follows them, and the departing
  * interface (ether_ifdetach on unplug) drops its routes and DNS servers.
  *
@@ -97,7 +102,8 @@ struct nx_slot {
     bool link_thread;
     pthread_t link_tid;
     bool link_up;    /* as reported to the ifnet */
-    bool link_seen;  /* the driver's rx thread got past its own link wait */
+    bool rx_linked;  /* usbh_X_linkup(): the interrupt endpoint is the link thread's */
+    uint8_t down_reads; /* consecutive link-down reads (polled chips: debounce) */
     int unit;
     char ifname[16];
     uint8_t mac[6];
@@ -110,6 +116,7 @@ struct nx_slot {
 static void nx_run(struct nx_slot *s, void *cls);
 static void nx_stop(struct nx_slot *s, void *cls);
 static void nx_input(struct nx_slot *s, uint8_t *buf, uint32_t len);
+static void nx_linkup(struct nx_slot *s, void *cls);
 static int nx_tx(void *arg, const void *frame, uint32_t len);
 
 #define NX_DRIVER(id, T, NAME, HDR, NCM, TRIM, PAD, PERIODIC)                                    \
@@ -131,7 +138,8 @@ static int nx_tx(void *arg, const void *frame, uint32_t len);
     static struct nx_slot id##_slot = { .drv = &id##_drv, .unit = -1 };                         \
     void usbh_##id##_run(T *c) { nx_run(&id##_slot, c); }                                       \
     void usbh_##id##_stop(T *c) { nx_stop(&id##_slot, c); }                                     \
-    void usbh_##id##_eth_input(uint8_t *buf, uint32_t len) { nx_input(&id##_slot, buf, len); }
+    void usbh_##id##_eth_input(uint8_t *buf, uint32_t len) { nx_input(&id##_slot, buf, len); } \
+    void usbh_##id##_linkup(T *c) { nx_linkup(&id##_slot, c); }
 
 /*
  * rtl8152: tx_desc of 8 bytes before the frame; rx_desc lengths include the 4-byte FCS (Linux
@@ -248,26 +256,53 @@ static void *nx_rx_main(void *arg)
     return NULL;
 }
 
-/* lock held */
-static void nx_rx_start_locked(struct nx_slot *s)
+/* lock held; false if the thread could not be created (the link thread retries) */
+static bool nx_rx_start_locked(struct nx_slot *s)
 {
     pthread_t t;
     char n[16];
 
     if (s->rx_alive) {
-        return; /* the previous device's thread re-finds the class object (find_class) */
+        return true; /* the previous device's thread re-finds the class object (find_class) */
     }
     if (nx_thread(&t, false, NEXUS_USBNET_RX_STACKSIZE, nx_rx_main, s) != 0) {
-        printf("usbnet: %s rx thread not started\n", s->ifname);
-        return;
+        printf("usbnet: %s rx thread not started, retrying\n", s->ifname);
+        return false;
     }
     snprintf(n, sizeof(n), "%s_rx", s->drv->name);
     (void)pthread_setname_np(t, n);
     s->rx_alive = true;
+    /* a new rx thread waits for the link on the interrupt endpoint itself */
+    s->rx_linked = false;
+    return true;
 }
 
 /* ---- link thread ---- */
 
+/* report a link state to the ifnet (lock held, dropped around the ifnet call) */
+static void nx_report_locked(struct nx_slot *s, bool up)
+{
+    struct aicwf_ifnet *ifn = s->ifn_link;
+
+    if (up == s->link_up || ifn == NULL) {
+        return;
+    }
+    s->link_up = up;
+    s->link_changes++;
+    nx_event(s, up ? "link up" : "link down");
+    pthread_mutex_unlock(&s->lock);
+    printf("usbnet: %s link %s\n", s->ifname, up ? "up" : "down");
+    aicwf_ifnet_link(ifn, up);
+    pthread_mutex_lock(&s->lock);
+}
+
+/*
+ * Owns, per attached adapter: the ifnet (attach retried while it fails), rx thread restarts,
+ * and the link state once the driver's rx thread has called usbh_X_linkup(). Until then it
+ * sleeps without a period (woken by linkup, stop or an rx thread exit). Afterwards CDC
+ * ECM/NCM block in the status read until the device notifies; RTL8152/ASIX are read every
+ * 500 ms with the link up, 1 s with it down, and a link-down needs two consecutive reads.
+ */
 static void *nx_link_main(void *arg)
 {
     struct nx_slot *s = arg;
@@ -275,20 +310,52 @@ static void *nx_link_main(void *arg)
 
     pthread_mutex_lock(&s->lock);
     while (!s->stopping) {
+        bool retry = false;
+
+        if (s->ifn_link == NULL) {
+            struct aicwf_ifnet *ifn;
+
+            pthread_mutex_unlock(&s->lock);
+            ifn = aicwf_ifnet_attach(s->ifname, s->mac, nx_tx, s);
+            pthread_mutex_lock(&s->lock);
+            if (ifn != NULL) {
+                s->ifn_link = ifn;
+                s->ifn = ifn;
+                nx_event(s, "ifnet attached");
+                if (s->stopping) {
+                    break; /* stop() detaches it after the join */
+                }
+            } else {
+                retry = true;
+            }
+        }
         if (s->rx_respawn && !s->rx_alive) {
             s->rx_respawn = false;
             s->rx_restarts++;
-            nx_rx_start_locked(s);
-        }
-        if (!s->link_seen) {
-            /* the driver's rx thread waits for the first link-up on the interrupt endpoint
-             * itself; a frame or this 250 ms check sees it pass */
-            if (!d->link(s->cls)) {
-                nx_wait_ms(s, 250);
-                continue;
+            if (!nx_rx_start_locked(s)) {
+                s->rx_respawn = true;
+                retry = true;
             }
-            s->link_seen = true;
-        } else {
+        }
+        if (!s->rx_linked || s->ifn_link == NULL) {
+            if (retry) {
+                nx_wait_ms(s, 1000);
+            } else {
+                pthread_cond_wait(&s->cond, &s->lock);
+            }
+            continue;
+        }
+
+        /* the driver's own wait saw the link up; its class object says so */
+        bool up = d->link(s->cls);
+
+        if (s->link_up || up) {
+            if (up) {
+                s->down_reads = 0;
+                nx_report_locked(s, true);
+            }
+        }
+        {
             void *cls = s->cls;
             int rc;
 
@@ -299,26 +366,21 @@ static void *nx_link_main(void *arg)
                 break;
             }
             if (rc < 0) {
-                /* device going away (stop() follows) or the endpoint busy with the rx
-                 * thread's own resynchronisation: keep the reported state */
+                /* device going away (stop() follows) or a transient endpoint error: keep the
+                 * reported state */
                 nx_wait_ms(s, 1000);
                 continue;
             }
         }
-        bool up = d->link(s->cls);
-        if (up != s->link_up) {
-            struct aicwf_ifnet *ifn = s->ifn_link;
-
-            s->link_up = up;
-            s->link_changes++;
-            nx_event(s, up ? "link up" : "link down");
-            pthread_mutex_unlock(&s->lock);
-            printf("usbnet: %s link %s\n", s->ifname, up ? "up" : "down");
-            aicwf_ifnet_link(ifn, up);
-            pthread_mutex_lock(&s->lock);
+        up = d->link(s->cls);
+        if (up) {
+            s->down_reads = 0;
+            nx_report_locked(s, true);
+        } else if (!d->periodic || ++s->down_reads >= 2) {
+            nx_report_locked(s, false);
         }
         if (d->periodic && !s->stopping) {
-            nx_wait_ms(s, NEXUS_USBNET_LINK_POLL_MS);
+            nx_wait_ms(s, s->link_up ? NEXUS_USBNET_LINK_POLL_MS : 2 * NEXUS_USBNET_LINK_POLL_MS);
         }
     }
     pthread_mutex_unlock(&s->lock);
@@ -330,7 +392,6 @@ static void *nx_link_main(void *arg)
 static void nx_run(struct nx_slot *s, void *cls)
 {
     struct usbh_hubport *hport = s->drv->hport(cls);
-    struct aicwf_ifnet *ifn;
     int unit = -1;
 
     pthread_once(&nx_once, nx_init_once);
@@ -348,7 +409,7 @@ static void nx_run(struct nx_slot *s, void *cls)
     }
 
     pthread_mutex_lock(&s->lock);
-    if (s->attached) { /* one class object per driver: cannot happen twice */
+    if (s->attached) { /* the patched connect() refuses a second device first (0103) */
         pthread_mutex_unlock(&s->lock);
         printf("usbnet: %s already attached\n", s->drv->name);
         goto free_unit;
@@ -361,11 +422,11 @@ static void nx_run(struct nx_slot *s, void *cls)
     s->pid = hport ? hport->device_desc.idProduct : 0;
     s->stopping = false;
     s->link_up = false;
-    s->link_seen = false;
+    s->down_reads = 0;
     s->rx_respawn = false;
+    s->ifn = NULL;
+    s->ifn_link = NULL;
     s->attaches++;
-    pthread_mutex_unlock(&s->lock);
-
     if ((s->mac[0] & 1) || (s->mac[0] | s->mac[1] | s->mac[2] | s->mac[3] | s->mac[4] | s->mac[5]) == 0) {
         /* no usable MAC from the device: locally administered one from the port path */
         static const uint8_t base[6] = { 0x02, 0x4e, 0x58, 0x55, 0x00, 0x00 };
@@ -374,26 +435,34 @@ static void nx_run(struct nx_slot *s, void *cls)
         s->mac[4] = hport ? hport->port : 0;
         s->mac[5] = (uint8_t)unit;
     }
-    ifn = aicwf_ifnet_attach(s->ifname, s->mac, nx_tx, s);
-    if (ifn == NULL) {
-        printf("usbnet: %s: ifnet %s not attached\n", s->drv->name, s->ifname);
-    }
+    s->attached = true;
+    pthread_mutex_unlock(&s->lock);
+
+    /* ifnet first (frames before it are dropped); on failure the link thread retries */
+    struct aicwf_ifnet *ifn = aicwf_ifnet_attach(s->ifname, s->mac, nx_tx, s);
+
     pthread_mutex_lock(&s->lock);
+    if (ifn == NULL) {
+        printf("usbnet: %s: ifnet %s not attached, retrying\n", s->drv->name, s->ifname);
+    }
     s->ifn = ifn;
     s->ifn_link = ifn;
-    s->attached = true;
     nx_event(s, "attached");
-    nx_rx_start_locked(s);
-    if (ifn != NULL) {
+    if (s->rx_alive && s->drv->link(cls)) {
+        s->rx_linked = true; /* the previous device's rx thread re-found the class and is past
+                              * its link wait already (its linkup came before this run) */
+    }
+    if (!nx_rx_start_locked(s)) {
+        s->rx_respawn = true;
+    }
+    if (nx_thread(&s->link_tid, true, 16 * 1024, nx_link_main, s) == 0) {
         char n[16];
 
-        if (nx_thread(&s->link_tid, true, 16 * 1024, nx_link_main, s) == 0) {
-            s->link_thread = true;
-            snprintf(n, sizeof(n), "%s_lnk", s->drv->name);
-            (void)pthread_setname_np(s->link_tid, n);
-        } else {
-            printf("usbnet: %s link thread not started\n", s->ifname);
-        }
+        s->link_thread = true;
+        snprintf(n, sizeof(n), "%s_lnk", s->drv->name);
+        (void)pthread_setname_np(s->link_tid, n);
+    } else {
+        printf("usbnet: %s link thread not started: no link state, no retries\n", s->ifname);
     }
     pthread_mutex_unlock(&s->lock);
     printf("usbnet: %s = %s %04x:%04x, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", s->ifname, s->drv->name,
@@ -403,6 +472,17 @@ free_unit:
     pthread_mutex_lock(&nx_units_lock);
     nx_units_used &= ~(1U << unit);
     pthread_mutex_unlock(&nx_units_lock);
+}
+
+static void nx_linkup(struct nx_slot *s, void *cls)
+{
+    pthread_once(&nx_once, nx_init_once);
+    pthread_mutex_lock(&s->lock);
+    if (s->attached && s->cls == cls) {
+        s->rx_linked = true;
+        pthread_cond_broadcast(&s->cond);
+    }
+    pthread_mutex_unlock(&s->lock);
 }
 
 static void nx_stop(struct nx_slot *s, void *cls)
@@ -420,7 +500,6 @@ static void nx_stop(struct nx_slot *s, void *cls)
     /* from here no frame reaches the ifnet (nx_input) and no new transmit starts (nx_tx) */
     s->attached = false;
     s->stopping = true;
-    ifn = s->ifn_link;
     s->ifn = NULL;
     join = s->link_thread;
     s->link_thread = false;
@@ -434,15 +513,19 @@ static void nx_stop(struct nx_slot *s, void *cls)
     if (join) {
         pthread_join(s->link_tid, NULL);
     }
+    pthread_mutex_lock(&s->lock);
+    ifn = s->ifn_link; /* read after the join: the link thread may have attached it */
+    s->ifn_link = NULL;
+    pthread_mutex_unlock(&s->lock);
     /* ether_ifdetach, then the tx taskqueue is drained (a transmit in flight fails with
      * NOTCONN: the hport is disconnected) and the ifnet freed; dhcpcd sees the departure */
     if (ifn != NULL) {
         aicwf_ifnet_detach(ifn);
     }
     pthread_mutex_lock(&s->lock);
-    s->ifn_link = NULL;
     s->cls = NULL;
     s->link_up = false;
+    s->rx_linked = false;
     s->unit = -1;
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_lock(&nx_units_lock);
@@ -465,9 +548,6 @@ static void nx_input(struct nx_slot *s, uint8_t *buf, uint32_t len)
     pthread_mutex_lock(&s->lock);
     if (s->ifn != NULL) {
         rc = aicwf_ifnet_input(s->ifn, buf, len); /* m_devget + if_input, inline */
-        if (!s->link_seen) {
-            pthread_cond_broadcast(&s->cond); /* frames flow: the link thread takes over */
-        }
     }
     if (rc == 0) {
         s->rx_frames++;
@@ -613,12 +693,14 @@ uint8_t usbh_get_hport_active_config_index(struct usbh_hubport *hport)
         setup->wValue = (uint16_t)((USB_DESCRIPTOR_TYPE_CONFIGURATION << 8) | i);
         setup->wIndex = 0;
         setup->wLength = sizeof(nx_cfg_buf);
+        memset(nx_cfg_buf, 0, sizeof(nx_cfg_buf)); /* nothing of the previous index survives */
         ret = usbh_control_transfer(hport, setup, nx_cfg_buf);
-        if (ret < 9 || nx_cfg_buf[1] != USB_DESCRIPTOR_TYPE_CONFIGURATION) {
+        if (ret < 8 + 9 || nx_cfg_buf[1] != USB_DESCRIPTOR_TYPE_CONFIGURATION) {
             continue;
         }
-        /* ret may count the setup stage (usbh_rtl8152.c reads ret - 8): bound by wTotalLength */
-        uint32_t len = (uint32_t)ret < sizeof(nx_cfg_buf) ? (uint32_t)ret : sizeof(nx_cfg_buf);
+        /* ret counts the 8-byte setup stage on the EHCI ports (usbh_rtl8152.c reads ret - 8);
+         * also bounded by wTotalLength, and the cleared buffer ends a short read's walk */
+        uint32_t len = (uint32_t)ret - 8U < sizeof(nx_cfg_buf) ? (uint32_t)ret - 8U : sizeof(nx_cfg_buf);
         uint32_t total = (uint32_t)nx_cfg_buf[2] | ((uint32_t)nx_cfg_buf[3] << 8);
 
         if (total < len) {

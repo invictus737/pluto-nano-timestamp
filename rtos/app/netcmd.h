@@ -30,6 +30,11 @@ void nx_net_start(void);
  * while the event monitor of nx_net_start() runs); fills its name and address */
 int nx_net_wait_inet(char *ifn, size_t icap, char *addr, size_t acap);
 
+/* the IPv4 default route (gateway and interface name); 0 if there is one */
+int nx_net_default_route(char *gw, size_t gcap, char *ifn, size_t icap);
+/* called from the event monitor thread after every default-route change */
+void nx_net_on_route_change(void (*cb)(void));
+
 /* net80211 USB Wi-Fi sticks (rtwn, run, ...): clone wlan1/wlan2, run wpa_supplicant */
 void nx_wifi80211_start(const char *ssid, const char *psk);
 /* `wifi` subcommands for the net80211 path; 1 = a net80211 stick is present */

@@ -4,8 +4,9 @@
  * models and class objects directly: a bulk IN error on a device that stays attached, a
  * second adapter of the same class, rapid cable flaps.
  *
- * Expected on the reviewed glue (commit c471ea0): qa_ecm_rx_error and qa_same_class FAIL
- * (documented defects), the others pass.
+ * On commit c471ea0 qa_ecm_rx_error, qa_ncm_rx_error and qa_same_class failed (documented
+ * defects); fixed by net/patches/0103 and the glue that follows it (fake_usbnet.c models the
+ * patched drivers).
  *
  * usage: qa_usbnet [test-name]   (default: all)
  *
@@ -129,7 +130,13 @@ static void qa_same_class(void)
     QCHECK(qwait_link("ue0", 1, 1500) == 0, "first adapter link up");
 
     cdc_ecm_connect(); /* device B: upstream connect() memsets g_cdc_ecm_class, then run() */
-    QCHECK(fake_if_count() == 2, "second ECM adapter got no interface (%d interfaces)", fake_if_count());
+    /* accepted outcomes: B gets its own interface, or (net/patches/0103) its connect() is
+     * refused with -USB_ERR_BUSY and A keeps working untouched */
+    QCHECK(fake_if_count() == 2 || (fake_if_count() == 1 && g_fdev[FK_ECM].refused == 1),
+           "second ECM adapter neither attached nor refused (%d interfaces)", fake_if_count());
+    push_n(FK_ECM, 10, 900);
+    QCHECK(qwait_drained(FK_ECM, 1500) == 0 && fake_if_link("ue0") == 1,
+           "first adapter disturbed by the second one's connect");
 
     cdc_ecm_disconnect(); /* device B unplugged: priv == &g_cdc_ecm_class -> stop(&g_cdc_ecm_class) */
     QCHECK(fake_if_link("ue0") != -2, "unplugging the second adapter detached the first adapter's ue0");

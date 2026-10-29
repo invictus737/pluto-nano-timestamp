@@ -299,8 +299,9 @@ static nx_ifcfg_t ovr[NX_OVR]; /* runtime overrides (net dhcp/static without --s
 NEXUS_PI_MUTEX(cfg_lock)
 static bool cfg_loaded;          /* nx_net_start ran: the configuration is in RAM */
 
-/* the documented keys: [WLAN] ipaddr_wlan, gateway_wlan for every wlanN; [USB_ETHERNET]
- * ipaddr_eth, netmask_eth, gateway_eth for every ueN; [NETWORK] dns for both */
+/* the documented keys: [WLAN] ipaddr_wlan, gateway_wlan for wlanN; [USB_ETHERNET]
+ * ipaddr_eth, netmask_eth, gateway_eth for ue0 only (one static address cannot serve two
+ * adapters on a LAN; a second adapter uses DHCP); [NETWORK] dns for both */
 static int cfg_family(const char *ifn)
 {
   if (strncmp(ifn, "wlan", 4) == 0) {
@@ -335,9 +336,11 @@ static int eff_cfg_locked(const char *ifn, nx_ifcfg_t *c)
     gw = cfg_get("gateway_wlan");
     break;
   case 2:
-    ip = cfg_get("ipaddr_eth");
-    gw = cfg_get("gateway_eth");
-    mask = cfg_get("netmask_eth");
+    if (strcmp(ifn, "ue0") == 0) {
+      ip = cfg_get("ipaddr_eth");
+      gw = cfg_get("gateway_eth");
+      mask = cfg_get("netmask_eth");
+    }
     break;
   default:
     break;
@@ -1247,6 +1250,12 @@ static bool nm_running;
 NEXUS_PI_MUTEX(nm_lock)
 static pthread_cond_t nm_cond = PTHREAD_COND_INITIALIZER;
 static char nm_defrt[64];          /* "192.168.1.1 via ue0" or "" */
+static void (*nm_route_cb)(void);  /* main.c: resolv.conf follows the default route */
+
+void nx_net_on_route_change(void (*cb)(void))
+{
+  nm_route_cb = cb;
+}
 
 static void nm_record(const char *ifn, bool show, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static void nm_record(const char *ifn, bool show, const char *fmt, ...)
@@ -1406,6 +1415,9 @@ static void nm_message(const struct rt_msghdr *rtm, const char *end)
     }
     pthread_mutex_unlock(&nm_lock);
     nm_record(ifn, true, "default route %s %s", rtm->rtm_type == RTM_DELETE ? "removed," : "->", g);
+    if (nm_route_cb != NULL) {
+      nm_route_cb();
+    }
     break;
   }
   default:
@@ -1585,6 +1597,11 @@ static int default_route(char *gw, size_t gcap, char *ifn, size_t icap)
   return found;
 }
 
+int nx_net_default_route(char *gw, size_t gcap, char *ifn, size_t icap)
+{
+  return default_route(gw, gcap, ifn, icap);
+}
+
 static void print_wifi_of(const char *ifn)
 {
   if (strncmp(ifn, "wlan", 4) != 0) {
@@ -1741,6 +1758,10 @@ static int save_cfg(const char *ifn, const nx_ifcfg_t *c)
   int fam = cfg_family(ifn);
   if (fam == 0) {
     printf("net: no configuration key for %s (only wlanN and ueN are stored)\n", ifn);
+    return -1;
+  }
+  if (fam == 2 && strcmp(ifn, "ue0") != 0) {
+    printf("net: [USB_ETHERNET] keys apply to ue0 only; %s keeps the runtime setting\n", ifn);
     return -1;
   }
   char v[24];

@@ -130,6 +130,31 @@ static void t_basic(int k, const char *name)
     CHECK(strstr(st, "ue0") == NULL, "status after unplug: %s", st);
 }
 
+/* polled chips: one link-down read (shorter than two poll periods) is not reported */
+static void t_debounce(void)
+{
+    struct fake_if_stats a, b;
+
+    printf("rtl8152 link-down debounce\n");
+    fake_plug(FK_RTL);
+    fake_cable(FK_RTL, true);
+    CHECK(wait_link("ue0", 1, 1500) == 0, "link up not reported");
+    fake_if_stats(&a);
+    for (int i = 0; i < 5; i++) {
+        msleep(300);
+        fake_cable(FK_RTL, false);
+        msleep(150); /* at most one poll inside */
+        fake_cable(FK_RTL, true);
+    }
+    msleep(600);
+    fake_if_stats(&b);
+    CHECK(b.link_downs == a.link_downs, "%lu false link-down(s) reported", b.link_downs - a.link_downs);
+    fake_cable(FK_RTL, false);
+    CHECK(wait_link("ue0", 0, 2500) == 0, "real link down not reported");
+    fake_unplug(FK_RTL);
+    CHECK(fake_wait_rx_gone(FK_RTL, 1000) == 0, "rx thread did not end");
+}
+
 /* two adapters: distinct names, a freed unit is reused */
 static void t_two(void)
 {
@@ -264,6 +289,7 @@ int main(int argc, char **argv)
     t_basic(FK_RTL, "rtl8152");
     t_basic(FK_NCM, "cdc_ncm");
     t_basic(FK_ASIX, "asix");
+    t_debounce();
     t_two();
     t_soak(cycles);
     printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");

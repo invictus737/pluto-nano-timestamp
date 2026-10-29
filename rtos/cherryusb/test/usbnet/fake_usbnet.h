@@ -14,6 +14,7 @@ enum { FK_RTL, FK_ECM, FK_NCM, FK_ASIX, FK_N };
 struct fake_dev_stats {
     unsigned rx_threads_alive, rx_threads_max, rx_threads_started;
     unsigned tx_ok, tx_refused, tx_bad_pad, tx_bad_data;
+    unsigned refused; /* second adapters of the class refused (-USB_ERR_BUSY), still plugged */
 };
 struct fake_if_stats {
     unsigned long attaches, detaches, rx_ok, rx_bad, tx_ok, tx_err, link_ups, link_downs;

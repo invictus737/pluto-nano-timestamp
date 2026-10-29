@@ -1,0 +1,281 @@
+USB Ethernet (rtos/cherryusb/net): hot-swap behaviour of the four class drivers.
+- rx thread: a failed bulk IN submit with the device still attached (transaction error,
+  babble, an ehci-nxp controller recovery) is resubmitted after a 5..200 ms back-off. Before,
+  it went back to find_class: connect_status cleared (transmit refused), the link waited for
+  again on the interrupt endpoint (CDC: a notification the device never resends, so receive
+  died; RTL8152: enable + set_rx_mode + autoneg again, a 2-3 s renegotiation).
+- usbh_X_linkup() (net/usbnet.c) when the receive loop starts: from there the interrupt
+  endpoint belongs to the glue's link thread, the rx thread never touches it again.
+- connect(): -USB_ERR_BUSY while the single static class object serves another adapter
+  (a second adapter of the same class cleared the first one's state).
+- rtl8152, asix: without a cable the link is read at 2 Hz (was every 128 ms).
+
+diff --git a/class/cdc/usbh_cdc_ecm.c b/class/cdc/usbh_cdc_ecm.c
+index 0c64ff1..9bdec54 100644
+--- a/class/cdc/usbh_cdc_ecm.c
++++ b/class/cdc/usbh_cdc_ecm.c
+@@ -82,6 +82,11 @@ static int usbh_cdc_ecm_connect(struct usbh_hubport *hport, uint8_t intf)
+ 
+     struct usbh_cdc_ecm *cdc_ecm_class = &g_cdc_ecm_class;
+ 
++    if (cdc_ecm_class->hport != NULL) {
++        /* one static class object: a second adapter would clear the first one's state */
++        USB_LOG_WRN("cdc_ecm: one adapter at a time, interface %u ignored\r\n", intf);
++        return -USB_ERR_BUSY;
++    }
+     memset(cdc_ecm_class, 0, sizeof(struct usbh_cdc_ecm));
+ 
+     cdc_ecm_class->hport = hport;
+@@ -234,6 +239,7 @@ static int usbh_cdc_ecm_disconnect(struct usbh_hubport *hport, uint8_t intf)
+ 
+ void usbh_cdc_ecm_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
+ {
++    uint32_t rx_backoff;
+     uint32_t g_cdc_ecm_rx_length;
+     int ret;
+ 
+@@ -256,13 +262,25 @@ find_class:
+         usb_osal_msleep(128);
+     }
+ 
++    usbh_cdc_ecm_linkup(&g_cdc_ecm_class);
+     g_cdc_ecm_rx_length = 0;
++    rx_backoff = 0;
+     while (1) {
+         usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkin_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkin, g_cdc_ecm_rx_buffer, CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+         ret = usbh_submit_urb(&g_cdc_ecm_class.bulkin_urb);
+         if (ret < 0) {
++            /* a transfer error with the device still attached (XACTERR, babble, a controller
++             * recovery): resubmit after a short back-off. The link state, the chip setup and the
++             * interrupt endpoint stay as they are; only a gone device leaves the loop. */
++            if (g_cdc_ecm_class.hport != NULL && g_cdc_ecm_class.hport->connected) {
++                rx_backoff = rx_backoff ? MIN(rx_backoff * 2U, 200U) : 5U;
++                usb_osal_msleep(rx_backoff);
++                g_cdc_ecm_rx_length = 0;
++                continue;
++            }
+             goto find_class;
+         }
++        rx_backoff = 0;
+ 
+         g_cdc_ecm_rx_length = g_cdc_ecm_class.bulkin_urb.actual_length;
+ 
+diff --git a/class/cdc/usbh_cdc_ecm.h b/class/cdc/usbh_cdc_ecm.h
+index a3ab84a..97d7190 100644
+--- a/class/cdc/usbh_cdc_ecm.h
++++ b/class/cdc/usbh_cdc_ecm.h
+@@ -42,6 +42,8 @@ uint8_t *usbh_cdc_ecm_get_eth_txbuf(void);
+ int usbh_cdc_ecm_eth_output(uint32_t buflen);
+ void usbh_cdc_ecm_eth_input(uint8_t *buf, uint32_t buflen);
+ void usbh_cdc_ecm_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV);
++/* rx thread: link seen up, the receive loop starts; the interrupt endpoint is the caller's from here (Nexus) */
++void usbh_cdc_ecm_linkup(struct usbh_cdc_ecm *cdc_ecm_class);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/class/cdc/usbh_cdc_ncm.c b/class/cdc/usbh_cdc_ncm.c
+index 9d4f707..527f1fc 100644
+--- a/class/cdc/usbh_cdc_ncm.c
++++ b/class/cdc/usbh_cdc_ncm.c
+@@ -109,6 +109,11 @@ static int usbh_cdc_ncm_connect(struct usbh_hubport *hport, uint8_t intf)
+ 
+     struct usbh_cdc_ncm *cdc_ncm_class = &g_cdc_ncm_class;
+ 
++    if (cdc_ncm_class->hport != NULL) {
++        /* one static class object: a second adapter would clear the first one's state */
++        USB_LOG_WRN("cdc_ncm: one adapter at a time, interface %u ignored\r\n", intf);
++        return -USB_ERR_BUSY;
++    }
+     memset(cdc_ncm_class, 0, sizeof(struct usbh_cdc_ncm));
+ 
+     cdc_ncm_class->hport = hport;
+@@ -252,6 +257,7 @@ static int usbh_cdc_ncm_disconnect(struct usbh_hubport *hport, uint8_t intf)
+ 
+ void usbh_cdc_ncm_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
+ {
++    uint32_t rx_backoff;
+     uint32_t g_cdc_ncm_rx_length;
+     int ret;
+ #if CONFIG_USBHOST_CDC_NCM_ETH_MAX_RX_SIZE <= (16 * 1024)
+@@ -278,13 +284,25 @@ find_class:
+         }
+     }
+ 
++    usbh_cdc_ncm_linkup(&g_cdc_ncm_class);
+     g_cdc_ncm_rx_length = 0;
++    rx_backoff = 0;
+     while (1) {
+         usbh_bulk_urb_fill(&g_cdc_ncm_class.bulkin_urb, g_cdc_ncm_class.hport, g_cdc_ncm_class.bulkin, &g_cdc_ncm_rx_buffer[g_cdc_ncm_rx_length], transfer_size, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+         ret = usbh_submit_urb(&g_cdc_ncm_class.bulkin_urb);
+         if (ret < 0) {
++            /* a transfer error with the device still attached (XACTERR, babble, a controller
++             * recovery): resubmit after a short back-off. The link state, the chip setup and the
++             * interrupt endpoint stay as they are; only a gone device leaves the loop. */
++            if (g_cdc_ncm_class.hport != NULL && g_cdc_ncm_class.hport->connected) {
++                rx_backoff = rx_backoff ? MIN(rx_backoff * 2U, 200U) : 5U;
++                usb_osal_msleep(rx_backoff);
++                g_cdc_ncm_rx_length = 0;
++                continue;
++            }
+             goto find_class;
+         }
++        rx_backoff = 0;
+ 
+         g_cdc_ncm_rx_length += g_cdc_ncm_class.bulkin_urb.actual_length;
+ 
+diff --git a/class/cdc/usbh_cdc_ncm.h b/class/cdc/usbh_cdc_ncm.h
+index b86122a..dff4904 100644
+--- a/class/cdc/usbh_cdc_ncm.h
++++ b/class/cdc/usbh_cdc_ncm.h
+@@ -46,6 +46,8 @@ uint8_t *usbh_cdc_ncm_get_eth_txbuf(void);
+ int usbh_cdc_ncm_eth_output(uint32_t buflen);
+ void usbh_cdc_ncm_eth_input(uint8_t *buf, uint32_t buflen);
+ void usbh_cdc_ncm_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV);
++/* rx thread: link seen up, the receive loop starts; the interrupt endpoint is the caller's from here (Nexus) */
++void usbh_cdc_ncm_linkup(struct usbh_cdc_ncm *cdc_ncm_class);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/class/vendor/net/usbh_asix.c b/class/vendor/net/usbh_asix.c
+index 95444c1..5189e27 100644
+--- a/class/vendor/net/usbh_asix.c
++++ b/class/vendor/net/usbh_asix.c
+@@ -518,6 +518,11 @@ static int usbh_asix_connect(struct usbh_hubport *hport, uint8_t intf)
+ 
+     struct usbh_asix *asix_class = &g_asix_class;
+ 
++    if (asix_class->hport != NULL) {
++        /* one static class object: a second adapter would clear the first one's state */
++        USB_LOG_WRN("asix: one adapter at a time, interface %u ignored\r\n", intf);
++        return -USB_ERR_BUSY;
++    }
+     memset(asix_class, 0, sizeof(struct usbh_asix));
+ 
+     asix_class->hport = hport;
+@@ -674,6 +679,7 @@ int usbh_asix_get_connect_status(struct usbh_asix *asix_class)
+ 
+ void usbh_asix_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
+ {
++    uint32_t rx_backoff;
+     uint32_t g_asix_rx_length;
+     int ret;
+     uint16_t len;
+@@ -701,16 +707,30 @@ find_class:
+             usb_osal_msleep(100);
+             goto find_class;
+         }
+-        usb_osal_msleep(128);
++        if (!g_asix_class.connect_status) {
++            usb_osal_msleep(500); /* no cable: 2 Hz status reads (was 128 ms) */
++        }
+     }
+ 
++    usbh_asix_linkup(&g_asix_class);
+     g_asix_rx_length = 0;
++    rx_backoff = 0;
+     while (1) {
+         usbh_bulk_urb_fill(&g_asix_class.bulkin_urb, g_asix_class.hport, g_asix_class.bulkin, &g_asix_rx_buffer[g_asix_rx_length], transfer_size, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+         ret = usbh_submit_urb(&g_asix_class.bulkin_urb);
+         if (ret < 0) {
++            /* a transfer error with the device still attached (XACTERR, babble, a controller
++             * recovery): resubmit after a short back-off. The link state, the chip setup and the
++             * interrupt endpoint stay as they are; only a gone device leaves the loop. */
++            if (g_asix_class.hport != NULL && g_asix_class.hport->connected) {
++                rx_backoff = rx_backoff ? MIN(rx_backoff * 2U, 200U) : 5U;
++                usb_osal_msleep(rx_backoff);
++                g_asix_rx_length = 0;
++                continue;
++            }
+             goto find_class;
+         }
++        rx_backoff = 0;
+ 
+         g_asix_rx_length += g_asix_class.bulkin_urb.actual_length;
+ 
+diff --git a/class/vendor/net/usbh_asix.h b/class/vendor/net/usbh_asix.h
+index bdeb0e3..6056f86 100644
+--- a/class/vendor/net/usbh_asix.h
++++ b/class/vendor/net/usbh_asix.h
+@@ -169,6 +169,8 @@ uint8_t *usbh_asix_get_eth_txbuf(void);
+ int usbh_asix_eth_output(uint32_t buflen);
+ void usbh_asix_eth_input(uint8_t *buf, uint32_t buflen);
+ void usbh_asix_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV);
++/* rx thread: link seen up, the receive loop starts; the interrupt endpoint is the caller's from here (Nexus) */
++void usbh_asix_linkup(struct usbh_asix *asix_class);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/class/vendor/net/usbh_rtl8152.c b/class/vendor/net/usbh_rtl8152.c
+index 59687fc..070f50e 100644
+--- a/class/vendor/net/usbh_rtl8152.c
++++ b/class/vendor/net/usbh_rtl8152.c
+@@ -1991,6 +1991,11 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
+ 
+     struct usbh_rtl8152 *rtl8152_class = &g_rtl8152_class;
+ 
++    if (rtl8152_class->hport != NULL) {
++        /* one static class object: a second adapter would clear the first one's state */
++        USB_LOG_WRN("rtl8152: one adapter at a time, interface %u ignored\r\n", intf);
++        return -USB_ERR_BUSY;
++    }
+     memset(rtl8152_class, 0, sizeof(struct usbh_rtl8152));
+ 
+     rtl8152_class->hport = hport;
+@@ -2134,6 +2139,7 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
+ 
+ void usbh_rtl8152_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
+ {
++    uint32_t rx_backoff;
+     uint32_t g_rtl8152_rx_length;
+     int ret;
+     uint16_t len;
+@@ -2160,7 +2166,9 @@ find_class:
+             usb_osal_msleep(100);
+             goto find_class;
+         }
+-        usb_osal_msleep(128);
++        if (!g_rtl8152_class.connect_status) {
++            usb_osal_msleep(500); /* no cable: 2 Hz status reads (was 128 ms) */
++        }
+     }
+ 
+     if (g_rtl8152_class.rtl_ops.enable) {
+@@ -2172,13 +2180,25 @@ find_class:
+     rtl8152_set_rx_mode(&g_rtl8152_class);
+     rtl8152_set_speed(&g_rtl8152_class, AUTONEG_ENABLE, g_rtl8152_class.supports_gmii ? SPEED_1000 : SPEED_100, DUPLEX_FULL);
+ 
++    usbh_rtl8152_linkup(&g_rtl8152_class);
+     g_rtl8152_rx_length = 0;
++    rx_backoff = 0;
+     while (1) {
+         usbh_bulk_urb_fill(&g_rtl8152_class.bulkin_urb, g_rtl8152_class.hport, g_rtl8152_class.bulkin, &g_rtl8152_rx_buffer[g_rtl8152_rx_length], transfer_size, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+         ret = usbh_submit_urb(&g_rtl8152_class.bulkin_urb);
+         if (ret < 0) {
++            /* a transfer error with the device still attached (XACTERR, babble, a controller
++             * recovery): resubmit after a short back-off. The link state, the chip setup and the
++             * interrupt endpoint stay as they are; only a gone device leaves the loop. */
++            if (g_rtl8152_class.hport != NULL && g_rtl8152_class.hport->connected) {
++                rx_backoff = rx_backoff ? MIN(rx_backoff * 2U, 200U) : 5U;
++                usb_osal_msleep(rx_backoff);
++                g_rtl8152_rx_length = 0;
++                continue;
++            }
+             goto find_class;
+         }
++        rx_backoff = 0;
+ 
+         g_rtl8152_rx_length += g_rtl8152_class.bulkin_urb.actual_length;
+ 
+diff --git a/class/vendor/net/usbh_rtl8152.h b/class/vendor/net/usbh_rtl8152.h
+index 171fa0b..3fb9028 100644
+--- a/class/vendor/net/usbh_rtl8152.h
++++ b/class/vendor/net/usbh_rtl8152.h
+@@ -60,6 +60,8 @@ uint8_t *usbh_rtl8152_get_eth_txbuf(void);
+ int usbh_rtl8152_eth_output(uint32_t buflen);
+ void usbh_rtl8152_eth_input(uint8_t *buf, uint32_t buflen);
+ void usbh_rtl8152_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV);
++/* rx thread: link seen up, the receive loop starts; the interrupt endpoint is the caller's from here (Nexus) */
++void usbh_rtl8152_linkup(struct usbh_rtl8152 *rtl8152_class);
+ 
+ #ifdef __cplusplus
+ }

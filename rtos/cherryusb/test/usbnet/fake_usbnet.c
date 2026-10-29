@@ -9,7 +9,10 @@
  *  - disconnect(): hport->connected = false (usbh_hubport_release does it first), the class
  *    URBs killed, usbh_X_stop(), class object cleared
  *  - rx thread: find_class (gone -> usb_osal_thread_delete(NULL) = pthread_exit), wait for the
- *    link on the interrupt endpoint, then one blocking bulk IN at a time -> usbh_X_eth_input
+ *    link on the interrupt endpoint, usbh_X_linkup(), then one blocking bulk IN at a time ->
+ *    usbh_X_eth_input; a failed bulk IN with the device attached is resubmitted (0103)
+ *  - connect() while the class object serves another adapter: -USB_ERR_BUSY, nothing set
+ *    (0103), and that device's disconnect() then finds no priv and does nothing
  *  - get_connect_status: CDC blocks until a notification (or kill), RTL/ASIX answer at once
  *  - eth_output: refuses when !connect_status or disconnected; records every transfer
  *
@@ -74,6 +77,7 @@ struct fdev {
     /* counters */
     unsigned rx_threads_alive, rx_threads_max, rx_threads_started;
     unsigned tx_ok, tx_refused, tx_bad_pad, tx_bad_data;
+    unsigned refused; /* connect() refused with -USB_ERR_BUSY, not yet unplugged */
     uint8_t txbuf[2048 + 64];
 };
 
@@ -91,7 +95,8 @@ static const bool fk_blocking_status[FK_N] = { false, true, true, false };
 #define HOOKS(id, T)                                    \
     void usbh_##id##_run(T *c);                         \
     void usbh_##id##_stop(T *c);                        \
-    void usbh_##id##_eth_input(uint8_t *b, uint32_t n);
+    void usbh_##id##_eth_input(uint8_t *b, uint32_t n); \
+    void usbh_##id##_linkup(T *c);
 HOOKS(rtl8152, struct usbh_rtl8152)
 HOOKS(cdc_ecm, struct usbh_cdc_ecm)
 HOOKS(cdc_ncm, struct usbh_cdc_ncm)
@@ -209,10 +214,16 @@ static int f_output(struct fdev *d, bool connect_status, uint32_t len)
             if (!g_##id.connect_status)                                                        \
                 usb_osal_msleep(2);                                                            \
         }                                                                                      \
+        usbh_##id##_linkup(&g_##id);                                                           \
         for (;;) {                                                                             \
             uint32_t n;                                                                        \
-            if (f_bulkin(d, buf, &n) < 0)                                                      \
+            if (f_bulkin(d, buf, &n) < 0) {                                                    \
+                if (d->hp.connected) { /* 0103: resubmit while attached */                     \
+                    usb_osal_msleep(5);                                                        \
+                    continue;                                                                  \
+                }                                                                              \
                 goto find_class;                                                               \
+            }                                                                                  \
             usbh_##id##_eth_input(buf, n + (K == FK_RTL ? 4 : 0)); /* RTL: + FCS */            \
         }                                                                                      \
     }                                                                                          \
@@ -220,6 +231,11 @@ static int f_output(struct fdev *d, bool connect_status, uint32_t len)
     {                                                                                          \
         struct fdev *d = &g_fdev[K];                                                           \
         pthread_mutex_lock(&d->m);                                                             \
+        if (g_##id.hport != NULL) { /* 0103: second adapter of this class refused */          \
+            d->refused++;                                                                      \
+            pthread_mutex_unlock(&d->m);                                                       \
+            return;                                                                            \
+        }                                                                                      \
         memset(&g_##id, 0, sizeof(g_##id));                                                    \
         d->hp.connected = true;                                                                \
         d->hp.port = 1;                                                                        \
@@ -239,6 +255,11 @@ static int f_output(struct fdev *d, bool connect_status, uint32_t len)
     {                                                                                          \
         struct fdev *d = &g_fdev[K];                                                           \
         pthread_mutex_lock(&d->m);                                                             \
+        if (d->refused > 0) { /* the refused device leaves: no priv, nothing to do */          \
+            d->refused--;                                                                      \
+            pthread_mutex_unlock(&d->m);                                                       \
+            return;                                                                            \
+        }                                                                                      \
         d->hp.connected = false;                                                               \
         d->kill_gen++;                                                                         \
         pthread_cond_broadcast(&d->c);                                                         \
@@ -328,6 +349,7 @@ void fake_dev_stats(int k, struct fake_dev_stats *st)
     st->tx_refused = d->tx_refused;
     st->tx_bad_pad = d->tx_bad_pad;
     st->tx_bad_data = d->tx_bad_data;
+    st->refused = d->refused;
     pthread_mutex_unlock(&d->m);
 }
 
