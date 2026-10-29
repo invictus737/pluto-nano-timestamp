@@ -235,28 +235,62 @@ unsigned zynq_ehci_async_kicks;
 static uint32_t zynq_ehci_last_alist;
 static unsigned zynq_ehci_stuck_ticks, zynq_ehci_kicks_seen;
 
-static void
+unsigned zynq_ehci_hc_resets;
+static volatile int zynq_ehci_reset_wanted;
+
+/* returns 0 when the async schedule obeyed (AS followed ASE), -1 when the engine is hung */
+static int
 zynq_ehci_async_kick(void)
 {
 	volatile uint32_t *cmd = (volatile uint32_t *)(ZY7_USB0_BASE + 0x140);
 	volatile uint32_t *sts = (volatile uint32_t *)(ZY7_USB0_BASE + 0x144);
-	int i;
+	int i, hung;
 
 	*cmd &= ~(1U << 5);
 	for (i = 0; i < 2000 && (*sts & (1U << 15)) != 0; ++i)
 		DELAY(1);
+	hung = (*sts & (1U << 15)) != 0;
 	*sts = 1U << 5; /* stale IAA */
 	*cmd |= 1U << 5;
 	for (i = 0; i < 2000 && (*sts & (1U << 15)) == 0; ++i)
 		DELAY(1);
 	zynq_ehci_async_kicks++;
+	if (hung)
+		zynq_ehci_reset_wanted = 1;
+	return (hung ? -1 : 0);
+}
+
+/*
+ * Hard hang of the ChipIdea async engine (seen after bulk IN transaction errors: ASE=0 is
+ * ignored, AS stays 1, IAA never comes): reset and re-initialise the controller the way a
+ * resume does (HCRESET, our post-reset settings, schedules, interrupts), then explore. Devices
+ * that lost their port are re-enumerated; pending transfers end with an error and are retried.
+ */
+void ehci_resume(ehci_softc_t *sc); /* ehci.c (exported on RTEMS) */
+static void
+zynq_ehci_hard_reset(ehci_softc_t *e)
+{
+	static int last_tick = -100000;
+	int now = ticks;
+
+	if (now - last_tick < 2 * hz)
+		return;
+	last_tick = now;
+	ehci_resume(e); /* takes the bus lock itself (ehci_do_poll) */
+	USB_BUS_LOCK(&e->sc_bus);
+	e->sc_eintrs |= ZY7_USBSTS_UAI | ZY7_USBSTS_UPI;
+	EOWRITE4(e, EHCI_USBINTR, e->sc_eintrs);
+	USB_BUS_UNLOCK(&e->sc_bus);
+	zynq_ehci_hc_resets++;
+	printf("ehci: async engine hung, controller reset #%u\n", zynq_ehci_hc_resets);
+	usb_needs_explore(&e->sc_bus, 1);
 }
 
 void zynq_ehci_kick_async(void); /* also called from ehci_timeout (Pluto patch) */
 void
 zynq_ehci_kick_async(void)
 {
-	zynq_ehci_async_kick();
+	(void)zynq_ehci_async_kick();
 }
 
 static void
@@ -275,6 +309,10 @@ zynq_ehci_poll_tick(void *arg)
 			zynq_ehci_stuck_ticks = 0;
 		}
 		zynq_ehci_last_alist = al;
+		if (zynq_ehci_reset_wanted) {
+			zynq_ehci_reset_wanted = 0;
+			zynq_ehci_hard_reset(zynq_ehci_sc);
+		}
 		zynq_ehci_rescued += (unsigned)ehci_zynq_poll(zynq_ehci_sc);
 		if ((REG32(ZY7_USB0_BASE + ZY7_USB_PORTSC1) & PORTSC_CHANGE_BITS) != 0 &&
 		    (zynq_ehci_ticks % 50) == 0)
@@ -283,8 +321,9 @@ zynq_ehci_poll_tick(void *arg)
 		    (ehci_zynq_ring_repairs != zynq_ehci_repairs_seen ||
 		    zynq_ehci_async_kicks != zynq_ehci_kicks_seen)) {
 			zynq_ehci_kicks_seen = zynq_ehci_async_kicks;
-			printf("ehci: %u transfer(s) completed by the poll, ring repairs %u, async kicks %u, IAA timeouts %u\n",
-			    zynq_ehci_rescued, ehci_zynq_ring_repairs, zynq_ehci_async_kicks, ehci_zynq_iaa_timeouts);
+			printf("ehci: %u transfer(s) completed by the poll, ring repairs %u, async kicks %u, IAA timeouts %u, resets %u\n",
+			    zynq_ehci_rescued, ehci_zynq_ring_repairs, zynq_ehci_async_kicks, ehci_zynq_iaa_timeouts,
+			    zynq_ehci_hc_resets);
 			zynq_ehci_rescued = 0;
 			zynq_ehci_repairs_seen = ehci_zynq_ring_repairs;
 		}
