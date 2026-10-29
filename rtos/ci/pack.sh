@@ -17,6 +17,10 @@ echo "$(basename "$ITB"): load $LOAD entry $ENTRY binary $SIZE bytes"
 [ "$SIZE" -lt $((48 * 1024 * 1024)) ] || { echo "binary too large"; readelf -lW "$ELF"; exit 1; }
 unzip -q -o "$XSA" system_top.bit -d "$T"
 dtc -I dts -O dtb -o "$T/stub.dtb" "$HERE/image/stub.dts"
-sed -e "s/@LOAD@/$LOAD/g" -e "s/@ENTRY@/$ENTRY/g" "$HERE/image/rtos.its.in" > "$T/rtos.its"
+# gzip kernel (PACK_GZIP=0 for none): half the bytes to read from QSPI at boot and to load
+# over the serial console; U-Boot decompresses it to the load address
+KDATA=nexus-rtos.bin; KCOMP=none
+if [ "${PACK_GZIP:-1}" = 1 ]; then gzip -9 -n -c "$BIN" > "$T/nexus-rtos.bin.gz"; KDATA=nexus-rtos.bin.gz; KCOMP=gzip; fi
+sed -e "s/@LOAD@/$LOAD/g" -e "s/@ENTRY@/$ENTRY/g" -e "s/@KDATA@/$KDATA/g" -e "s/@KCOMP@/$KCOMP/g" "$HERE/image/rtos.its.in" > "$T/rtos.its"
 (cd "$T" && mkimage -f rtos.its "$ITB" >/dev/null)
 mkimage -l "$ITB" | grep -E "Data Size|Configuration|FIT description" | head -12

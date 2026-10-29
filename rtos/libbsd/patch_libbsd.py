@@ -142,6 +142,36 @@ def diag_rtwn_c(s):
     return s.replace(old, "fail:\n\tif (error != 0)\n\t\tdevice_printf(sc->sc_dev, \"diag: init failed, error %d\\n\", error);\n\tRTWN_UNLOCK(sc);\n\n\treturn (error);\n}")
 
 
+POLL_MARK = "/* Pluto RTOS: periodic transfer poll */"
+
+
+def ehci_c(s):
+    """ehci_zynq_poll(): complete finished transfers without an interrupt (the Zynq glue calls it
+    from a timer); returns how many it completed, so lost completion interrupts become visible."""
+    if POLL_MARK in s:
+        return s
+    return s + """
+""" + POLL_MARK + """
+int
+ehci_zynq_poll(ehci_softc_t *sc)
+{
+	struct usb_xfer *xfer;
+	int done = 0;
+
+	USB_BUS_LOCK(&sc->sc_bus);
+repeat:
+	TAILQ_FOREACH(xfer, &sc->sc_bus.intr_q.head, wait_entry) {
+		if (ehci_check_transfer(xfer)) {
+			done++;
+			goto repeat;
+		}
+	}
+	USB_BUS_UNLOCK(&sc->sc_bus);
+	return (done);
+}
+"""
+
+
 edit("libbsd.py", libbsd_py)
 edit("freebsd/sys/dev/usb/usb_msctest.c", msctest_c)
 edit("freebsd/sys/dev/usb/usb_msctest.h", msctest_h)
@@ -149,4 +179,5 @@ edit("freebsd/sys/dev/usb/quirk/usb_quirk.c", quirk_c)
 edit("freebsd/sys/net80211/ieee80211_proto.c", diag_proto_c)
 edit("freebsd/sys/net80211/ieee80211_ioctl.c", diag_ioctl_c)
 edit("freebsd/sys/dev/rtwn/if_rtwn.c", diag_rtwn_c)
+edit("freebsd/sys/dev/usb/controller/ehci.c", ehci_c)
 print("libbsd patched for the Pluto")
