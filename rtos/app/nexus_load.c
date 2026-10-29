@@ -306,10 +306,28 @@ int nexus_load_shell(int argc, char **argv)
 #define NEXUS2_ENV_FILE "/data/nexus2/nexus2.env"
 extern char **environ;
 
+/* NEXUS2_RTEMS_* names set by this side (LAYOUT, BASE_PRIO) stay reserved; these are
+ * operator A/B switches of the light layout and its cross-core locks (rt_thread.rs, pi_mutex.rs) */
+static const char *const env_rtems_ab[] = {
+  "NEXUS2_RTEMS_IO_CPU=",
+  "NEXUS2_RTEMS_ANALYSIS_CPU=",
+  "NEXUS2_RTEMS_ANALYSIS_PRIO=",
+  "NEXUS2_RTEMS_PROTOCOL_ABOVE=",
+  "NEXUS2_RTEMS_PI_MUTEX=",
+  NULL,
+};
+
 static int env_switch(const char *kv)
 {
-  return (strncmp(kv, "NEXUS2_", 7) == 0 && strncmp(kv, "NEXUS2_RTEMS_", 13) != 0) ||
-         strncmp(kv, "NEXUS2_RTEMS_IO_CPU=", 20) == 0 || strncmp(kv, "RUST_LOG=", 9) == 0;
+  if (strncmp(kv, "NEXUS2_RTEMS_", 13) == 0) {
+    for (const char *const *ab = env_rtems_ab; *ab != NULL; ++ab) {
+      if (strncmp(kv, *ab, strlen(*ab)) == 0) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  return strncmp(kv, "NEXUS2_", 7) == 0 || strncmp(kv, "RUST_LOG=", 9) == 0;
 }
 
 /* NAME=VALUE sets, NAME= unsets; 0 ok */
@@ -360,7 +378,13 @@ static const char *const env_pluto[] = {
  *    16-block TX DMA ring. With 2 ms latency that leaves ~13.5 ms of pipeline slack.
  *  - ANALYSIS_PAIR/Q15, SYNTHESIS_HISTORY, TX/RX_RESAMPLER_BLOCK: the NEON PFB/resampler kernels.
  *  - DRIVE_WAKE: the drive loop parks until RX analysis wakes it (a 250 us sleep is a 1-2 ms
- *    tick on RTEMS); TX_SILENT/TX_BATCH/IDLE_GATE and the DMR/FM credits as on Linux. */
+ *    tick on RTEMS); TX_SILENT/TX_BATCH/IDLE_GATE and the DMR/FM credits as on Linux (the credits
+ *    take effect on RTEMS since nexus2 compiles them there too).
+ * Defaulted on RTEMS inside nexus2 itself (no entry needed; NAME=0 turns one off):
+ *  RTEMS_ANALYSIS_CPU=0 (RX analysis on CPU0, POSIX 109), RTEMS_PROTOCOL_ABOVE=1,
+ *  RTEMS_PI_MUTEX=1, TXGATE_SEQLOCK=1, TX_LATE_SILENCE=1 (TX_LATE_SILENCE_MS=6),
+ *  TETRA_UL_GATE=1 (TETRA_UL_GATE_DB=3), DASHBOARD_SERIALIZER=1, LIVE_MODE_RELOAD=1.
+ *  Opt-in only, as on Linux: PLUTO_BOUNDED_TURNS, PLUTO_NATIVE_RX1MS, NATIVE_CARRIER_CAP_US. */
 static const char *const env_rtems_defaults[] = {
   "NEXUS2_PLUTO_RX_LATENCY_US=2000",
   "NEXUS2_PLUTO_RUNNING_LEAD12=1",
