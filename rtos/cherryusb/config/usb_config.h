@@ -1,0 +1,107 @@
+/*
+ * CherryUSB host configuration for the Pluto Nano RTEMS image (USB_STACK=cherry).
+ *
+ * One controller: Zynq-7000 USB0, a ChipIdea (Synopsys/ARC TDI) EHCI core with an integrated
+ * transaction translator and a ULPI USB3320 PHY, one root port, high speed. Devices: the AIC8800
+ * Wi-Fi/BT stick (vendor + Bluetooth interfaces), behind at most a couple of hubs.
+ *
+ * Memory model: QH/qTD pools, the frame list and every CherryUSB-internal transfer buffer live
+ * in the BSP non-cacheable area (.bsp_nocache, Normal non-cacheable on this BSP); the OSAL drains
+ * the L2C-310 store buffer when it leaves the outermost critical section (osal/usb_osal_rtems.c).
+ * Class-driver buffers are cacheable: CONFIG_USB_DCACHE_ENABLE makes the EHCI port clean and
+ * invalidate them before a transfer, aic/aicwf_cherry.c invalidates IN buffers after it and
+ * bounces buffers that are not cache-line aligned.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef NEXUS_CHERRYUSB_CONFIG_H
+#define NEXUS_CHERRYUSB_CONFIG_H
+
+#include <stdio.h>
+
+/* ================ common ================ */
+
+#define CONFIG_USB_PRINTF(...) printf(__VA_ARGS__)
+
+#ifndef CONFIG_USB_DBG_LEVEL
+#define CONFIG_USB_DBG_LEVEL USB_DBG_INFO
+#endif
+
+/* Cortex-A9 L1 and the L2C-310 both use 32-byte lines */
+#define CONFIG_USB_DCACHE_ENABLE
+#define CONFIG_USB_ALIGN_SIZE 32
+
+#define USB_NOCACHE_RAM_SECTION __attribute__((section(".bsp_nocache.cherryusb")))
+
+/* ================ host stack ================ */
+
+#define CONFIG_USBHOST_MAX_RHPORTS          1
+#define CONFIG_USBHOST_MAX_EXTHUBS          2
+#define CONFIG_USBHOST_MAX_EHPORTS          7
+/* AIC8800 composites: vendor Wi-Fi interface + Bluetooth (event/ACL + isochronous alternates) */
+#define CONFIG_USBHOST_MAX_INTERFACES       8
+#define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 8
+#define CONFIG_USBHOST_MAX_ENDPOINTS        8
+
+#define CONFIG_USBHOST_MAX_SERIAL_CLASS 1
+#define CONFIG_USBHOST_MAX_HID_CLASS    1
+#define CONFIG_USBHOST_MAX_MSC_CLASS    1
+#define CONFIG_USBHOST_MAX_AUDIO_CLASS  1
+#define CONFIG_USBHOST_MAX_VIDEO_CLASS  1
+
+#define CONFIG_USBHOST_DEV_NAMELEN 16
+
+/*
+ * Hub thread: it runs enumeration and the class drivers' connect(), and the AIC driver's
+ * connect() downloads the firmware and starts the station there. Priority in the CherryUSB
+ * scale (smaller = more urgent); the OSAL maps it like the AIC shim maps RT-Thread priorities
+ * (POSIX 150 - prio), so 14 equals the shim's attach thread.
+ */
+#define CONFIG_USBHOST_PSC_PRIO      14
+#define CONFIG_USBHOST_PSC_STACKSIZE (64 * 1024)
+
+/* composite AIC configuration descriptors exceed 512 bytes with the Bluetooth alternates */
+#define CONFIG_USBHOST_REQUEST_BUFFER_LEN       1024
+#define CONFIG_USBHOST_CONTROL_TRANSFER_TIMEOUT 2000
+#define CONFIG_USBHOST_MSC_TIMEOUT              5000
+
+/* ================ host port ================ */
+
+#define CONFIG_USBHOST_MAX_BUS 1
+
+/* ---------------- EHCI (ChipIdea) ---------------- */
+
+/*
+ * USB0 at 0xE0002000: capability registers at +0x100, CAPLENGTH 0x40 puts the operational
+ * registers at +0x140 (USBCMD), PORTSC1 at +0x184, i.e. the standard EHCI layout with the
+ * reserved words before CONFIGFLAG kept.
+ */
+#define CONFIG_USB_EHCI_HCCR_OFFSET     (0x100)
+#define CONFIG_USB_EHCI_FRAME_LIST_SIZE 1024
+/* one QH per URB in flight; aicwf_cherry.c keeps one URB per endpoint in the controller */
+#define CONFIG_USB_EHCI_QH_NUM          24
+#define CONFIG_USB_EHCI_QTD_NUM         96
+#define CONFIG_USB_EHCI_ITD_NUM         4
+/* integrated TT: no companion controller (CONFIG_USB_EHCI_WITH_OHCI stays undefined) */
+/* descriptors are in non-cacheable memory: no descriptor cache maintenance */
+/* no CONFIG_USB_EHCI_CONFIGFLAG, no CONFIG_USB_EHCI_ISO, no CONFIG_USB_EHCI_HCOR_RESERVED_DISABLE */
+/* usbh_kill_urb() leaves PSE/ASE alone (patches/0002); remove to get the stock toggle back */
+#define CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES
+/* restart a qTD halted by transaction errors in place, as Linux (QH_XACTERR_MAX, patches/0003) */
+#define CONFIG_USB_EHCI_XACTERR_RETRIES 32
+
+#define CONFIG_USB_HS
+
+/* the RTEMS address space is identity mapped */
+#define usb_phyaddr2ramaddr(addr) (addr)
+#define usb_ramaddr2phyaddr(addr) (addr)
+
+/* ================ Nexus glue (port/usb_glue_zynq.c) ================ */
+
+#define NEXUS_USB0_BASE      0xE0002000U
+/* poll period of the lost-interrupt / IAA watchdog */
+#define NEXUS_USB_POLL_MS    10
+/* CPU of every CherryUSB thread (the AIC driver threads run on CPU0 as well, AICWF_THREAD_CPU) */
+#define NEXUS_USB_THREAD_CPU 0
+
+#endif /* NEXUS_CHERRYUSB_CONFIG_H */

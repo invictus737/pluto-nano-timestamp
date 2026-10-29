@@ -1,0 +1,67 @@
+Nexus-BS: Interrupt on Async Advance watchdog hooks for the Zynq glue poll thread
+(usbh_ehci_iaa_pending / usbh_ehci_iaa_complete, as Linux ehci_iaa_watchdog).
+
+diff --git a/port/ehci/usb_hc_ehci.c b/port/ehci/usb_hc_ehci.c
+index fd72907..9709e49 100644
+--- a/port/ehci/usb_hc_ehci.c
++++ b/port/ehci/usb_hc_ehci.c
+@@ -1454,4 +1454,44 @@ void USBH_IRQHandler(uint8_t busid)
+ 
+     if (usbsts & EHCI_USBSTS_FATAL) {
+     }
+-}
+\ No newline at end of file
++}
++/*
++ * Nexus-BS (RTEMS, Zynq-7000 ChipIdea core): Interrupt on Async Advance watchdog.
++ *
++ * A finished bulk/control QH is unlinked and completed only when the IAA interrupt arrives.
++ * usbh_kill_urb() runs its own IAA handshake and clears USBSTS.IAA, so QHs that were waiting
++ * for that same IAA are never completed; a controller that never raises IAA (seen on this
++ * core) has the same effect. The glue samples usbh_ehci_iaa_pending() every poll period and
++ * completes, with usbh_ehci_iaa_complete(), the QHs that were already waiting one period
++ * earlier, as Linux ehci_iaa_watchdog() does. The caller holds the critical section.
++ */
++uint32_t usbh_ehci_iaa_pending(uint8_t busid)
++{
++    uint32_t mask = 0;
++
++    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM && index < 32; index++) {
++        if (ehci_qh_pool[busid][index].remove_in_iaad) {
++            mask |= 1U << index;
++        }
++    }
++    return mask;
++}
++
++uint32_t usbh_ehci_iaa_complete(uint8_t busid, uint32_t mask)
++{
++    struct usbh_bus *bus = &g_usbhost_bus[busid];
++    uint32_t done = 0;
++
++    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM && index < 32; index++) {
++        struct ehci_qh_hw *qh = &ehci_qh_pool[busid][index];
++
++        if ((mask & (1U << index)) && qh->remove_in_iaad && qh->urb) {
++            ehci_urb_waitup(bus, qh->urb);
++            done |= 1U << index;
++        }
++    }
++    if (done) {
++        EHCI_HCOR->usbcmd &= ~EHCI_USBCMD_IAAD;
++    }
++    return done;
++}
+diff --git a/port/ehci/usb_hc_ehci.h b/port/ehci/usb_hc_ehci.h
+index 3d4cb8c..7d1db91 100644
+--- a/port/ehci/usb_hc_ehci.h
++++ b/port/ehci/usb_hc_ehci.h
+@@ -99,4 +99,8 @@ int ehci_iso_urb_init(struct usbh_bus *bus, struct usbh_urb *urb);
+ void ehci_kill_iso_urb(struct usbh_bus *bus, struct usbh_urb *urb);
+ void ehci_scan_isochronous_list(struct usbh_bus *bus);
+ 
++/* Nexus-BS: IAA watchdog (usb_hc_ehci.c) */
++uint32_t usbh_ehci_iaa_pending(uint8_t busid);
++uint32_t usbh_ehci_iaa_complete(uint8_t busid, uint32_t mask);
++
+ #endif

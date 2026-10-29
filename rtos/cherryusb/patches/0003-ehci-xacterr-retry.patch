@@ -1,0 +1,92 @@
+Nexus-BS: CONFIG_USB_EHCI_XACTERR_RETRIES, as Linux ehci-q.c qh_completions(): a qTD that is
+still active is never completed because of an error bit (the controller is retrying it), and a
+qTD halted by transaction errors with CERR exhausted is restarted in place, QH linked, up to
+that many times before the transfer fails (g_ehci_xacterr_retries counts the restarts).
+
+diff --git a/port/ehci/usb_hc_ehci.c b/port/ehci/usb_hc_ehci.c
+index 1d385f9..7ef2839 100644
+--- a/port/ehci/usb_hc_ehci.c
++++ b/port/ehci/usb_hc_ehci.c
+@@ -15,6 +15,8 @@
+ #define EHCI_TUNE_MULT_TT 1
+ 
+ struct ehci_hcd g_ehci_hcd[CONFIG_USBHOST_MAX_BUS];
++/* transaction-error restarts (CONFIG_USB_EHCI_XACTERR_RETRIES) */
++volatile uint32_t g_ehci_xacterr_retries;
+ 
+ USB_NOCACHE_RAM_SECTION struct ehci_qh_hw ehci_qh_pool[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_QH_NUM];
+ USB_NOCACHE_RAM_SECTION struct ehci_qtd_hw ehci_qtd_pool[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_QTD_NUM];
+@@ -85,6 +87,7 @@ static struct ehci_qh_hw *ehci_qh_alloc(struct usbh_bus *bus)
+             qh->urb = NULL;
+             qh->first_qtd = QTD_LIST_END;
+             qh->remove_in_iaad = 0;
++            qh->xacterrs = 0;
+ 
+             return qh;
+         }
+@@ -673,15 +676,46 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
+ #endif
+         token = qtd->hw.token;
+ 
++#ifdef CONFIG_USB_EHCI_XACTERR_RETRIES
++        /* still active: the controller is retrying it (an error bit with CERR left is not final) */
++        if (token & QTD_TOKEN_STATUS_ACTIVE) {
++            return;
++        } else if (token & QTD_TOKEN_STATUS_ERRORS) {
++            break;
++        }
++#else
+         if (token & QTD_TOKEN_STATUS_ERRORS) {
+             break;
+         } else if (token & QTD_TOKEN_STATUS_ACTIVE) {
+             return;
+         }
++#endif
+ 
+         qtd = EHCI_ADDR2QTD(qtd->hw.next_qtd);
+     }
+ 
++#ifdef CONFIG_USB_EHCI_XACTERR_RETRIES
++    /*
++     * As Linux ehci-q.c qh_completions(): a qTD halted by transaction errors with the error
++     * counter exhausted is restarted in place (QH stays linked) up to
++     * CONFIG_USB_EHCI_XACTERR_RETRIES times before the transfer fails.
++     */
++    if (qtd && (token & (QTD_TOKEN_STATUS_HALTED | QTD_TOKEN_STATUS_XACTERR)) ==
++                   (QTD_TOKEN_STATUS_HALTED | QTD_TOKEN_STATUS_XACTERR) &&
++        (token & QTD_TOKEN_CERR_MASK) == 0 &&
++        (token & (QTD_TOKEN_STATUS_BABBLE | QTD_TOKEN_STATUS_DBERR)) == 0 &&
++        qh->xacterrs < CONFIG_USB_EHCI_XACTERR_RETRIES) {
++        uint32_t keep = ~(QTD_TOKEN_STATUS_HALTED | QTD_TOKEN_STATUS_XACTERR | QTD_TOKEN_CERR_MASK);
++        uint32_t set = QTD_TOKEN_STATUS_ACTIVE | ((uint32_t)EHCI_TUNE_CERR << QTD_TOKEN_CERR_SHIFT);
++
++        qh->xacterrs++;
++        g_ehci_xacterr_retries++;
++        qtd->hw.token = (token & keep) | set;
++        qh->hw.overlay.token = (qh->hw.overlay.token & keep) | set;
++        return;
++    }
++#endif
++
+     urb = qh->urb;
+ 
+     if ((token & QTD_TOKEN_STATUS_ERRORS) == 0) {
+diff --git a/port/ehci/usb_hc_ehci.h b/port/ehci/usb_hc_ehci.h
+index 7d1db91..f05527e 100644
+--- a/port/ehci/usb_hc_ehci.h
++++ b/port/ehci/usb_hc_ehci.h
+@@ -64,6 +64,7 @@ struct ehci_qh_hw {
+     struct usbh_urb *urb;
+     usb_osal_sem_t waitsem;
+     uint8_t remove_in_iaad;
++    uint8_t xacterrs; /* CONFIG_USB_EHCI_XACTERR_RETRIES */
+ } __attribute__((aligned(CONFIG_USB_EHCI_ALIGN_SIZE)));
+ 
+ struct ehci_itd_hw {
+@@ -102,5 +103,6 @@ void ehci_scan_isochronous_list(struct usbh_bus *bus);
+ /* Nexus-BS: IAA watchdog (usb_hc_ehci.c) */
+ uint32_t usbh_ehci_iaa_pending(uint8_t busid);
+ uint32_t usbh_ehci_iaa_complete(uint8_t busid, uint32_t mask);
++extern volatile uint32_t g_ehci_xacterr_retries;
+ 
+ #endif

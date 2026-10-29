@@ -1,0 +1,30 @@
+Nexus-BS: CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES keeps the periodic and asynchronous
+schedules running in usbh_kill_urb(). The stock code clears and sets PSE/ASE back to back
+without the PSS/ASS handshake (EHCI 4.6, 4.8); unlinking with the IAA doorbell is enough for
+the asynchronous list (as Linux does), and the ChipIdea core was seen to hang its asynchronous
+engine after ASE toggles.
+
+diff --git a/port/ehci/usb_hc_ehci.c b/port/ehci/usb_hc_ehci.c
+index 9709e49..1d385f9 100644
+--- a/port/ehci/usb_hc_ehci.c
++++ b/port/ehci/usb_hc_ehci.c
+@@ -1308,7 +1308,9 @@ int usbh_kill_urb(struct usbh_urb *urb)
+ 
+     flags = usb_osal_enter_critical_section();
+ 
++#ifndef CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES
+     EHCI_HCOR->usbcmd &= ~(EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
++#endif
+ 
+     if ((USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_CONTROL) || (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK)) {
+         qh = EHCI_ADDR2QH(g_async_qh_head[bus->hcd.hcd_id].hw.hlp);
+@@ -1336,7 +1338,9 @@ int usbh_kill_urb(struct usbh_urb *urb)
+ #endif
+     }
+ 
++#ifndef CONFIG_USB_EHCI_KILL_KEEP_SCHEDULES
+     EHCI_HCOR->usbcmd |= (EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
++#endif
+ 
+     qh = (struct ehci_qh_hw *)urb->hcpriv;
+     qh->remove_in_iaad = 0;
