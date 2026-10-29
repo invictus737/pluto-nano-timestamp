@@ -48,6 +48,7 @@
 #include "config_store.h"
 #include "netcmd.h"
 #include "nexus_station.h"
+#include "metrics.h"
 void nexus_fwupdate_register(void);
 #include "ssh_server.h"
 /* ---- Bluetooth (rtos/bt) ---- */
@@ -115,9 +116,9 @@ static double uptime_s(void)
 
 static volatile double t_net_up = -1.0;
 
-/* ---- HTTP status (plain text, one request per connection, low priority) ---- */
+/* ---- HTTP status: GET / page; the server and /metrics /log /cmd live in http_status.c ---- */
 
-static int status_text(char *buf, size_t cap)
+int nexus_status_text(char *buf, size_t cap)
 {
   int n = 0;
   struct ifaddrs *ifa = NULL;
@@ -148,45 +149,6 @@ static int status_text(char *buf, size_t cap)
     freeifaddrs(ifa);
   }
   return n;
-}
-
-static void *http_status(void *arg)
-{
-  (void)arg;
-  int s = socket(AF_INET, SOCK_STREAM, 0);
-  int one = 1;
-  struct sockaddr_in a = {.sin_len = sizeof(a), .sin_family = AF_INET, .sin_port = htons(80)};
-  static char body[2048];
-  static char head[160];
-
-  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  if (s < 0 || bind(s, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(s, 4) != 0) {
-    printf("http: cannot listen on :80\n");
-    return NULL;
-  }
-  for (;;) {
-    int c = accept(s, NULL, NULL);
-    if (c < 0) {
-      if (errno != EINTR) {
-        sleep(1); /* EMFILE/ENOBUFS: do not spin at the accept */
-      }
-      continue;
-    }
-    /* a client that connects and sends nothing must not hold the page forever */
-    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    char req[256];
-    (void)read(c, req, sizeof(req)); /* request line ignored: one page */
-    int n = status_text(body, sizeof(body));
-    int h = snprintf(head, sizeof(head),
-                     "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
-                     "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
-    (void)write(c, head, h);
-    (void)write(c, body, n);
-    close(c);
-  }
-  return NULL;
 }
 
 /* ---- network bring-up: interfaces arrive by USB hotplug, dhcpcd follows them ---- */
@@ -940,7 +902,7 @@ static void Init(rtems_task_argument arg)
 
   spawn(net_watch, 5, 8192);
   spawn(sntp_main, 5, 16384);
-  spawn(http_status, 5, 16384);
+  spawn(nexus_http_status, 5, 64 * 1024); /* http_status.c: /, /metrics, /log, /cmd */
 #ifdef NEXUS_RUST
   spawn(rust_entry, 5, 256 * 1024);
 #endif

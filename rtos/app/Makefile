@@ -67,6 +67,20 @@ $(B)/netcmd.o: netcmd.c netcmd.h config_store.h ../libbsd/aic8800/aicwf_wifi.h |
 CONFIG_OBJS += $(B)/fwupdate.o
 $(B)/fwupdate.o: fwupdate.c config_store.h qspi_nor.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
+# Port 80 status server (http_status.c: /, /metrics, /log, /cmd) and the metrics collectors
+# (metrics.c; metrics_fmt.c is plain C, host-tested by tools/pluto/tests). Build identity for
+# /metrics: git commit of this tree, CI run number, the pinned nexus2 commit (rtos/NEXUS_REF).
+METRICS_GIT := $(or $(shell git -C $(CURDIR) rev-parse -q --short=12 HEAD 2>/dev/null),unknown)$(shell git -C $(CURDIR) rev-parse -q HEAD >/dev/null 2>&1 && ! git -C $(CURDIR) diff --quiet HEAD 2>/dev/null && echo -dirty)
+METRICS_REF := $(shell cat $(CURDIR)/../NEXUS_REF 2>/dev/null | cut -c1-12)
+METRICS_DEFS := -DNEXUS_BUILD_GIT='"$(METRICS_GIT)"' -DNEXUS_BUILD_RUN='"$(GITHUB_RUN_NUMBER)"' \
+	-DNEXUS_BUILD_NEXUS_REF='"$(METRICS_REF)"'
+CONFIG_OBJS += $(B)/http_status.o $(B)/metrics.o $(B)/metrics_fmt.o
+$(B)/http_status.o: http_status.c metrics.h config_store.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/metrics.o: metrics.c metrics.h netcmd.h nexus_station.h FORCE | $(B)
+	$(CC) $(CFLAGS) $(METRICS_DEFS) -I../libbsd/aic8800 -c $< -o $@
+$(B)/metrics_fmt.o: metrics_fmt.c metrics.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/nexus-rtos.elf: $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) $(RUST_LIB)
 	$(CC) $(CFLAGS) $(B)/main.o $(B)/platform.o $(B)/abi.o $(B)/ssh_server.o $(CONFIG_OBJS) -o $@ -Wl,--start-group $(RUST_LIB) $(SSH_LIBS) -lbsd -ljffs2 -lm -lz -Wl,--end-group $(LDFLAGS) -Wl,-Map,$(B)/nexus-rtos.map
@@ -94,6 +108,13 @@ $(error USB_STACK must be libbsd or cherry, not $(USB_STACK))
 endif
 # Bluetooth (rtos/bt): BTstack A2DP source; must precede the libnexusrtos.a rule
 include ../bt/bt.mk
+# /metrics "usb": the CherryUSB host counters, built with the CherryUSB include path
+ifeq ($(USB_STACK),cherry)
+CONFIG_OBJS += $(B)/metrics_usb.o
+$(B)/nexus-rtos.elf: $(B)/metrics_usb.o
+$(B)/metrics_usb.o: metrics_usb.c metrics.h $(B)/cherry_hcd.$(CHERRY_HCD) | $(B)
+	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
+endif
 
 # nexus2 build (rtos/ci/nexus2-link.sh): the C side as one library, Init starting nexus2's main().
 AR := $(RTEMS_TOOLS)/bin/arm-rtems6-ar

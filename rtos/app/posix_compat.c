@@ -682,6 +682,39 @@ static char *log_snapshot(size_t *out_len)
   return c;
 }
 
+/* GET /log (http_status.c, metrics.h): ring bytes from the free-running offset `since`; writers
+ * are never stopped (bytes at the oldest edge may be torn). cap 0 reports the offsets only. */
+size_t nexus_log_read(uint32_t since, char *buf, size_t cap, uint32_t *next, uint32_t *oldest)
+{
+  uint32_t end = atomic_load_explicit(&log_reserved, memory_order_acquire);
+  uint32_t held = end - atomic_load_explicit(&log_clear_mark, memory_order_relaxed);
+  if (held > NEXUS_LOG_RING) {
+    held = NEXUS_LOG_RING;
+  }
+  uint32_t first = end - held;
+  /* wrap-safe: an offset outside [first, end] is older than the ring (start at the oldest byte)
+   * or not written yet (start at the end) */
+  if (since - first > held) {
+    since = (uint32_t)(first - since) < 0x80000000u ? first : end;
+  }
+  uint32_t n = end - since;
+  if (n > cap) {
+    n = (uint32_t)cap;
+  }
+  for (uint32_t done = 0; done < n;) {
+    uint32_t pos = (since + done) & (NEXUS_LOG_RING - 1u);
+    uint32_t run = NEXUS_LOG_RING - pos;
+    if (run > n - done) {
+      run = n - done;
+    }
+    memcpy(buf + done, log_ring + pos, run);
+    done += run;
+  }
+  *next = since + n;
+  *oldest = first;
+  return n;
+}
+
 int nexus_log_shell(int argc, char **argv)
 {
   if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
