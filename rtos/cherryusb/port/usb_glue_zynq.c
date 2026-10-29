@@ -396,9 +396,12 @@ static void *zynq_usb_irq_thread(void *arg)
         /* IAA watchdog events: one line per 10 s at most (never in the per-transfer path) */
         if ((st->lost != logged_lost || st->late != logged_late) &&
             (uint32_t)(now - last_log) >= 10000000U) {
-            printf("usbh: IAA watchdog: %lu lost, %lu late of %lu cycles (USBCMD 0x%08lx USBSTS "
-                   "0x%08lx ASYNCLISTADDR 0x%08lx, longest cycle %lu us)\n",
+            printf("usbh: IAA watchdog: %lu lost, %lu late of %lu cycles, %lu QHs quarantined "
+                   "(%lu released, doorbell stuck %lu) (USBCMD 0x%08lx USBSTS 0x%08lx "
+                   "ASYNCLISTADDR 0x%08lx, longest cycle %lu us)\n",
                    (unsigned long)st->lost, (unsigned long)st->late, (unsigned long)st->cycles,
+                   (unsigned long)st->quarantined, (unsigned long)st->released,
+                   (unsigned long)st->stuck_ends,
                    (unsigned long)st->last_cmd, (unsigned long)st->last_sts,
                    (unsigned long)st->last_async, (unsigned long)st->max_cycle_us);
             logged_lost = st->lost;
@@ -527,6 +530,12 @@ int nexus_cherryusb_shell(int argc, char **argv)
                (unsigned long)st->not_running, (unsigned long)st->kill_waits,
                (unsigned long)st->fatal, (unsigned long)st->max_cycle_us,
                (unsigned long)usbh_ehci_iaa_pending(0));
+        printf("QH quarantine %lu (released %lu, doorbell stuck %lu); bulk IN streams created %lu "
+               "appended %lu torn down %lu; completions ok %lu\n",
+               (unsigned long)st->quarantined, (unsigned long)st->released,
+               (unsigned long)st->stuck_ends, (unsigned long)st->stream_creates,
+               (unsigned long)st->stream_appends, (unsigned long)st->stream_teardowns,
+               (unsigned long)st->ok_count);
     }
     if (aicwf_cherry_stats) {
         aicwf_cherry_stats();

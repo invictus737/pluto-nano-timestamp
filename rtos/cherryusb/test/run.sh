@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Host simulation of the patched CherryUSB EHCI port (IAA cycles, watchdog, kill, barriers).
+# Host simulation of the patched CherryUSB EHCI port (IAA cycles, watchdog, quarantine, kill,
+# barriers, bulk IN streams).
 # The driver is compiled unchanged except that USBSTS/USBCMD stores become calls into a
 # register model (write-1-to-clear status, doorbell that software cannot clear), so the test
 # can answer, delay, drop or lose IAA. Needs a fetched CherryUSB (fetch-cherryusb.sh), gcc and

@@ -542,6 +542,28 @@ void usb_osal_leave_critical_section(size_t flag)
     rtems_recursive_mutex_unlock(&g_crit);
 }
 
+/*
+ * The EHCI port (usbh_kill_urb() waiting for an IAA cycle) must not sleep inside the critical
+ * section: the interrupt thread and every submitter would stall behind it. These release it
+ * at every nesting level held by the caller (the owner) and take it back as deep.
+ */
+size_t usb_osal_crit_suspend(void)
+{
+    size_t depth = g_crit_depth;
+
+    for (size_t i = 0; i < depth; i++) {
+        usb_osal_leave_critical_section(0);
+    }
+    return depth;
+}
+
+void usb_osal_crit_resume(size_t depth)
+{
+    for (size_t i = 0; i < depth; i++) {
+        (void)usb_osal_enter_critical_section();
+    }
+}
+
 /* ---- memory ---- */
 
 void *usb_osal_malloc(size_t size)

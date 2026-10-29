@@ -1,6 +1,8 @@
 /*
- * Host simulation of the CherryUSB EHCI port as patched for the Pluto Nano (patches/0001-0004):
- * Interrupt on Async Advance cycles, IAA watchdog, usbh_kill_urb(), barriers, toggle recovery.
+ * Host simulation of the CherryUSB EHCI port as patched for the Pluto Nano (patches/0001-0005):
+ * Interrupt on Async Advance cycles, IAA watchdog, usbh_kill_urb(), barriers, toggle recovery,
+ * quarantine of QHs handed back by a late cycle (no doorbell over a pending one), no sleep in
+ * the critical section, error classes, bulk IN streams (chained qTDs on one QH).
  *
  * The driver source is included after run.sh turned its USBSTS/USBCMD stores into calls of the
  * register model below. The model answers a doorbell after a delay (or drops/loses it), keeps
@@ -104,12 +106,28 @@ int usb_osal_sem_give(usb_osal_sem_t sem)
 void usb_osal_sem_reset(usb_osal_sem_t sem) { ((struct sim_sem *)sem)->count = 0; }
 
 static int g_crit;
+static uint32_t g_sleeps_in_crit;
+static void (*g_sleep_hook)(void); /* "another thread" running while the caller sleeps */
 size_t usb_osal_enter_critical_section(void) { return ++g_crit; }
 void usb_osal_leave_critical_section(size_t flag) { (void)flag; g_crit--; }
+size_t usb_osal_crit_suspend(void)
+{
+    size_t depth = (size_t)g_crit;
+
+    g_crit = 0;
+    return depth;
+}
+void usb_osal_crit_resume(size_t depth) { g_crit = (int)depth; }
 static uint32_t g_barriers;
 void usb_osal_dma_barrier(void) { g_barriers++; g_barriers_since_cmd++; }
 void usb_osal_msleep(uint32_t delay)
 {
+    if (g_crit) {
+        g_sleeps_in_crit++;
+    }
+    if (g_sleep_hook) {
+        g_sleep_hook();
+    }
     for (uint32_t i = 0; i < delay * 1000U; i++) {
         g_now_us++;
         model_tick();
@@ -161,6 +179,8 @@ static struct usbh_hub g_roothub;
 static struct usbh_hubport g_hport;
 static struct usb_endpoint_descriptor g_ep_out = { .bLength = 7, .bDescriptorType = 5,
     .bEndpointAddress = 0x02, .bmAttributes = USB_ENDPOINT_TYPE_BULK, .wMaxPacketSize = 512 };
+static struct usb_endpoint_descriptor g_ep_in = { .bLength = 7, .bDescriptorType = 5,
+    .bEndpointAddress = 0x81, .bmAttributes = USB_ENDPOINT_TYPE_BULK, .wMaxPacketSize = 512 };
 static uint8_t g_buf[8][2048] __attribute__((aligned(32)));
 
 struct xfer {
@@ -460,6 +480,372 @@ static void test_sync_timeout(void)
     }
 }
 
+static bool all_qh_free(void)
+{
+    for (int i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
+        if (ehci_qh_pool[0][i].inuse) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int qtds_in_use(void)
+{
+    int n = 0;
+
+    for (int i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
+        n += ehci_qtd_pool[0][i].inuse ? 1 : 0;
+    }
+    return n;
+}
+
+/*
+ * The board failure (debug82: iaad_busy ~ late): a watchdog-ended late cycle handed its QHs
+ * back with the doorbell still set; the next cycle rang on top of it, the late IAA ended that
+ * new cycle and freed QHs unlinked after it, and freed QHs were reused at once. Now: the late
+ * QH is quarantined (not reusable), no doorbell rings while IAAD is set, the late IAA ends
+ * nothing, and a fresh doorbell answered with IAAD clear releases the quarantine.
+ */
+static void test_late_quarantine(void)
+{
+    struct xfer a, b, c;
+    int a_qh;
+
+    sim_reset();
+    g_iaa_delay_us = 15000; /* answered, but after the 10 ms watchdog */
+    CHECK(submit(&a, 0, 64, false) == 0);
+    a_qh = a.qh_index;
+    hw_finish(&a, true);
+    isr();
+    CHECK(g_rings == 1);
+    advance(10100);
+    CHECK(usbh_ehci_iaa_watchdog(0) == 1);
+    CHECK(g_ehci_iaa_stats[0].late == 1);
+    CHECK(a.done == 1 && a.result == 64);
+    CHECK(ehci_qh_pool[0][a_qh].inuse && ehci_qh_pool[0][a_qh].quarantine);
+    CHECK(g_ehci_iaa_stats[0].quarantined == 1);
+
+    CHECK(submit(&b, 1, 64, false) == 0);
+    CHECK(b.qh_index != a_qh);     /* the quarantined QH is not reused */
+    hw_finish(&b, false);
+    isr();                         /* B unlinked: no doorbell on top of the pending one */
+    CHECK(g_rings == 1 && g_echo_writes == 0);
+    CHECK(g_ehci_iaa_stats[0].iaad_busy == 1);
+    CHECK(!b.done);
+    CHECK(submit(&c, 2, 64, false) == 0);
+    CHECK(c.qh_index != a_qh);
+    CHECK(usbh_ehci_iaa_watchdog(0) == 0);
+
+    advance(5000);                 /* the late IAA answers doorbell 1 now */
+    g_iaa_delay_us = 60;
+    isr();                         /* spurious for the cycles; then doorbell 2 rings */
+    CHECK(g_ehci_iaa_stats[0].spurious == 1);
+    CHECK(!b.done);                /* the late IAA must not end B's cycle */
+    CHECK(g_rings == 2);
+    CHECK(ehci_qh_pool[0][a_qh].quarantine);
+    advance(100);
+    isr();                         /* real IAA of doorbell 2 */
+    CHECK(b.done == 1 && b.order_ok && b.result == 64);
+    CHECK(!ehci_qh_pool[0][a_qh].inuse && !ehci_qh_pool[0][a_qh].quarantine);
+    CHECK(g_ehci_iaa_stats[0].released == 1);
+    CHECK(!ehci_qh_pool[0][b.qh_index].inuse);
+    CHECK(g_echo_writes == 0);
+}
+
+/* the doorbell never clears: waiting QHs go back quarantined after the watchdog time */
+static void test_stuck_doorbell(void)
+{
+    struct xfer a, b;
+    uint32_t t0;
+
+    sim_reset();
+    g_mode = IAA_LOST;
+    CHECK(submit(&a, 0, 64, false) == 0);
+    hw_finish(&a, false);
+    isr();
+    advance(10100);
+    CHECK(usbh_ehci_iaa_watchdog(0) == 1 && a.done == 1);
+    CHECK(submit(&b, 1, 64, false) == 0);
+    t0 = g_now_us;
+    CHECK(usbh_kill_urb(&b.urb) == 0); /* bounded although no doorbell can ring */
+    CHECK(b.done == 1 && b.result == -USB_ERR_SHUTDOWN);
+    CHECK(g_now_us - t0 <= 12000);
+    CHECK(g_ehci_iaa_stats[0].stuck_ends == 1);
+    CHECK(g_rings == 1 && g_echo_writes == 0);
+    CHECK(g_ehci_iaa_stats[0].quarantined == 2);
+    CHECK(!all_qh_free());
+    /* the controller recovers: the old doorbell is answered, an empty one releases both */
+    g_mode = IAA_NORMAL;
+    advance(10);
+    isr();
+    CHECK(g_rings == 2);
+    advance(100);
+    isr();
+    CHECK(all_qh_free() && qtds_in_use() == 0);
+    CHECK(usbh_ehci_iaa_pending(0) == 0);
+}
+
+/* usbh_kill_urb() waiting for its cycle sleeps with the critical section released */
+static int g_hook_runs;
+
+static void sim_irq_thread(void)
+{
+    CHECK(g_crit == 0);
+    g_hook_runs++;
+    isr();
+}
+
+static void test_kill_sleeps_unlocked(void)
+{
+    struct xfer k;
+
+    sim_reset();
+    g_iaa_delay_us = 3000;
+    CHECK(submit(&k, 0, 64, false) == 0);
+    g_sleep_hook = sim_irq_thread;
+    (void)usb_osal_enter_critical_section(); /* as aicwf_cherry_kill_urb(): nested */
+    CHECK(usbh_kill_urb(&k.urb) == 0);
+    usb_osal_leave_critical_section(0);
+    g_sleep_hook = NULL;
+    CHECK(k.done == 1 && k.result == -USB_ERR_SHUTDOWN && k.order_ok);
+    CHECK(g_crit == 0 && g_sleeps_in_crit == 0);
+    CHECK(g_hook_runs >= 2); /* the "interrupt thread" ran while the killer slept */
+    CHECK(g_ehci_iaa_stats[0].irq_ends + g_ehci_iaa_stats[0].polled_ends == 1);
+}
+
+/* transaction errors that exhausted the retries are -USB_ERR_IO; only a plain halt is a STALL */
+static void test_error_classes(void)
+{
+    struct xfer a, b;
+    struct ehci_qh_hw *qh;
+    struct ehci_qtd_hw *qtd;
+
+    sim_reset();
+    CHECK(submit(&a, 0, 64, true) == 0);
+    qh = &ehci_qh_pool[0][a.qh_index];
+    CHECK(((qh->hw.epchar & QH_EPCHAR_RL_MASK) >> QH_EPCHAR_RL_SHIFT) == 4); /* EHCI_TUNE_RL_HS */
+    qh->xacterrs = CONFIG_USB_EHCI_XACTERR_RETRIES;
+    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    qtd->hw.token = (qtd->hw.token & ~(QTD_TOKEN_STATUS_ACTIVE | QTD_TOKEN_CERR_MASK)) |
+                    QTD_TOKEN_STATUS_HALTED | QTD_TOKEN_STATUS_XACTERR;
+    qh->hw.overlay.token = QTD_TOKEN_TOGGLE | QTD_TOKEN_STATUS_HALTED;
+    g_regs.usbsts |= EHCI_USBSTS_ERR;
+    isr();
+    advance(100);
+    isr();
+    CHECK(a.done == 1 && a.result == -USB_ERR_IO);
+    CHECK(a.urb.data_toggle == true); /* kept from the overlay, not reset */
+
+    CHECK(submit(&b, 1, 64, true) == 0);
+    qh = &ehci_qh_pool[0][b.qh_index];
+    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    qtd->hw.token = (qtd->hw.token & ~QTD_TOKEN_STATUS_ACTIVE) | QTD_TOKEN_STATUS_HALTED;
+    qh->hw.overlay.token = QTD_TOKEN_TOGGLE | QTD_TOKEN_STATUS_HALTED;
+    g_regs.usbsts |= EHCI_USBSTS_ERR;
+    isr();
+    advance(100);
+    isr();
+    CHECK(b.done == 1 && b.result == -USB_ERR_STALL);
+    CHECK(b.urb.data_toggle == false); /* the device restarts at DATA0 after CLEAR_HALT */
+}
+
+/* a successful bulk completion takes the toggle from the QH overlay */
+static void test_toggle_from_overlay(void)
+{
+    struct xfer a;
+    struct ehci_qh_hw *qh;
+
+    sim_reset();
+    CHECK(submit(&a, 0, 1024, false) == 0);
+    qh = &ehci_qh_pool[0][a.qh_index];
+    hw_finish(&a, false);
+    qh->hw.overlay.token = QTD_TOKEN_TOGGLE; /* the qTD copy says DATA0, the overlay DATA1 */
+    isr();
+    advance(100);
+    isr();
+    CHECK(a.done == 1 && a.result == 1024 && a.urb.data_toggle == true);
+}
+
+/* ---- bulk IN streams ---- */
+
+static int g_order[16], g_norder;
+
+static struct xfer g_sx[8];
+
+static void sx_done(void *arg, int nbytes)
+{
+    struct xfer *x = arg;
+
+    x->done++;
+    x->result = nbytes;
+    g_order[g_norder++ & 15] = (int)(x - g_sx);
+}
+
+static bool g_in_toggle;
+
+static int submit_in(int i, uint32_t len, int flags)
+{
+    struct xfer *x = &g_sx[i];
+
+    memset(x, 0, sizeof(*x));
+    x->urb.data_toggle = g_in_toggle;
+    x->urb.hport = &g_hport;
+    x->urb.ep = &g_ep_in;
+    x->urb.transfer_buffer = g_buf[i];
+    x->urb.transfer_buffer_length = len;
+    x->urb.transfer_flags = flags;
+    x->urb.complete = sx_done;
+    x->urb.arg = x;
+    return usbh_submit_urb(&x->urb);
+}
+
+/* the controller retires the first active qTD of a stream QH with `bytes` received */
+static void hw_stream_retire(struct ehci_qh_hw *qh, uint32_t bytes, bool toggle)
+{
+    struct ehci_qtd_hw *qtd = EHCI_ADDR2QTD(qh->first_qtd);
+
+    while (qtd && qtd != qh->dummy && !(qtd->hw.token & QTD_TOKEN_STATUS_ACTIVE)) {
+        qtd = EHCI_ADDR2QTD(qtd->hw.next_qtd);
+    }
+    CHECK(qtd && qtd != qh->dummy);
+    if (!qtd || qtd == qh->dummy) {
+        return;
+    }
+    qtd->hw.token = (qtd->hw.token & ~(QTD_TOKEN_STATUS_ACTIVE | QTD_TOKEN_NBYTES_MASK)) |
+                    ((qtd->length - bytes) << QTD_TOKEN_NBYTES_SHIFT);
+    qh->hw.curr_qtd = EHCI_PTR2ADDR(qtd);
+    qh->hw.overlay.next_qtd = qtd->hw.next_qtd;
+    qh->hw.overlay.token = toggle ? QTD_TOKEN_TOGGLE : 0;
+    g_regs.usbsts |= EHCI_USBSTS_INT;
+}
+
+static void test_stream(void)
+{
+    struct ehci_qh_hw *qh;
+    struct ehci_qtd_hw *s3;
+    const struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[0];
+
+    sim_reset();
+    g_norder = 0;
+    CHECK(submit_in(0, 2048, USBH_EHCI_URB_STREAM) == 0);
+    for (int i = 1; i < 4; i++) {
+        CHECK(submit_in(i, 2048, USBH_EHCI_URB_STREAM | USBH_EHCI_URB_APPEND_ONLY) == 0);
+    }
+    qh = g_sx[0].urb.hcpriv;
+    CHECK(qh && qh->stream && qh->stream_open);
+    for (int i = 1; i < 4; i++) {
+        CHECK(g_sx[i].urb.hcpriv == qh);
+    }
+    CHECK(st->stream_creates == 1 && st->stream_appends == 3);
+    CHECK(qtds_in_use() == 5); /* 4 URBs + the dummy */
+    CHECK(!(qh->dummy->hw.token & QTD_TOKEN_STATUS_ACTIVE));
+    CHECK(ring_mask() == 1U << (qh - &ehci_qh_pool[0][0]));
+
+    /* two retire (one short): completed in order while the QH stays linked, no doorbell */
+    hw_stream_retire(qh, 2048, false);
+    hw_stream_retire(qh, 100, true);
+    isr();
+    CHECK(g_sx[0].done == 1 && g_sx[0].result == 2048);
+    CHECK(g_sx[1].done == 1 && g_sx[1].result == 100);
+    CHECK(g_norder == 2 && g_order[0] == 0 && g_order[1] == 1);
+    CHECK(g_rings == 0 && qh->stream_open && ring_mask() != 0);
+    CHECK(qtds_in_use() == 3);
+
+    /* one more appended behind the others */
+    CHECK(submit_in(4, 512, USBH_EHCI_URB_STREAM | USBH_EHCI_URB_APPEND_ONLY) == 0);
+    CHECK(g_sx[4].urb.hcpriv == qh && qtds_in_use() == 4);
+
+    /* kill URB 2 while it is half received: the stream is torn down, the rest handed back */
+    s3 = EHCI_ADDR2QTD(qh->first_qtd);
+    CHECK(s3->urb == &g_sx[2].urb);
+    qh->hw.curr_qtd = EHCI_PTR2ADDR(s3);
+    qh->hw.overlay.token = QTD_TOKEN_TOGGLE | QTD_TOKEN_STATUS_ACTIVE | ((2048U - 1024U) << QTD_TOKEN_NBYTES_SHIFT);
+    CHECK(usbh_kill_urb(&g_sx[2].urb) == 0);
+    CHECK(g_sx[2].done == 1 && g_sx[2].result == -USB_ERR_SHUTDOWN && g_sx[2].urb.actual_length == 1024);
+    CHECK(g_sx[3].done == 1 && g_sx[3].result == -USB_ERR_SHUTDOWN && g_sx[3].urb.actual_length == 0);
+    CHECK(g_sx[4].done == 1 && g_sx[4].result == -USB_ERR_SHUTDOWN);
+    CHECK(g_sx[3].urb.data_toggle == true && g_sx[4].urb.data_toggle == true);
+    CHECK(g_norder == 5 && g_order[2] == 2 && g_order[3] == 3 && g_order[4] == 4);
+    CHECK(g_rings == 1 && all_qh_free() && qtds_in_use() == 0);
+    CHECK(st->stream_teardowns == 1);
+    CHECK(g_sleeps_in_crit == 0);
+
+    /* no stream open: append-only is refused, the URB stays usable */
+    CHECK(submit_in(5, 512, USBH_EHCI_URB_STREAM | USBH_EHCI_URB_APPEND_ONLY) == -USB_ERR_BUSY);
+    CHECK(g_sx[5].urb.errorcode == 0 && all_qh_free());
+    /* not stream-eligible (OUT, or > 16 KiB): append-only is invalid */
+    CHECK(submit_in(5, 0x5000, USBH_EHCI_URB_APPEND_ONLY) == -USB_ERR_INVAL);
+}
+
+static void test_stream_idle_and_error(void)
+{
+    struct ehci_qh_hw *qh;
+    struct ehci_qtd_hw *qtd;
+
+    /* the last URB completes: done at once, the empty QH leaves through an IAA cycle */
+    sim_reset();
+    g_norder = 0;
+    CHECK(submit_in(0, 512, USBH_EHCI_URB_STREAM) == 0);
+    qh = g_sx[0].urb.hcpriv;
+    hw_stream_retire(qh, 512, true);
+    isr();
+    CHECK(g_sx[0].done == 1 && g_sx[0].result == 512 && g_sx[0].urb.data_toggle == true);
+    CHECK(g_rings == 1 && !qh->stream_open && ring_mask() == 0);
+    /* a new URB meanwhile starts a new stream with the toggle carried over */
+    g_in_toggle = g_sx[0].urb.data_toggle;
+    CHECK(submit_in(1, 512, USBH_EHCI_URB_STREAM) == 0);
+    g_in_toggle = false;
+    CHECK(g_sx[1].urb.hcpriv != qh);
+    CHECK(((struct ehci_qh_hw *)g_sx[1].urb.hcpriv)->hw.overlay.token & QTD_TOKEN_TOGGLE);
+    advance(100);
+    isr();
+    CHECK(!qh->inuse);
+    CHECK(usbh_kill_urb(&g_sx[1].urb) == 0 && g_sx[1].result == -USB_ERR_SHUTDOWN);
+    CHECK(all_qh_free() && qtds_in_use() == 0);
+
+    /* a STALL on the first URB: it fails at once, the next comes back after the IAA */
+    sim_reset();
+    g_norder = 0;
+    CHECK(submit_in(0, 512, USBH_EHCI_URB_STREAM) == 0);
+    CHECK(submit_in(1, 512, USBH_EHCI_URB_STREAM | USBH_EHCI_URB_APPEND_ONLY) == 0);
+    qh = g_sx[0].urb.hcpriv;
+    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    qtd->hw.token = (qtd->hw.token & ~QTD_TOKEN_STATUS_ACTIVE) | QTD_TOKEN_STATUS_HALTED;
+    qh->hw.overlay.token = QTD_TOKEN_TOGGLE | QTD_TOKEN_STATUS_HALTED;
+    g_regs.usbsts |= EHCI_USBSTS_ERR;
+    isr();
+    CHECK(g_sx[0].done == 1 && g_sx[0].result == -USB_ERR_STALL && g_sx[0].urb.data_toggle == false);
+    CHECK(!g_sx[1].done && g_rings == 1);
+    /* append-only while the halted stream waits for its IAA: refused */
+    CHECK(submit_in(2, 512, USBH_EHCI_URB_STREAM | USBH_EHCI_URB_APPEND_ONLY) == -USB_ERR_BUSY);
+    advance(100);
+    isr();
+    CHECK(g_sx[1].done == 1 && g_sx[1].result == -USB_ERR_SHUTDOWN && g_sx[1].urb.data_toggle == false);
+    CHECK(all_qh_free() && qtds_in_use() == 0);
+
+    /* a transaction error is retried in place first, then -USB_ERR_IO */
+    sim_reset();
+    CHECK(submit_in(0, 512, USBH_EHCI_URB_STREAM) == 0);
+    qh = g_sx[0].urb.hcpriv;
+    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    qtd->hw.token = (qtd->hw.token & ~(QTD_TOKEN_STATUS_ACTIVE | QTD_TOKEN_CERR_MASK)) |
+                    QTD_TOKEN_STATUS_HALTED | QTD_TOKEN_STATUS_XACTERR;
+    g_regs.usbsts |= EHCI_USBSTS_ERR;
+    isr();
+    CHECK(!g_sx[0].done && (qtd->hw.token & QTD_TOKEN_STATUS_ACTIVE) && qh->xacterrs == 1);
+    qh->xacterrs = CONFIG_USB_EHCI_XACTERR_RETRIES;
+    qtd->hw.token = (qtd->hw.token & ~(QTD_TOKEN_STATUS_ACTIVE | QTD_TOKEN_CERR_MASK)) |
+                    QTD_TOKEN_STATUS_HALTED | QTD_TOKEN_STATUS_XACTERR;
+    qh->hw.overlay.token = QTD_TOKEN_TOGGLE | QTD_TOKEN_STATUS_HALTED;
+    g_regs.usbsts |= EHCI_USBSTS_ERR;
+    isr();
+    CHECK(g_sx[0].done == 1 && g_sx[0].result == -USB_ERR_IO && g_sx[0].urb.data_toggle == true);
+    advance(100);
+    isr();
+    CHECK(all_qh_free() && qtds_in_use() == 0);
+}
+
 int main(void)
 {
     test_stale_iaa();
@@ -473,6 +859,14 @@ int main(void)
     test_halted();
     test_sem_reset();
     test_sync_timeout();
+    test_late_quarantine();
+    test_stuck_doorbell();
+    test_kill_sleeps_unlocked();
+    test_error_classes();
+    test_toggle_from_overlay();
+    test_stream();
+    test_stream_idle_and_error();
+    CHECK(g_sleeps_in_crit == 0);
     printf("ehci_iaa_test: %s (%d failure(s))\n", g_fail ? "FAIL" : "ok", g_fail);
     return g_fail ? 1 : 0;
 }

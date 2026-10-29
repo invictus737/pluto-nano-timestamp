@@ -7,9 +7,12 @@
  *    driver's own K230-layout class tables (as the shim did) and runs the matching RT-Smart
  *    connect() on the hub thread, then brings the station up (aicwf_wlan_attach_done()).
  *    Storage-mode sticks go to aicwf_cherry_modeswitch.c.
- *  - URBs: the EHCI port keeps one QH per URB with the data toggle in the URB, so two URBs of
- *    one endpoint in the controller at the same time would race and break the toggle. Every
- *    endpoint therefore has a software queue; one URB is in the controller, the next one is
+ *  - URBs: every endpoint has a software queue. Bulk IN URBs of at most 16 KiB stay armed in
+ *    the controller as Linux keeps them (aicwf_usb.c: 20 data + 100 message RX URBs): up to
+ *    NX_IN_URBS_PER_EP per endpoint, chained on one EHCI stream QH (USBH_EHCI_URB_STREAM, the
+ *    data toggle stays in its overlay). Separate QHs per URB cannot do this safely: each would
+ *    carry its own toggle and the device's next packet would be discarded as a repeat by the
+ *    other one. Any other transfer has one URB in the controller per endpoint; the next one is
  *    started from the completion (still in the interrupt handler) with the toggle carried over.
  *  - Completions run on the "aic-usbc" giveback thread, never in the interrupt handler and
  *    never in the submitting thread; usbh_kill_urb() returns after the completion ran, as the
@@ -44,6 +47,7 @@
 #include "aicwf_shim.h"
 
 #include "nexus_cherryusb.h"
+#include "usb_hc_ehci.h" /* stream URBs, timeout diagnostics */
 
 #define DBG_TAG "aicwf.usb"
 #define DBG_LVL DBG_INFO
@@ -63,6 +67,13 @@ int aicwf_cherry_modeswitch_connect(struct usbh_hubport *hport, uint8_t intf);
 #define NX_LINE      32U
 #define NX_SYNC_GRACE_MS 2000
 #define NX_START_WAIT_MS 60000
+/* bulk IN URBs kept in the controller per endpoint (EHCI stream QH); at least 4 */
+#ifndef NX_IN_URBS_PER_EP
+#define NX_IN_URBS_PER_EP 8
+#endif
+#if NX_IN_URBS_PER_EP < 1
+#error NX_IN_URBS_PER_EP must be at least 1
+#endif
 
 /* ---- the driver's class tables (K230 layout) ---- */
 
@@ -114,6 +125,10 @@ struct nx_req {
     uint8_t state;
     uint8_t zlp;
     uint8_t is_in;
+    uint8_t in_hw;    /* counted in ep->inflight */
+    uint8_t stream;   /* on the endpoint's EHCI stream QH */
+    uint8_t killing;  /* aicwf_cherry_kill_urb() cancels it */
+    int flags;        /* the driver's transfer_flags */
     rtems_binary_semaphore *waiter; /* synchronous submit */
 };
 
@@ -121,7 +136,10 @@ struct nx_ep {
     struct usbh_hubport *hport;     /* NULL: free */
     uint8_t addr;
     uint8_t toggle;
-    struct nx_req *active;
+    uint8_t streaming;  /* the requests in the controller are on a stream QH */
+    uint16_t inflight;  /* requests in the controller */
+    uint16_t max_inflight;
+    unsigned timeouts;  /* synchronous transfers that timed out */
     struct nx_req *head, *tail;
     struct usbh_urb zlp_urb;
 };
@@ -149,7 +167,7 @@ static volatile unsigned g_attach_count;
 
 /* counters (`usbh` command) */
 static unsigned g_st_submit, g_st_complete, g_st_bounce, g_st_zlp, g_st_kill, g_st_noreq,
-    g_st_maxq, g_st_reenum;
+    g_st_maxq, g_st_reenum, g_st_requeue, g_st_append_busy;
 
 #define CRIT_ENTER() size_t crit_flags_ = usb_osal_enter_critical_section()
 #define CRIT_LEAVE() usb_osal_leave_critical_section(crit_flags_)
@@ -210,7 +228,7 @@ static void ep_purge(struct usbh_hubport *hport)
     int i;
 
     for (i = 0; i < NX_MAX_EP; i++) {
-        if (g_ep[i].hport == hport && g_ep[i].active == NULL && g_ep[i].head == NULL) {
+        if (g_ep[i].hport == hport && g_ep[i].inflight == 0 && g_ep[i].head == NULL) {
             g_ep[i].hport = NULL;
         }
     }
@@ -279,11 +297,38 @@ static void nx_zlp_done(void *arg, int nbytes);
  */
 static volatile rtems_interval g_io_last_in, g_io_out_since_in;
 
+static void ep_leave_hw(struct nx_ep *ep, struct nx_req *req)
+{
+    if (req->in_hw) {
+        req->in_hw = 0;
+        ep->inflight--;
+        if (ep->inflight == 0) {
+            ep->streaming = 0;
+        }
+    }
+}
+
+static void ep_push_head(struct nx_ep *ep, struct nx_req *req)
+{
+    req->state = REQ_QUEUED;
+    req->next = ep->head;
+    ep->head = req;
+    if (ep->tail == NULL) {
+        ep->tail = req;
+    }
+}
+
+/* a bulk IN request that can stay armed on the endpoint's EHCI stream QH */
+static int req_stream_ok(const struct nx_req *req)
+{
+    return NX_IN_URBS_PER_EP > 1 && req->is_in && req->len != 0 &&
+           req->len <= USBH_EHCI_STREAM_MAX_LEN && req->urb->ep &&
+           USB_GET_ENDPOINT_TYPE(req->urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK;
+}
+
 static void ep_finish(struct nx_ep *ep, struct nx_req *req, int result)
 {
-    if (ep->active == req) {
-        ep->active = NULL;
-    }
+    ep_leave_hw(ep, req);
     if (result >= 0 && req->urb && req->urb->ep &&
         USB_GET_ENDPOINT_TYPE(req->urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK) {
         rtems_interval now = rtems_clock_get_ticks_since_boot() | 1U;
@@ -300,14 +345,21 @@ static void ep_finish(struct nx_ep *ep, struct nx_req *req, int result)
     done_push(req);
 }
 
-/* start queued requests until one is in the controller */
+/*
+ * start queued requests: one in the controller per endpoint, or up to NX_IN_URBS_PER_EP bulk
+ * IN requests on a stream QH (appended while the stream is open)
+ */
 static void ep_kick(struct nx_ep *ep)
 {
-    while (ep->active == NULL && ep->head != NULL) {
+    while (ep->head != NULL) {
         struct nx_req *req = ep->head;
         struct usbh_urb *urb = req->urb;
+        int stream = req_stream_ok(req), append = ep->inflight != 0;
         int rc;
 
+        if (append && (!stream || !ep->streaming || ep->inflight >= NX_IN_URBS_PER_EP)) {
+            break;
+        }
         ep->head = req->next;
         if (ep->head == NULL) {
             ep->tail = NULL;
@@ -322,9 +374,26 @@ static void ep_kick(struct nx_ep *ep)
         urb->errorcode = 0;
         urb->hcpriv = NULL;
         urb->actual_length = 0;
-        ep->active = req;
+        urb->transfer_flags = req->flags & ~(USBH_EHCI_URB_STREAM | USBH_EHCI_URB_APPEND_ONLY);
+        if (stream) {
+            urb->transfer_flags |= USBH_EHCI_URB_STREAM | (append ? USBH_EHCI_URB_APPEND_ONLY : 0);
+            ep->streaming = 1;
+        }
+        req->stream = (uint8_t)stream;
+        req->in_hw = 1;
+        ep->inflight++;
+        if (ep->inflight > ep->max_inflight) {
+            ep->max_inflight = ep->inflight;
+        }
         req->state = REQ_HW;
         rc = usbh_submit_urb(urb);
+        if (rc == -USB_ERR_BUSY && append) {
+            /* the stream halted and waits for its IAA cycle: retry when its URBs are back */
+            ep_leave_hw(ep, req);
+            ep_push_head(ep, req);
+            g_st_append_busy++;
+            break;
+        }
         if (rc != 0) {
             ep_finish(ep, req, rc);
         }
@@ -340,6 +409,15 @@ static void nx_urb_done(void *arg, int nbytes)
     uint16_t mps;
 
     ep->toggle = urb->data_toggle;
+    if (nbytes == -USB_ERR_SHUTDOWN && req->stream && !req->killing && req->state == REQ_HW &&
+        urb->actual_length == 0) {
+        /* its stream was torn down for another URB (kill or error) before it got data: requeue */
+        ep_leave_hw(ep, req);
+        ep_push_head(ep, req);
+        g_st_requeue++;
+        ep_kick(ep);
+        return;
+    }
     req->actual = urb->actual_length;
     mps = USB_GET_MAXPACKETSIZE(urb->ep->wMaxPacketSize);
     if (nbytes >= 0 && req->zlp && !req->is_in && req->len != 0 && mps != 0 &&
@@ -380,6 +458,7 @@ static int req_restore(struct nx_req *req)
 
     urb->transfer_buffer = req->buf;
     urb->transfer_buffer_length = req->len;
+    urb->transfer_flags = req->flags;
     urb->complete = req->complete;
     urb->arg = req->arg;
     urb->hcpriv = NULL;
@@ -450,6 +529,83 @@ static void gb_thread(void *parameter)
 static int on_gb_thread(void)
 {
     return g_gb_running && pthread_equal(pthread_self(), g_gb_tid);
+}
+
+/* ---- timeout diagnostics ---- */
+
+struct nx_ep_snap {
+    uint8_t state, toggle, streaming, zlp;
+    uint16_t inflight, queued;
+    unsigned timeouts;
+};
+
+static const char *const g_req_state[] = { "free", "queued", "in controller", "zero-length packet",
+                                           "done", "delivering" };
+
+/* the shim's view of the request and its endpoint, then the controller's (one lock) */
+static void nx_snap(struct nx_req *req, struct nx_ep_snap *e, struct usbh_ehci_diag *d)
+{
+    struct nx_ep *ep = req->ep;
+    struct usbh_urb *hw;
+    struct nx_req *r;
+
+    CRIT_ENTER();
+    memset(e, 0, sizeof(*e));
+    e->state = req->state;
+    e->toggle = ep->toggle;
+    e->streaming = ep->streaming;
+    e->inflight = ep->inflight;
+    e->timeouts = ep->timeouts;
+    e->zlp = req->zlp;
+    for (r = ep->head; r; r = r->next) {
+        e->queued++;
+    }
+    hw = req->state == REQ_ZLP ? &ep->zlp_urb : req->urb;
+    usbh_ehci_diag_capture(hw, d);
+    CRIT_LEAVE();
+}
+
+static void nx_snap_print(const struct nx_req *req, const struct nx_ep_snap *e,
+                          const struct usbh_ehci_diag *d, const char *when)
+{
+    char tag[32];
+
+    printf("aic: ep 0x%02x %s: request %s, endpoint toggle DATA%u, %u in the controller%s, %u queued, "
+           "%u timeout(s) so far\n",
+           req->ep->addr, when, g_req_state[e->state % 6], e->toggle, e->inflight,
+           e->streaming ? " (stream)" : "", e->queued, e->timeouts);
+    snprintf(tag, sizeof(tag), "ep 0x%02x %s", req->ep->addr, when);
+    usbh_ehci_diag_print(d, tag);
+}
+
+/*
+ * A synchronous transfer timed out (-USB_ERR_TIMEOUT follows): before the cancel, capture the
+ * shim and controller state twice 100 ms apart (rate limited: the first 4, then one per 10 s).
+ * Returns 1 when the transfer completed within those 100 ms (no cancel needed).
+ */
+static int nx_timeout_report(struct nx_req *req, rtems_binary_semaphore *waiter, uint32_t timeout)
+{
+    struct nx_ep_snap e0, e1;
+    struct usbh_ehci_diag d0, d1;
+    int done;
+
+    {
+        CRIT_ENTER();
+        req->ep->timeouts++;
+        CRIT_LEAVE();
+    }
+    if (!usbh_ehci_diag_allowed()) {
+        return 0;
+    }
+    nx_snap(req, &e0, &d0);
+    done = rtems_binary_semaphore_wait_timed_ticks(waiter, RTEMS_MILLISECONDS_TO_TICKS(100) + 1) == 0;
+    nx_snap(req, &e1, &d1);
+    printf("aic: ep 0x%02x: %s of %u bytes timed out after %u ms%s\n", req->ep->addr,
+           req->is_in ? "bulk IN" : "bulk OUT", (unsigned)req->len, (unsigned)timeout,
+           done ? ", completed 100 ms later" : "; state before the cancel:");
+    nx_snap_print(req, &e0, &d0, "t+0");
+    nx_snap_print(req, &e1, &d1, "t+100ms");
+    return done;
 }
 
 /* ---- the driver-facing API ---- */
@@ -524,6 +680,7 @@ int aicwf_cherry_submit_urb(struct usbh_urb *urb)
     req->bounce = bounce;
     req->is_in = (uint8_t)is_in;
     req->zlp = (urb->transfer_flags & URB_ZERO_PACKET) != 0;
+    req->flags = urb->transfer_flags;
     req->waiter = timeout ? &waiter : NULL;
     urb->errorcode = -USB_ERR_BUSY;
     urb->actual_length = 0;
@@ -555,7 +712,8 @@ int aicwf_cherry_submit_urb(struct usbh_urb *urb)
     }
 
     /* synchronous: the URB timeout is the transfer timeout, then cancel and wait for it */
-    if (rtems_binary_semaphore_wait_timed_ticks(&waiter, RTEMS_MILLISECONDS_TO_TICKS(timeout) + 1) != 0) {
+    if (rtems_binary_semaphore_wait_timed_ticks(&waiter, RTEMS_MILLISECONDS_TO_TICKS(timeout) + 1) != 0 &&
+        !nx_timeout_report(req, &waiter, timeout)) {
         int cancelled = 0;
 
         (void)aicwf_cherry_kill_urb(urb);
@@ -617,6 +775,7 @@ int aicwf_cherry_kill_urb(struct usbh_urb *urb)
             continue;
         case REQ_HW:
             g_st_kill++;
+            req->killing = 1;
             if (usbh_kill_urb(urb) != 0 && req->state == REQ_HW) {
                 /* the controller side does not know it: end it here */
                 ep_finish(req->ep, req, -USB_ERR_SHUTDOWN);
@@ -1096,9 +1255,22 @@ void aicwf_cherry_stats(void)
     }
     CRIT_LEAVE();
     printf("aic: urbs submitted %u completed %u killed %u, bounced %u, zlp %u, no slot %u, "
-           "max queue %u, re-enumerations %u; now in controller %d queued %d giveback %d\n",
+           "max queue %u, re-enumerations %u, stream requeues %u append-busy %u; now in controller %d "
+           "queued %d giveback %d\n",
            g_st_submit, g_st_complete, g_st_kill, g_st_bounce, g_st_zlp, g_st_noreq, g_st_maxq,
-           g_st_reenum, inflight, queued, done);
+           g_st_reenum, g_st_requeue, g_st_append_busy, inflight, queued, done);
+    {
+        CRIT_ENTER();
+        for (i = 0; i < NX_MAX_EP; i++) {
+            if (g_ep[i].hport) {
+                printf("aic:   ep 0x%02x: %u in the controller (max %u, limit %u)%s, toggle DATA%u, "
+                       "%u timeout(s)\n", g_ep[i].addr, g_ep[i].inflight, g_ep[i].max_inflight,
+                       (g_ep[i].addr & 0x80) ? NX_IN_URBS_PER_EP : 1,
+                       g_ep[i].streaming ? " stream" : "", g_ep[i].toggle, g_ep[i].timeouts);
+            }
+        }
+        CRIT_LEAVE();
+    }
 }
 
 /* ---- start (wlan_dev_shim.c aicwf_wifi_start, after the firmware files are installed) ---- */
