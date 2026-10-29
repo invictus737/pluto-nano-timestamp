@@ -559,6 +559,14 @@ static int set_bb_rate(const struct pluto_rate_plan *pl)
 
 /* readback against the plan: PHY RX/TX rate within 0.1 %, FIR on in both directions with the
  * planned decimation/interpolation and taps */
+/* FIR configuration as read back right after the rate change (verify_rate). Reading the
+ * coefficients back (ad9361_get_*_fir_config) rewrites REG_*_FILTER_CONFIG with FIR_START_CLK and
+ * stops the filter's data flow while the ENSM is in FDD: the RX DMA froze mid-block after the
+ * stream-start summary. Linux never reads the FIR back at run time either; the summaries use this
+ * copy. */
+static AD9361_RXFIRConfig fir_rx_seen;
+static AD9361_TXFIRConfig fir_tx_seen;
+
 static int verify_rate(const struct pluto_rate_plan *pl)
 {
   uint32_t rxr = 0, txr = 0;
@@ -573,6 +581,8 @@ static int verify_rate(const struct pluto_rate_plan *pl)
   ad9361_get_tx_fir_en_dis(phy, &txe);
   ad9361_get_rx_fir_config(phy, 0, &rf);
   ad9361_get_tx_fir_config(phy, 0, &tf);
+  fir_rx_seen = rf;
+  fir_tx_seen = tf;
   uint32_t rxc[6] = {0}, txc[6] = {0};
   ad9361_get_trx_path_clks(phy, rxc, txc);
   uint32_t tol = pl->phy_hz / 1000u + 1u;
@@ -805,8 +815,8 @@ int pluto_hw_summary(char *buf, size_t cap)
   ad9361_get_tx_sampling_freq(phy, &txr);
   ad9361_get_rx_fir_en_dis(phy, &rxe);
   ad9361_get_tx_fir_en_dis(phy, &txe);
-  ad9361_get_rx_fir_config(phy, 0, &rf);
-  ad9361_get_tx_fir_config(phy, 0, &tf);
+  rf = fir_rx_seen; /* never read back while streaming (see fir_rx_seen) */
+  tf = fir_tx_seen;
   ad9361_get_tx_attenuation(phy, 0, &att);
   ad9361_get_rx_gain_control_mode(phy, 0, &mode);
   ad9361_get_rx_rf_gain(phy, 0, &g);
@@ -864,8 +874,8 @@ int pluto_hw_chain_summary(char *tx_line, size_t txcap, char *rx_line, size_t rx
   AD9361_TXFIRConfig tc;
   memset(&rf, 0, sizeof(rf));
   memset(&tc, 0, sizeof(tc));
-  ad9361_get_rx_fir_config(phy, 0, &rf);
-  ad9361_get_tx_fir_config(phy, 0, &tc);
+  rf = fir_rx_seen; /* never read back while streaming (see fir_rx_seen) */
+  tc = fir_tx_seen;
   uint32_t att = 0, txr = 0, rxr = 0;
   int32_t g = 0;
   uint8_t mode = 0;
