@@ -79,7 +79,12 @@ static int wifi_cmd(int argc, char **argv)
 {
   struct aicwf_wifi_status ast;
 
-  if (nx_wifi80211_present() && (aicwf_wifi_status(&ast) != 0 || !ast.device_present))
+  /* AIC driver diagnostics always go to the AIC driver, whatever else is plugged in */
+  int aic_only = argc > 1 && (strcmp(argv[1], "fw") == 0 || strcmp(argv[1], "reprobe") == 0 ||
+                              strcmp(argv[1], "fwdiag") == 0 || strcmp(argv[1], "debug") == 0 ||
+                              strcmp(argv[1], "rescan") == 0);
+  if (!aic_only && nx_wifi80211_present() &&
+      (aicwf_wifi_status(&ast) != 0 || !ast.device_present))
     return nx_wifi80211_cmd(argc, argv);
   if (argc >= 2 && strcmp(argv[1], "connect") == 0)
     argv[1] = "join";

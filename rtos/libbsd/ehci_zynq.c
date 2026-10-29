@@ -233,7 +233,7 @@ zynq_ehci_intr(void *arg)
  */
 unsigned zynq_ehci_async_kicks;
 static uint32_t zynq_ehci_last_alist;
-static unsigned zynq_ehci_stuck_ticks;
+static unsigned zynq_ehci_stuck_ticks, zynq_ehci_kicks_seen;
 
 static void
 zynq_ehci_async_kick(void)
@@ -280,8 +280,9 @@ zynq_ehci_poll_tick(void *arg)
 		    (zynq_ehci_ticks % 50) == 0)
 			usb_needs_explore(&zynq_ehci_sc->sc_bus, 0);
 		if (++zynq_ehci_ticks % 1000 == 0 &&
-		    (zynq_ehci_rescued != 0 || ehci_zynq_ring_repairs != zynq_ehci_repairs_seen ||
-		    zynq_ehci_async_kicks != 0)) {
+		    (ehci_zynq_ring_repairs != zynq_ehci_repairs_seen ||
+		    zynq_ehci_async_kicks != zynq_ehci_kicks_seen)) {
+			zynq_ehci_kicks_seen = zynq_ehci_async_kicks;
 			printf("ehci: %u transfer(s) completed by the poll, async ring repairs %u, async kicks %u\n",
 			    zynq_ehci_rescued, ehci_zynq_ring_repairs, zynq_ehci_async_kicks);
 			zynq_ehci_rescued = 0;

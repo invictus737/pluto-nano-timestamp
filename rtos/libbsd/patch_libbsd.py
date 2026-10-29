@@ -127,7 +127,12 @@ def diag_ioctl_c(s):
         return s
     old = "\t\tif (ifp->if_flags & IFF_UP) {\n\t\t\t/*\n\t\t\t * Bring ourself up unless we're already operational."
     assert s.count(old) == 1, "SIOCSIFFLAGS anchor"
-    return s.replace(old, "\t\tprintf(\"wlan diag: %s flags 0x%x state %d running %d\\n\", ifp->if_xname, (unsigned)ifp->if_flags, (int)vap->iv_state, ic->ic_nrunning); " + DIAG_MARK + "\n" + old)
+    s = s.replace(old, "\t\tprintf(\"wlan diag: %s flags 0x%x state %d running %d\\n\", ifp->if_xname, (unsigned)ifp->if_flags, (int)vap->iv_state, ic->ic_nrunning); " + DIAG_MARK + "\n" + old)
+    # a vap whose parent was stopped while it was scanning keeps iv_state SCAN and is never
+    # started again by "up" (seen with rtwn + wpa_supplicant): not running = start from INIT
+    old2 = "\t\t\tif (vap->iv_state == IEEE80211_S_INIT) {\n\t\t\t\tif (ic->ic_nrunning == 0)\n\t\t\t\t\twait = 1;\n\t\t\t\tieee80211_start_locked(vap);"
+    assert s.count(old2) == 1, "SIOCSIFFLAGS start anchor"
+    return s.replace(old2, "\t\t\tif (vap->iv_state == IEEE80211_S_INIT ||\n\t\t\t    (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {\n\t\t\t\tvap->iv_state = IEEE80211_S_INIT; /* Pluto: stale SCAN */\n\t\t\t\tif (ic->ic_nrunning == 0)\n\t\t\t\t\twait = 1;\n\t\t\t\tieee80211_start_locked(vap);")
 
 
 def diag_rtwn_c(s):

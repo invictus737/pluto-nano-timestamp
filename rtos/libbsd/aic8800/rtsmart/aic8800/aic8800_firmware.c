@@ -18,8 +18,9 @@
 extern int aicwf_d80_fw_mode;   /* 0 auto (MCU1 -> legacy), 1 SDK5 only, 2 legacy only */
 static rt_bool_t aicwf_d80_legacy(const struct aic8800_context *context)
 {
-    return aicwf_d80_fw_mode == 2 ||
-           (aicwf_d80_fw_mode == 0 && context && context->chip_mcu_id == 1U);
+    /* auto = SDK 5.0 (the set the Linux image loads); legacy only on request */
+    (void)context;
+    return aicwf_d80_fw_mode == 2;
 }
 #endif
 
