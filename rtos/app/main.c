@@ -44,6 +44,7 @@
 
 #include <bsp.h>
 
+#include "nexus_mutex.h"
 #include "config_store.h"
 #include "netcmd.h"
 #include "nexus_station.h"
@@ -203,7 +204,7 @@ static struct {
   char domain[64];
   char ntp[128];
 } net_if[NET_IFS];
-static pthread_mutex_t net_if_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(net_if_lock)
 
 static const char *env_get(char *const *env, const char *name)
 {
@@ -688,6 +689,81 @@ static void usb_tunables_apply(void)
 }
 
 /* mr32 <addr> [count] / mw32 <addr> <value>: 32-bit register access (mdump/medit are byte-wide) */
+/* `fput <path>`: a file over the serial console, for a headless board without Wi-Fi. Lines are
+ * read from stdin until a line holding a single "." (a line that starts with "." is sent with one
+ * more "." in front, as in SMTP); CR/LF become LF. Written to <path>.fput~ and renamed over
+ * <path>; prints the size and the CRC-32 (zlib/`crc32` on the host) of what was written. */
+uint32_t cfg_crc32(uint32_t crc, const void *data, size_t len); /* config_kv.c */
+
+#define FPUT_MAX (1024 * 1024)
+
+static int shell_fput(int argc, char **argv)
+{
+  if (argc != 2) {
+    printf("usage: fput <path>   then the lines, ended by a line \".\"\n");
+    return 1;
+  }
+  char tmp[256];
+  if ((size_t)snprintf(tmp, sizeof(tmp), "%s.fput~", argv[1]) >= sizeof(tmp)) {
+    printf("fput: path too long\n");
+    return 1;
+  }
+  FILE *f = fopen(tmp, "w");
+  if (f == NULL) {
+    printf("fput: %s: %s\n", tmp, strerror(errno));
+    return 1;
+  }
+  printf("fput: send the lines, end with a line \".\"\n");
+  fflush(stdout);
+  char line[1024];
+  size_t total = 0;
+  uint32_t crc = 0;
+  int ok = 0, err = 0, bol = 1; /* bol: this chunk starts a line (fgets splits long lines) */
+  while (fgets(line, sizeof(line), stdin) != NULL) {
+    size_t n = strcspn(line, "\r\n");
+    int complete = line[n] != '\0';
+    line[n] = '\0';
+    if (bol && complete && strcmp(line, ".") == 0) {
+      ok = 1;
+      break;
+    }
+    const char *p = bol && line[0] == '.' ? line + 1 : line;
+    bol = complete;
+    size_t len = strlen(p);
+    if (total + len + 1 > FPUT_MAX) {
+      printf("fput: more than %d bytes\n", FPUT_MAX);
+      err = 1;
+      break;
+    }
+    if (fwrite(p, 1, len, f) != len || (complete && fputc('\n', f) == EOF)) {
+      err = 1;
+      break;
+    }
+    crc = cfg_crc32(crc, p, len);
+    total += len;
+    if (complete) {
+      crc = cfg_crc32(crc, "\n", 1);
+      total += 1;
+    }
+  }
+  if (fclose(f) != 0) {
+    err = 1;
+  }
+  if (!ok || err) {
+    (void)unlink(tmp);
+    printf("fput: %s, %s unchanged\n", err ? "write failed" : "input ended without \".\"", argv[1]);
+    return 1;
+  }
+  /* rename() replaces the target in the nexus2 image (posix_compat.c wrapper); elsewhere RTEMS
+   * refuses an existing target */
+  if (rename(tmp, argv[1]) != 0 && !(errno == EEXIST && unlink(argv[1]) == 0 && rename(tmp, argv[1]) == 0)) {
+    printf("fput: rename to %s: %s (data in %s)\n", argv[1], strerror(errno), tmp);
+    return 1;
+  }
+  printf("fput: %s %zu bytes crc32 %08x\n", argv[1], total, (unsigned)crc);
+  return 0;
+}
+
 static int shell_mr32(int argc, char **argv)
 {
   if (argc < 2) {
@@ -792,6 +868,8 @@ static void Init(rtems_task_argument arg)
   nexus_fwupdate_register(); /* fwupdate.c */
   rtems_shell_add_cmd("mr32", "mem", "mr32 <addr> [count]: 32-bit reads", shell_mr32);
   rtems_shell_add_cmd("mw32", "mem", "mw32 <addr> <value>: 32-bit write", shell_mw32);
+  rtems_shell_add_cmd("fput", "files", "fput <path>: write stdin lines up to a line \".\" to <path> (serial upload)",
+                      shell_fput);
   rtems_shell_add_cmd("abi", "misc", "abi [-v]: C layouts/constants vs the Rust libc crate", nexus_shell_abi);
   /* ---- Bluetooth (rtos/bt): `bt` command; powers on when bt.enabled, reconnects the last sink ---- */
   nexus_bt_shell_register();
@@ -800,6 +878,7 @@ static void Init(rtems_task_argument arg)
 #ifdef NEXUS_RUST_MAIN
   rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status|layout|env|load|stages: the nexus2 station", shell_nexus);
   rtems_shell_add_cmd("log", "misc", "log [bytes] | log find <word>... | log clear: console log ring", nexus_log_shell);
+  nexus_log_drainer_start(); /* radio threads never wait for the serial console */
   nexus2_start();
 #endif
 

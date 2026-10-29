@@ -16,6 +16,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
+#include "nexus_mutex.h"
 #include "qspi_nor.h"
 
 #include <pthread.h>
@@ -72,7 +73,7 @@
 #define ISR_RXNEMPTY (1U << 4)
 #define POLL_LIMIT 200000u      /* ~ms at most per byte; a stuck controller fails, not hangs */
 
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(lock)
 static int ready;
 static uint32_t jedec;
 static uint8_t verify_buf[PAGE];

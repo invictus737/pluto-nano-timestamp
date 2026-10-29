@@ -26,6 +26,7 @@
 #include <rtems/score/threadimpl.h>
 #include <rtems/score/todimpl.h>
 
+#include "nexus_mutex.h"
 #include "nexus_station.h"
 
 #define LOAD_MAX_THREADS 192
@@ -156,7 +157,7 @@ static void print_pct(char *out, size_t cap, uint32_t v)
 
 static load_snapshot shell_a, shell_b;
 static load_row shell_rows[LOAD_MAX_THREADS];
-static pthread_mutex_t shell_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(shell_lock)
 
 static void load_report(unsigned seconds)
 {

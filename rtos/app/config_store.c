@@ -3,6 +3,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
+#include "nexus_mutex.h"
 #include "config_store.h"
 #include "config_kv.h"
 #include "qspi_nor.h"
@@ -54,14 +55,14 @@ static const unsigned char nexus_wifi_default_psk[1] = {0};
 #define MEDIA_PRIO 150
 #define MEDIA_STACK (64 * 1024)
 
-static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(mtx)
 static kv_t store;
 static int data_ok;   /* /data mounted and writable */
 static int flash_ok;  /* QSPI layer usable */
 static char *last_drive;
 /* nexus_config_init() finished: the media listener holds drive drop-ins until then, because the
  * media server is started before /data is mounted (nexus_config_early) */
-static pthread_mutex_t ready_mtx = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(ready_mtx)
 static pthread_cond_t ready_cv = PTHREAD_COND_INITIALIZER;
 static int config_ready;
 static void (*callbacks[8])(void);

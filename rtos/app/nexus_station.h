@@ -28,6 +28,8 @@ int nexus_env_shell(int argc, char **argv);
 void nexus_env_load_file(void);
 /* console log ring (posix_compat.c): stdout/stderr of every thread, readable over SSH */
 int nexus_log_shell(int argc, char **argv);
+/* forwards radio threads' console output from CPU0; until started they write synchronously */
+void nexus_log_drainer_start(void);
 
 /* nexus2 (Rust, rf-front stage_timing.rs); weak: absent in images without nexus2 */
 size_t nexus2_stage_report(char *buf, size_t cap, int reset) __attribute__((weak));

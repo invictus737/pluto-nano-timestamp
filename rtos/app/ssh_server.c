@@ -23,6 +23,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include "nexus_mutex.h"
 #include "ssh_server.h"
 
 #include <stdio.h>
@@ -109,7 +110,7 @@ struct ssh_slot {
 };
 
 static struct ssh_slot slots[SSH_SLOTS];
-static pthread_mutex_t slots_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(slots_lock)
 static WOLFSSH_CTX *ssh_ctx;
 
 static double mono_s(void)

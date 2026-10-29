@@ -55,6 +55,7 @@
 #include <rtems/libio.h>
 #include <rtems/shell.h>
 
+#include "nexus_mutex.h"
 #include "aicwf_wifi.h"
 #include "config_store.h"
 #include "netcmd.h"
@@ -70,7 +71,7 @@
 
 /* ---- small helpers ---- */
 
-static pthread_mutex_t getopt_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(getopt_lock)
 
 /* a libbsd program (ifconfig, arp, netstat, ping, ...): newlib getopt state reset first */
 static int bsd_prog(int (*fn)(int, char **), int argc, char **argv)
@@ -292,7 +293,7 @@ typedef struct {
 
 #define NX_OVR 6
 static nx_ifcfg_t ovr[NX_OVR]; /* runtime overrides (net dhcp/static without --save) */
-static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(cfg_lock)
 static bool cfg_loaded;          /* nx_net_start ran: the configuration is in RAM */
 
 /* the documented keys: [WLAN] ipaddr_wlan, gateway_wlan for every wlanN; [USB_ETHERNET]
@@ -392,7 +393,7 @@ static struct {
   char ifn[IFNAMSIZ];
   char block[256];
 } applied[NX_BLOCKS];
-static pthread_mutex_t conf_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(conf_lock)
 
 static int if_list(char names[][IFNAMSIZ], int max)
 {
@@ -643,7 +644,7 @@ static bool kv_line(const char *text, const char *key, char *out, size_t cap)
  */
 #define W_MAX 2
 static const char *w_def_ssid, *w_def_psk;
-static pthread_mutex_t w_lock = PTHREAD_MUTEX_INITIALIZER;
+NEXUS_PI_MUTEX(w_lock)
 static pthread_cond_t w_cond = PTHREAD_COND_INITIALIZER;
 static bool w_running;                   /* the supplicant task is in main() */
 static char w_run_set[W_MAX][IFNAMSIZ];  /* interfaces it was started with */
