@@ -89,6 +89,14 @@ jobs:
         if: steps.wolf.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with: { path: '${{ env.WOLF_PREFIX }}', key: "rtems-6.2-wolfssh-v1-${{ hashFiles('rtos/ci/wolfssh.sh', 'rtos/ssh/user_settings.h', 'rtos/ci/toolchain.sh') }}" }
+      - name: BTstack cache
+        uses: actions/cache@v4
+        with: { path: rtos/bt/btstack, key: "btstack-${{ hashFiles('rtos/bt/fetch-btstack.sh') }}" }
+      - name: Bluetooth (BTstack fetch)
+        run: rtos/bt/fetch-btstack.sh
+      - name: Bluetooth host tests (resampler, manager against a scripted controller)
+        continue-on-error: true
+        run: sh rtos/bt/test/run.sh
       - name: Image (rtos.itb)
         env:
           NEXUS_SSH_HOSTKEY: '${{ secrets.NEXUS_SSH_HOSTKEY }}'
@@ -182,6 +190,10 @@ jobs:
         id: abi
         continue-on-error: true
         run: rtos/ci/nexus2-abi.sh $RTEMS_TOOLS $RTEMS_BSP_PREFIX $PWD/nexus $PWD/out/abi
+      - name: BTstack cache
+        uses: actions/cache@v4
+        with: { path: rtos/bt/btstack, key: "btstack-${{ hashFiles('rtos/bt/fetch-btstack.sh') }}" }
+      - run: rtos/bt/fetch-btstack.sh
       - name: Station image (nexus2 + native Pluto driver linked into RTEMS)
         id: n2img
         continue-on-error: true
