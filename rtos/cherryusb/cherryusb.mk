@@ -13,7 +13,22 @@ ifeq ($(wildcard $(CHERRY_SRC)/core/usbh_core.c),)
 $(error cherryusb: no CherryUSB at $(CHERRY_SRC): run rtos/cherryusb/fetch-cherryusb.sh)
 endif
 
-CHERRY_INC := -I$(CHERRY_DIR)/config -I$(CHERRY_DIR)/port -I$(CHERRY_SRC)/common \
+# Host controller driver: CHERRY_HCD=nxp (port/ehci_nxp: NXP MCUXpresso pipe model, one QH per
+# endpoint kept linked, cancel by the schedule handshake, no IAA) or cherry (CherryUSB's EHCI
+# port with patches/). Both provide usb_hc_ehci.h for the glue and the AIC adapter; the nxp
+# directory comes first on the include path so its header wins (usb_ehci_reg.h stays CherryUSB's).
+CHERRY_HCD ?= cherry
+ifeq ($(CHERRY_HCD),nxp)
+CHERRY_HCD_INC := -I$(CHERRY_DIR)/port/ehci_nxp
+CHERRY_HCD_OBJ := usb_hc_ehci_nxp.o
+else ifeq ($(CHERRY_HCD),cherry)
+CHERRY_HCD_INC :=
+CHERRY_HCD_OBJ := usb_hc_ehci.o
+else
+$(error cherryusb: CHERRY_HCD must be nxp or cherry, not $(CHERRY_HCD))
+endif
+
+CHERRY_INC := -I$(CHERRY_DIR)/config -I$(CHERRY_DIR)/port $(CHERRY_HCD_INC) -I$(CHERRY_SRC)/common \
 	-I$(CHERRY_SRC)/core -I$(CHERRY_SRC)/class/hub -I$(CHERRY_SRC)/class/msc \
 	-I$(CHERRY_SRC)/port/ehci
 # third-party code: its own warnings are not ours to fix
@@ -31,13 +46,18 @@ AICWF_CFLAGS := $(CFLAGS) -std=gnu11 -Wno-unused-function -Wno-format \
 	-I$(AICWF_RTS)/wlan -I$(AICWF_RTS)/wlan/offload \
 	-I$(AICWF_RTS)/wlan/offload/third_party/tinycrypt/include -I$(AICWF_DIR)
 
-CHERRY_OBJS := $(addprefix $(B)/cherry_, usbh_core.o usbh_hub.o usb_hc_ehci.o usb_osal_rtems.o \
+CHERRY_OBJS := $(addprefix $(B)/cherry_, usbh_core.o usbh_hub.o $(CHERRY_HCD_OBJ) usb_osal_rtems.o \
 	usb_glue_zynq.o aicwf_cherry_classes.o aicwf_cherry_modeswitch.o aicwf_cherry.o)
 
 # usbh_shim.c is replaced: out of the link, and its prerequisite slot (already on the image
 # rule from aicwf.mk) becomes an empty object
 CONFIG_OBJS := $(filter-out $(B)/aicwf_usbh_shim.o,$(CONFIG_OBJS)) $(CHERRY_OBJS)
 $(B)/nexus-rtos.elf: $(CHERRY_OBJS)
+# a different CHERRY_HCD rebuilds every object that includes usb_hc_ehci.h
+$(B)/cherry_hcd.$(CHERRY_HCD): | $(B)
+	rm -f $(B)/cherry_hcd.*
+	touch $@
+$(CHERRY_OBJS): $(B)/cherry_hcd.$(CHERRY_HCD)
 
 $(B)/aicwf_usbh_shim.o: | $(B)
 	echo '/* USB_STACK=cherry: shim/usbh_shim.c is replaced by rtos/cherryusb/aic */' > $(B)/aicwf_usbh_shim_unused.c
@@ -48,6 +68,8 @@ $(B)/cherry_%.o: $(CHERRY_SRC)/core/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
 $(B)/cherry_%.o: $(CHERRY_SRC)/class/hub/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
 	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
 $(B)/cherry_%.o: $(CHERRY_SRC)/port/ehci/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
+	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
+$(B)/cherry_%.o: $(CHERRY_DIR)/port/ehci_nxp/%.c $(CHERRY_DIR)/port/ehci_nxp/usb_hc_ehci.h $(CHERRY_DIR)/config/usb_config.h | $(B)
 	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
 $(B)/cherry_%.o: $(CHERRY_DIR)/osal/%.c $(CHERRY_DIR)/config/usb_config.h | $(B)
 	$(CC) $(CHERRY_CFLAGS) -c $< -o $@
