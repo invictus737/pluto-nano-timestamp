@@ -6,7 +6,8 @@
  * Wi-Fi/BT stick (vendor + Bluetooth interfaces), behind at most a couple of hubs.
  *
  * Memory model: QH/qTD pools, the frame list and every CherryUSB-internal transfer buffer live
- * in the BSP non-cacheable area (.bsp_nocache, Normal non-cacheable on this BSP); the OSAL drains
+ * in the BSP non-cacheable NOLOAD area (.bsp_noload_nocache, zeroed by the glue; an initialised
+ * .bsp_nocache would put the 512 MiB gap into the binary; Normal non-cacheable on this BSP); the OSAL drains
  * the L2C-310 store buffer when it leaves the outermost critical section (osal/usb_osal_rtems.c).
  * Class-driver buffers are cacheable: CONFIG_USB_DCACHE_ENABLE makes the EHCI port clean and
  * invalidate them before a transfer, aic/aicwf_cherry.c invalidates IN buffers after it and
@@ -31,7 +32,7 @@
 #define CONFIG_USB_DCACHE_ENABLE
 #define CONFIG_USB_ALIGN_SIZE 32
 
-#define USB_NOCACHE_RAM_SECTION __attribute__((section(".bsp_nocache.cherryusb")))
+#define USB_NOCACHE_RAM_SECTION __attribute__((section(".bsp_noload_nocache.cherryusb")))
 
 /* ================ host stack ================ */
 

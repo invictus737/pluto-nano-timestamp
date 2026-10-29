@@ -377,6 +377,10 @@ int nexus_cherryusb_start(void)
      * valid can be cached there, so nothing is written back */
     rtems_cache_invalidate_multiple_data_lines((const void *)bsp_section_nocache_begin,
                                                (size_t)bsp_section_nocache_size);
+    /* CherryUSB's static descriptors/buffers live in the NOLOAD part before the coherent heap:
+     * not loaded, not zeroed by the start code */
+    memset((void *)bsp_section_nocachenoload_begin, 0,
+           (size_t)(bsp_section_nocacheheap_begin - bsp_section_nocachenoload_begin));
     rtems_cache_invalidate_multiple_data_lines((const void *)bsp_section_nocacheheap_begin,
                                                (size_t)bsp_section_nocacheheap_size);
     if (usbh_initialize(0, NEXUS_USB0_BASE, NULL) != 0) {
