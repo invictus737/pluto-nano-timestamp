@@ -23,6 +23,9 @@
 
 #include "nexus_cherryusb.h"
 
+/* libbsd/aic8800/shim/wlan_dev_shim.c: recovery-chain timing (AICWF_T_PLUG = 1, aicwf_shim.h) */
+void aicwf_timing_mark(int stage);
+
 #define AIC_VID     0xa69c
 #define PANDORA_VID 0x1111
 #define PANDORA_PID 0x1111
@@ -243,6 +246,7 @@ int aicwf_cherry_modeswitch_connect(struct usbh_hubport *hport, uint8_t intf)
         printf("aic8800: %04x:%04x storage interface without bulk pipes\n", vid, pid);
         return -USB_ERR_NODEV;
     }
+    aicwf_timing_mark(1); /* AICWF_T_PLUG: a stick that lost power starts here */
     if (vid == AIC_VID && pid == 0x5721 && !nexus_cherryusb_aic_dc_switch) {
         printf("aic8800: %04x:%04x driver CD left alone (usb_aic_dc_switch=0)\n", vid, pid);
         return 0;

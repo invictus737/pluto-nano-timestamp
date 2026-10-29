@@ -1108,6 +1108,7 @@ static int aicwf_cherry_connect(struct usbh_hubport *hport, uint8_t intf)
         return -USB_ERR_NOMEM;
     }
     LOG_I("%04x:%04x interface %u -> %s", vid, pid, intf, cls->class_driver->driver_name);
+    aicwf_timing_mark(AICWF_T_PLUG);
     rc = cls->class_driver->connect(hport, intf);
     if (rc == 0) {
         dev->cls[intf] = cls;
@@ -1176,6 +1177,22 @@ const struct usbh_class_driver aicwf_cherry_class_driver = {
 unsigned aicwf_usbh_attach_count(void)
 {
     return g_attach_count;
+}
+
+/* the controller is being reset/restarted, or a device re-enumerates: no self-heal now */
+int aicwf_usbh_busy(void)
+{
+    int busy = 0, i;
+#ifdef USB_HC_EHCI_NXP
+    const struct ehci_nxp_hcd *h = &g_ehci_nxp[0];
+
+    busy = h->recover_req || h->recovering || h->restart_req || h->restarting || h->gate;
+#endif
+
+    for (i = 0; i < NX_MAX_DEV && !busy; i++) {
+        busy = g_dev[i].hport && g_dev[i].reenumerating;
+    }
+    return busy;
 }
 
 void aicwf_usbh_dump(void)

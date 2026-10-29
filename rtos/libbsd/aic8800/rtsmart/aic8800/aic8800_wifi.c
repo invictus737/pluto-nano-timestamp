@@ -10952,7 +10952,32 @@ rt_err_t aic8800_core_detach(struct aic8800_context *context)
 #ifdef AIC8800_WIFI_TCP_ACK_FILTER
     aic_tcp_ack_deinit(context);
 #endif
+#ifdef AICWF_RTEMS
+    /* the device is gone: every command still waiting for its confirmation (a station start,
+     * a scan or join of the dead instance) fails now instead of after its 15 s timeout */
+    rt_wlan_offload_command_manager_fail(&context->commands, -RT_EIO);
+#endif
     result = rt_wlan_offload_unregister_radio(&context->radio);
+#ifdef AICWF_RTEMS
+    {
+        /* -RT_EBUSY: a station start (wlan_init: STARTING) runs on another thread (the
+         * aic-wlan start retry or the offload recovery work). Its commands fail against the
+         * detached device within their timeouts; wait for it instead of leaving a radio that
+         * can never be torn down (the next attach would refuse the stale context). */
+        unsigned waited = 0;
+
+        while (result == -RT_EBUSY && waited < AIC8800_WIFI_COMMAND_TIMEOUT_MS + 5000U)
+        {
+            rt_thread_mdelay(20);
+            waited += 20;
+            result = rt_wlan_offload_unregister_radio(&context->radio);
+        }
+        if (waited)
+        {
+            LOG_W("radio teardown waited %u ms for a station start in progress (%d)", waited, result);
+        }
+    }
+#endif
     if (result != RT_EOK)
     {
         LOG_E("WLAN offload radio teardown failed: %d", result);

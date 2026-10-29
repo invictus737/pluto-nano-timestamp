@@ -817,6 +817,10 @@ static int
 aicwf_if_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
 	switch (cmd) {
+	case SIOCSIFADDR:
+		if (aicwf_ifnet_addr_set != NULL)
+			aicwf_ifnet_addr_set(if_name(ifp));
+		return (ether_ioctl(ifp, cmd, data));
 	case SIOCSIFFLAGS:
 		if (if_getflags(ifp) & IFF_UP)
 			if_setdrvflagbits(ifp, IFF_DRV_RUNNING, 0);

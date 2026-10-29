@@ -6,6 +6,9 @@
  * AIC8800 boot-ROM firmware loader for RT-Smart USB and SDIO transports.
  */
 #include "aic8800_wifi.h"
+#ifdef AICWF_RTEMS
+#include "aicwf_shim.h"
+#endif
 #include "aic8800_firmware_dc.h"
 #include "tick.h"
 
@@ -110,6 +113,12 @@ enum aic_firmware_state
     AIC_FW_STATE_WAIT_BOOT,
     AIC_FW_STATE_WAIT_RUNTIME,
     AIC_FW_STATE_READY,
+#ifdef AICWF_RTEMS
+    /* the runtime firmware this boot loaded was running when its device detached (USB
+     * controller reset, port reset): a runtime PID of the same family that comes back is
+     * attached to that firmware without the loader, as Linux aic8800_fdrv attaches 8d81 */
+    AIC_FW_STATE_WARM,
+#endif
 };
 
 struct aic_firmware_pair
@@ -136,6 +145,30 @@ struct aic_patch_info
 
 static enum aic_firmware_state g_firmware_state = AIC_FW_STATE_COLD;
 static enum aic_firmware_family g_transition_family = AIC_FW_FAMILY_NONE;
+#ifdef AICWF_RTEMS
+static enum aic_firmware_family g_warm_family = AIC_FW_FAMILY_NONE;
+static enum aic_firmware_family g_ready_family = AIC_FW_FAMILY_NONE;
+static volatile int g_warm_attach;   /* the current runtime attached to a warm firmware */
+static volatile int g_warm_blocked;  /* a warm attach failed: the next one loads again */
+/* warm re-attach on (1) or off (0, every runtime re-enumeration reboots into the loader) */
+int aicwf_warm_firmware = 1;
+
+int aic8800_firmware_warm_attach(void)
+{
+    return g_warm_attach;
+}
+
+/* the warm firmware did not come up: forget it, the next runtime attach reloads */
+void aic8800_firmware_drop_warm(void)
+{
+    g_warm_blocked = 1;
+    g_warm_attach = 0;
+    if (g_firmware_state == AIC_FW_STATE_WARM)
+    {
+        g_firmware_state = AIC_FW_STATE_COLD;
+    }
+}
+#endif
 
 static rt_uint16_t aic_fw_get_le16(const rt_uint8_t *data)
 {
@@ -3342,6 +3375,9 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
         return -RT_ENOSYS;
     }
 
+#ifdef AICWF_RTEMS
+    g_warm_attach = 0;
+#endif
     if (runtime)
     {
         if (g_firmware_state == AIC_FW_STATE_WAIT_RUNTIME &&
@@ -3349,10 +3385,30 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
         {
             g_firmware_state = AIC_FW_STATE_READY;
             context->firmware_runtime_ready = RT_TRUE;
+#ifdef AICWF_RTEMS
+            g_ready_family = family;
+            g_warm_blocked = 0;
+#endif
             LOG_I("firmware runtime re-enumerated as %04x:%04x",
                   context->vendor_id, context->product_id);
             return RT_EOK;
         }
+#ifdef AICWF_RTEMS
+        if (g_firmware_state == AIC_FW_STATE_WARM)
+        {
+            if (g_warm_family == family && aicwf_warm_firmware && !g_warm_blocked)
+            {
+                g_firmware_state = AIC_FW_STATE_READY;
+                g_ready_family = family;
+                g_warm_attach = 1;
+                context->firmware_runtime_ready = RT_TRUE;
+                LOG_I("runtime %04x:%04x came back with the firmware of this boot running: "
+                      "attached without the loader", context->vendor_id, context->product_id);
+                return RT_EOK;
+            }
+            g_firmware_state = AIC_FW_STATE_COLD;
+        }
+#endif
         if (g_firmware_state == AIC_FW_STATE_WAIT_BOOT)
         {
             LOG_W("device returned as a runtime PID before boot download");
@@ -3394,6 +3450,9 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
 
     LOG_I("boot device %04x:%04x detected; loading firmware",
           context->vendor_id, context->product_id);
+#ifdef AICWF_RTEMS
+    aicwf_timing_mark(AICWF_T_FW_START);
+#endif
     g_transition_family = family;
     g_firmware_state = AIC_FW_STATE_WAIT_RUNTIME;
     context->firmware_transition = RT_TRUE;
@@ -3428,5 +3487,14 @@ void aic8800_firmware_disconnected(struct aic8800_context *context)
     {
         g_firmware_state = AIC_FW_STATE_COLD;
         g_transition_family = AIC_FW_FAMILY_NONE;
+#ifdef AICWF_RTEMS
+        /* a runtime that detached, not a loader: its firmware may still run (no power loss) */
+        if (g_ready_family != AIC_FW_FAMILY_NONE && !g_warm_blocked &&
+            aic_firmware_product_is_runtime(context->product_id))
+        {
+            g_firmware_state = AIC_FW_STATE_WARM;
+            g_warm_family = g_ready_family;
+        }
+#endif
     }
 }

@@ -123,6 +123,12 @@ struct aicwf_ifnet *aicwf_ifnet_attach(const char *name, const uint8_t mac[6],
 int aicwf_ifnet_input(struct aicwf_ifnet *ifn, const void *frame, uint32_t len);
 void aicwf_ifnet_link(struct aicwf_ifnet *ifn, int up);
 void aicwf_ifnet_detach(struct aicwf_ifnet *ifn);
+/*
+ * Optional (weak) observer: an IPv4 address was set on an aicwf ifnet (SIOCSIFADDR from the
+ * stack, i.e. dhcpcd bound or a static address). Called on the configuring thread; must not
+ * block. The station shim uses it to time the recovery chain up to DHCP.
+ */
+void aicwf_ifnet_addr_set(const char *ifname) __attribute__((weak));
 
 #ifdef __cplusplus
 }

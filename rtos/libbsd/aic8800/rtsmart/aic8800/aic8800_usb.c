@@ -6,6 +6,9 @@
  * CherryUSB transport for the RT-Smart AIC8800 WLAN offload driver.
  */
 #include "aic8800_wifi.h"
+#ifdef AICWF_RTEMS
+#include "aicwf_shim.h"
+#endif
 #ifdef AIC8800_WIFI_DEBUG_STATS
 #include "tick.h"
 #endif
@@ -3933,7 +3936,21 @@ static void aic8800_usb_attach_work(struct rt_work *work, void *work_data)
         goto done;
     }
 
+#ifdef AICWF_RTEMS
+    {
+        rt_tick_t t0 = rt_tick_get();
+
+        result = aic8800_firmware_probe(context, &attach_runtime);
+        if (result == RT_EOK && !attach_runtime)
+        {
+            aicwf_timing_mark(AICWF_T_FW_DONE);
+            LOG_I("%04x:%04x: firmware stage done in %u ms", context->vendor_id, context->product_id,
+                  (unsigned)(rt_tick_get() - t0));
+        }
+    }
+#else
     result = aic8800_firmware_probe(context, &attach_runtime);
+#endif
     if (result != RT_EOK)
     {
         LOG_E("firmware probe for %04x:%04x failed: %d",

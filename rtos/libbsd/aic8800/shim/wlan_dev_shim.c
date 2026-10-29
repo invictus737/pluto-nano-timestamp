@@ -7,6 +7,16 @@
  * connected to the configured network by the aic-wlan thread (scan for the SSID, join
  * the strongest BSS with the security it advertises, retry with backoff).
  *
+ * Lifecycle across USB resets: a detach (rt_wlan_dev_unregister) removes wlan0 and clears every
+ * per-device state (link, scan, pending join, command failure streak); the next registration
+ * starts the station again (wlan0 with the same name; dhcpcd sees it arrive and asks for its
+ * previous lease). A station start that fails is retried by the aic-wlan thread with a backoff
+ * (WLAN_START_RETRY_MIN_MS up to WLAN_RETRY_MAX_MS) instead of leaving the stick without wlan0;
+ * a stick attached to the firmware still running from before the reset (warm attach) that does
+ * not start twice is re-enumerated with a firmware reload. The first join after a start scans
+ * only the channel of the last network (WLAN_FAST_SCAN_TIMEOUT_MS), then all channels. Every
+ * step is logged; one "recovery" line gives the time of each step up to the DHCP address.
+ *
  * Self-heal (aic-heal thread, as a Linux USB reset + driver rebind): the stick is
  * re-enumerated (port reset, enumeration, firmware download, station start, rejoin; the same
  * as `wifi reprobe`) when WLAN_HEAL_CMD_FAILS firmware commands in a row failed, when bulk
@@ -14,7 +24,9 @@
  * progress (no scan result, join event or start) for WLAN_HEAL_STALL_MS while a network is
  * configured. Recoveries are spaced by an exponential backoff (WLAN_HEAL_BACKOFF_MIN_MS up to
  * WLAN_HEAL_BACKOFF_MAX_MS, reset after WLAN_HEAL_STABLE_MS connected); one log line each.
- * Only while aicwf_self_heal is set (default AICWF_SELF_HEAL_DEFAULT, rtconfig.h: off).
+ * It is the last resort: never while the USB host resets or re-enumerates (aicwf_usbh_busy()),
+ * while a station start is in progress, or within WLAN_HEAL_SETTLE_MS of a station
+ * registration. Only while aicwf_self_heal is set (default AICWF_SELF_HEAL_DEFAULT, rtconfig.h).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -34,8 +46,17 @@
 #define WLAN_SCAN_MAX           64
 #define WLAN_SCAN_TIMEOUT_MS    12000
 #define WLAN_CONNECT_TIMEOUT_MS 30000
-#define WLAN_RETRY_MIN_MS       2000
+#define WLAN_RETRY_MIN_MS       1000
 #define WLAN_RETRY_MAX_MS       30000
+/* station start retries after a failed bring-up */
+#define WLAN_START_RETRY_MIN_MS 1000
+/* the hub thread starts the station right after the registration; the aic-wlan thread only
+ * steps in if that did not happen within this long */
+#define WLAN_START_GRACE_MS     5000
+/* failed starts on a warm-attached firmware before it is reloaded (re-enumeration) */
+#define WLAN_WARM_START_FAILS   2
+/* scan of the last network's channel only, first join after a station start */
+#define WLAN_FAST_SCAN_TIMEOUT_MS 2500
 
 void aicwf_usbh_start(void);
 
@@ -52,6 +73,7 @@ int aicwf_d80_fw_mode;
 #define WLAN_HEAL_BACKOFF_MIN_MS    30000
 #define WLAN_HEAL_BACKOFF_MAX_MS    300000
 #define WLAN_HEAL_STABLE_MS         300000
+#define WLAN_HEAL_SETTLE_MS         20000
 
 #ifndef AICWF_SELF_HEAL_DEFAULT
 #define AICWF_SELF_HEAL_DEFAULT 0
@@ -91,6 +113,29 @@ static int g_last_error;
 static struct rt_wlan_info g_current;
 
 static rt_bool_t g_started;
+
+/* station start (g_lock) */
+static rt_bool_t g_start_pending;       /* registered, wlan0 not created yet */
+static rt_bool_t g_start_running;       /* a start is in progress (hub or aic-wlan thread) */
+static rt_tick_t g_start_next;
+static rt_uint32_t g_start_backoff_ms = WLAN_START_RETRY_MIN_MS;
+static unsigned g_start_fails;          /* failed starts of this registration */
+static unsigned g_registrations;        /* station registrations since boot */
+static rt_tick_t g_registered_at;
+static unsigned g_heal_skips;
+
+/* the network of the last association: the first join after a start scans its channel only */
+static struct rt_wlan_info g_last_bss;
+static rt_bool_t g_last_bss_valid;
+static rt_bool_t g_fast_scan;           /* next join may use the single-channel scan */
+static rt_bool_t g_fast_tried;          /* the last join scanned the last channel only */
+
+/* recovery-chain timing (aicwf_timing_mark) */
+static rt_tick_t g_tm[AICWF_T_COUNT];
+static rt_bool_t g_tm_open;
+static const char *const g_tm_name[AICWF_T_COUNT] = {
+    "lost", "plug", "fw-start", "fw-done", "runtime", "wlan0", "scan", "assoc", "dhcp"
+};
 
 /* self-heal (g_lock, except the command streak) */
 static int g_cmd_fail_streak;           /* __atomic: firmware command threads */
@@ -167,6 +212,80 @@ static const char *security_name(rt_wlan_security_t security)
     }
 }
 
+/* ---- recovery-chain timing ---- */
+
+void aicwf_timing_mark(int stage)
+{
+    char line[256];
+    rt_tick_t now = rt_tick_get(), t[AICWF_T_COUNT];
+    int o, i, print = 0;
+
+    if (stage < 0 || stage >= AICWF_T_COUNT)
+    {
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    if (stage == AICWF_T_LOST || !g_tm_open)
+    {
+        if (stage == AICWF_T_LOST || stage == AICWF_T_PLUG || stage == AICWF_T_FW_START ||
+            stage == AICWF_T_RUNTIME)
+        {
+            memset(g_tm, 0, sizeof(g_tm));
+            g_tm_open = RT_TRUE;
+        }
+        else
+        {
+            pthread_mutex_unlock(&g_lock);
+            return; /* a link flap without a USB chain: not timed */
+        }
+    }
+    if (g_tm[stage] == 0)
+    {
+        g_tm[stage] = now ? now : 1;
+    }
+    if (stage == AICWF_T_DHCP)
+    {
+        memcpy(t, g_tm, sizeof(t));
+        g_tm_open = RT_FALSE;
+        print = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (!print)
+    {
+        return;
+    }
+    {
+        rt_tick_t t0 = 0, prev;
+
+        for (i = 0; i < AICWF_T_COUNT && !t0; i++)
+        {
+            t0 = t[i];
+        }
+        prev = t0;
+        o = snprintf(line, sizeof(line), "recovery timing (ms from the first step):");
+        for (i = 0; i < AICWF_T_COUNT && o < (int)sizeof(line) - 24; i++)
+        {
+            if (t[i])
+            {
+                o += snprintf(line + o, sizeof(line) - o, " %s +%u (%u)", g_tm_name[i],
+                              (unsigned)(t[i] - t0), (unsigned)(t[i] - prev));
+                prev = t[i];
+            }
+        }
+        LOG_I("%s; total %u ms", line, (unsigned)(now - t0));
+    }
+}
+
+/* libbsd ifnet (if_aicwf_usb.c): an IPv4 address was set on an aicwf interface */
+void aicwf_ifnet_addr_set(const char *ifname)
+{
+    if (ifname && strcmp(ifname, AICWF_WIFI_IFNAME) == 0)
+    {
+        LOG_I("%s has its address", ifname);
+        aicwf_timing_mark(AICWF_T_DHCP);
+    }
+}
+
 /* ---- RT-Thread wlan_dev API used by the WLAN offload framework ---- */
 
 rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan, const char *model_name,
@@ -207,15 +326,34 @@ rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan, const char *mode
     pthread_mutex_lock(&g_lock);
     if (mode == RT_WLAN_STATION)
     {
+        /* a new device instance: nothing of the previous one carries over */
         g_sta = wlan;
         g_sta_ready = RT_FALSE;
+        g_link_up = RT_FALSE;
+        g_connect_result = -1;
+        g_scan_done = RT_TRUE;
+        g_scan_count = 0;
+        g_start_pending = RT_TRUE;
+        g_start_fails = 0;
+        g_start_backoff_ms = WLAN_START_RETRY_MIN_MS;
+        g_start_next = rt_tick_get() + WLAN_START_GRACE_MS;
+        g_registered_at = rt_tick_get();
+        g_progress = g_registered_at;
+        g_registrations++;
+        __atomic_store_n(&g_cmd_fail_streak, 0, __ATOMIC_RELAXED);
+        pthread_cond_broadcast(&g_cond);
     }
     else
     {
         g_ap = wlan;
     }
     pthread_mutex_unlock(&g_lock);
-    LOG_I("registered %s (%s)", wlan->device.parent.name, wlan->model_name);
+    LOG_I("registered %s (%s)%s", wlan->device.parent.name, wlan->model_name,
+          mode == RT_WLAN_STATION && aic8800_firmware_warm_attach() ? ", firmware kept running" : "");
+    if (mode == RT_WLAN_STATION)
+    {
+        aicwf_timing_mark(AICWF_T_RUNTIME);
+    }
     return RT_EOK;
 }
 
@@ -228,10 +366,15 @@ rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan)
     {
         return -RT_EINVAL;
     }
+    rt_bool_t station = RT_FALSE, was_up = RT_FALSE;
+
     pthread_mutex_lock(&g_lock);
     if (wlan == g_sta)
     {
+        station = RT_TRUE;
+        was_up = g_link_up;
         g_sta_ready = RT_FALSE;
+        g_start_pending = RT_FALSE;
         g_link_up = RT_FALSE;
         g_connect_result = -1;
         g_scan_done = RT_TRUE;
@@ -240,10 +383,19 @@ rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan)
         pthread_cond_broadcast(&g_cond);
     }
     pthread_mutex_unlock(&g_lock);
+    if (station)
+    {
+        aicwf_timing_mark(AICWF_T_LOST);
+    }
     if (ifnet)
     {
         /* drains the transmit task, which may be inside wlan_send() */
         aicwf_ifnet_detach(ifnet);
+    }
+    if (station)
+    {
+        LOG_W("station device detached%s: %s removed, waiting for the stick to come back",
+              was_up ? " while connected" : "", AICWF_WIFI_IFNAME);
     }
     pthread_mutex_lock(&g_lock);
     while (wlan == g_sta && g_uses > 0)
@@ -318,6 +470,8 @@ void rt_wlan_dev_indicate_event_handle(struct rt_wlan_device *device, rt_wlan_de
         g_progress = g_link_since;
         g_connect_result = 1;
         g_backoff_ms = WLAN_RETRY_MIN_MS;
+        g_last_bss = g_current;
+        g_last_bss_valid = RT_TRUE;
         link = 1;
         break;
     case RT_WLAN_DEV_EVT_CONNECT_FAIL:
@@ -357,6 +511,7 @@ void rt_wlan_dev_indicate_event_handle(struct rt_wlan_device *device, rt_wlan_de
     {
         LOG_I("connected to %s (channel %d, %d dBm)", g_current.ssid.val,
               g_current.channel, g_current.rssi);
+        aicwf_timing_mark(AICWF_T_ASSOC);
     }
 }
 
@@ -446,20 +601,29 @@ static int ifnet_tx(void *arg, const void *frame, uint32_t len)
     return result == RT_EOK ? 0 : -1;
 }
 
-void aicwf_wlan_attach_done(void)
+/*
+ * Start the station of the registered device and create wlan0 (hub thread right after the
+ * class connect, or the aic-wlan thread retrying). 0 when wlan0 exists afterwards.
+ */
+static int station_start(const char *who)
 {
     struct rt_wlan_device *wlan;
     struct aicwf_ifnet *ifnet;
     rt_uint8_t mac[6];
     rt_err_t result;
+    rt_tick_t t0 = rt_tick_get();
+    unsigned fails, generation;
+    int warm = aic8800_firmware_warm_attach();
 
     pthread_mutex_lock(&g_lock);
     wlan = g_sta;
-    if (!wlan || g_sta_ready)
+    if (!wlan || g_sta_ready || g_start_running || !g_start_pending)
     {
         pthread_mutex_unlock(&g_lock);
-        return;
+        return wlan && g_sta_ready ? 0 : -RT_EBUSY;
     }
+    generation = g_registrations;
+    g_start_running = RT_TRUE;
     g_uses++;
     pthread_mutex_unlock(&g_lock);
 
@@ -475,36 +639,101 @@ void aicwf_wlan_attach_done(void)
     }
     if (result != RT_EOK)
     {
-        LOG_E("station start failed: %d", result);
+        rt_uint32_t next_ms;
+
         pthread_mutex_lock(&g_lock);
         g_last_error = result;
+        g_start_running = RT_FALSE;
+        fails = ++g_start_fails;
+        next_ms = g_start_backoff_ms;
+        g_start_next = rt_tick_get() + next_ms;
+        g_start_backoff_ms = g_start_backoff_ms * 2 > WLAN_RETRY_MAX_MS ? WLAN_RETRY_MAX_MS
+                                                                        : g_start_backoff_ms * 2;
+        pthread_cond_broadcast(&g_cond);
         pthread_mutex_unlock(&g_lock);
         sta_put();
-        return;
+        LOG_E("station start (%s) failed: %d after %u ms, attempt %u%s; retry in %u ms", who, result,
+              (unsigned)(rt_tick_get() - t0), fails, warm ? " on the warm firmware" : "",
+              (unsigned)next_ms);
+        if (warm && fails >= WLAN_WARM_START_FAILS)
+        {
+            /* the firmware that survived the reset does not answer as it should: reload it */
+            LOG_W("warm firmware did not start %u times: re-enumerating the stick to reload it", fails);
+            aic8800_firmware_drop_warm();
+            (void)aicwf_usbh_reprobe();
+        }
+        return result;
     }
     wlan->mode = RT_WLAN_STATION;
     ifnet = aicwf_ifnet_attach(AICWF_WIFI_IFNAME, mac, ifnet_tx, RT_NULL);
     pthread_mutex_lock(&g_lock);
+    if (g_sta != wlan || g_registrations != generation || !g_start_pending)
+    {
+        /* the device detached while it started (its unregister waits for this use): no wlan0
+         * for a device that is gone */
+        g_start_running = RT_FALSE;
+        pthread_cond_broadcast(&g_cond);
+        pthread_mutex_unlock(&g_lock);
+        if (ifnet)
+        {
+            aicwf_ifnet_detach(ifnet);
+        }
+        sta_put();
+        LOG_W("station start (%s): device detached meanwhile", who);
+        return -RT_EIO;
+    }
     memcpy(g_mac, mac, sizeof(g_mac));
     g_ifnet = ifnet;
     g_sta_ready = ifnet != RT_NULL;
+    g_start_running = RT_FALSE;
+    if (ifnet)
+    {
+        g_start_pending = RT_FALSE;
+    }
+    else
+    {
+        g_start_next = rt_tick_get() + g_start_backoff_ms;
+    }
     g_link_up = RT_FALSE;
+    g_connect_result = -1;
     g_next_attempt = rt_tick_get();
     g_backoff_ms = WLAN_RETRY_MIN_MS;
     g_progress = rt_tick_get();
+    g_fast_scan = g_last_bss_valid;
     pthread_cond_broadcast(&g_cond);
     pthread_mutex_unlock(&g_lock);
+    sta_put();
     if (!ifnet)
     {
         LOG_E("cannot create %s", AICWF_WIFI_IFNAME);
+        return -RT_ENOMEM;
     }
-    sta_put();
+    LOG_I("station started (%s) in %u ms%s: %s %02x:%02x:%02x:%02x:%02x:%02x", who,
+          (unsigned)(rt_tick_get() - t0), warm ? " on the warm firmware" : "", AICWF_WIFI_IFNAME, mac[0], mac[1],
+          mac[2], mac[3], mac[4], mac[5]);
+    aicwf_timing_mark(AICWF_T_STATION);
+    return 0;
+}
+
+/* a class driver's connect() returned success (hub thread, serialised with the disconnects) */
+void aicwf_wlan_attach_done(void)
+{
+    rt_bool_t want;
+
+    pthread_mutex_lock(&g_lock);
+    want = g_sta != RT_NULL && !g_sta_ready && !g_start_running;
+    pthread_mutex_unlock(&g_lock);
+    if (want)
+    {
+        (void)station_start("attach");
+    }
 }
 
 /* ---- scanning and joining ---- */
 
-/* returns the number of results, < 0 on error; g_scan_lock held by the caller */
-static int do_scan(const char *ssid, int timeout_ms)
+/* returns the number of results, < 0 on error; g_scan_lock held by the caller; channel > 0 scans
+ * that channel only (band of `band`) */
+static int do_scan(const char *ssid, int timeout_ms, int channel, rt_802_11_band_t band)
 {
     struct rt_scan_info info;
     struct rt_wlan_device *wlan;
@@ -528,6 +757,13 @@ static int do_scan(const char *ssid, int timeout_ms)
     info.channel_min = -1;
     info.channel_max = -1;
     info.band = RT_802_11_BAND_UNKNOWN;
+    if (channel > 0)
+    {
+        info.channel_min = (rt_int16_t)channel;
+        info.channel_max = (rt_int16_t)channel;
+        info.band = band;
+        info.band_locked = band == RT_802_11_BAND_2_4GHZ || band == RT_802_11_BAND_5GHZ;
+    }
     if (ssid && ssid[0])
     {
         info.ssid.len = (rt_uint8_t)strnlen(ssid, RT_WLAN_SSID_MAX_LENGTH);
@@ -565,16 +801,26 @@ static rt_err_t do_join(rt_uint32_t generation)
     struct timespec deadline;
     char ssid[RT_WLAN_SSID_MAX_LENGTH + 1];
     char psk[RT_WLAN_PASSWORD_MAX_LENGTH + 1];
-    int count, i, found = 0;
+    int count, i, found = 0, channel = 0;
+    rt_802_11_band_t band = RT_802_11_BAND_UNKNOWN;
     rt_err_t result;
+    rt_tick_t t0 = rt_tick_get(), tj;
 
     pthread_mutex_lock(&g_lock);
     memcpy(ssid, g_ssid, sizeof(ssid));
     memcpy(psk, g_psk, sizeof(psk));
+    if (g_fast_scan && g_last_bss_valid && g_last_bss.ssid.len == strlen(ssid) &&
+        memcmp(g_last_bss.ssid.val, ssid, g_last_bss.ssid.len) == 0 && g_last_bss.channel > 0)
+    {
+        channel = g_last_bss.channel;
+        band = g_last_bss.band;
+    }
+    g_fast_scan = RT_FALSE; /* one try: a miss falls back to all channels */
+    g_fast_tried = channel != 0;
     pthread_mutex_unlock(&g_lock);
 
     pthread_mutex_lock(&g_scan_lock);
-    count = do_scan(ssid, WLAN_SCAN_TIMEOUT_MS);
+    count = do_scan(ssid, channel ? WLAN_FAST_SCAN_TIMEOUT_MS : WLAN_SCAN_TIMEOUT_MS, channel, band);
     pthread_mutex_lock(&g_lock);
     for (i = 0; i < count && i < g_scan_count; i++)
     {
@@ -590,14 +836,17 @@ static rt_err_t do_join(rt_uint32_t generation)
     pthread_mutex_unlock(&g_scan_lock);
     if (count < 0)
     {
-        LOG_W("scan for %s failed: %d", ssid, count);
+        LOG_W("scan for %s%s failed: %d after %u ms", ssid, channel ? " (last channel only)" : "", count,
+              (unsigned)(rt_tick_get() - t0));
         return count;
     }
     if (!found)
     {
-        LOG_W("network %s not found (%d networks seen)", ssid, count);
+        LOG_W("network %s not found (%d networks seen%s, %u ms)", ssid, count,
+              channel ? " on its last channel" : "", (unsigned)(rt_tick_get() - t0));
         return -RT_EEMPTY;
     }
+    aicwf_timing_mark(AICWF_T_SCAN);
     if (best.security != SECURITY_OPEN && !psk[0])
     {
         LOG_E("%s needs a passphrase (%s)", ssid, security_name(best.security));
@@ -611,9 +860,11 @@ static rt_err_t do_join(rt_uint32_t generation)
     sta.channel = (rt_uint16_t)best.channel;
     sta.band = best.band;
     sta.security = best.security;
-    LOG_I("joining %s %02x:%02x:%02x:%02x:%02x:%02x channel %d %d dBm %s",
+    LOG_I("joining %s %02x:%02x:%02x:%02x:%02x:%02x channel %d %d dBm %s (scan%s %u ms)",
           ssid, best.bssid[0], best.bssid[1], best.bssid[2], best.bssid[3], best.bssid[4],
-          best.bssid[5], best.channel, best.rssi, security_name(best.security));
+          best.bssid[5], best.channel, best.rssi, security_name(best.security),
+          channel ? " of the last channel" : "", (unsigned)(rt_tick_get() - t0));
+    tj = rt_tick_get();
 
     pthread_mutex_lock(&g_lock);
     if (generation != g_generation)
@@ -656,7 +907,12 @@ static rt_err_t do_join(rt_uint32_t generation)
     pthread_mutex_unlock(&g_lock);
     if (result != RT_EOK)
     {
-        LOG_W("association with %s failed: %d", ssid, result);
+        LOG_W("association with %s failed: %d after %u ms", ssid, result, (unsigned)(rt_tick_get() - tj));
+    }
+    else
+    {
+        LOG_I("associated with %s in %u ms (scan + join %u ms)", ssid, (unsigned)(rt_tick_get() - tj),
+              (unsigned)(rt_tick_get() - t0));
     }
     return result;
 }
@@ -671,6 +927,23 @@ static void wlan_thread(void *parameter)
         rt_uint32_t generation;
         rt_err_t result;
 
+        /* a registered station whose start failed (or never ran): start it again */
+        if (g_sta && !g_sta_ready && g_start_pending && !g_start_running)
+        {
+            wait_ms = (rt_int32_t)(g_start_next - rt_tick_get());
+            if (wait_ms > 0)
+            {
+                struct timespec deadline;
+
+                shim_now_deadline(&deadline, wait_ms);
+                pthread_cond_timedwait(&g_cond, &g_lock, &deadline);
+                continue;
+            }
+            pthread_mutex_unlock(&g_lock);
+            (void)station_start("retry");
+            pthread_mutex_lock(&g_lock);
+            continue;
+        }
         if (!g_want || !g_sta || !g_sta_ready || g_link_up || g_connect_result == 0)
         {
             pthread_cond_wait(&g_cond, &g_lock);
@@ -697,9 +970,20 @@ static void wlan_thread(void *parameter)
             {
                 g_connect_result = -1;
             }
-            g_next_attempt = rt_tick_get() + g_backoff_ms;
-            g_backoff_ms = g_backoff_ms * 2 > WLAN_RETRY_MAX_MS ? WLAN_RETRY_MAX_MS
-                                                              : g_backoff_ms * 2;
+            if (g_fast_tried && result != -RT_EINTR)
+            {
+                /* the single-channel scan missed: the full scan at once, no backoff step */
+                g_next_attempt = rt_tick_get();
+            }
+            else
+            {
+                g_next_attempt = rt_tick_get() + g_backoff_ms;
+                g_backoff_ms = g_backoff_ms * 2 > WLAN_RETRY_MAX_MS ? WLAN_RETRY_MAX_MS
+                                                                  : g_backoff_ms * 2;
+            }
+            g_fast_tried = RT_FALSE;
+            LOG_W("join attempt %u: %d; next in %d ms", g_attempts, result,
+                  (int)(g_next_attempt - rt_tick_get()));
         }
     }
 }
@@ -739,6 +1023,15 @@ static void heal_thread(void *parameter)
         {
             continue; /* no stick yet: usb_watchdog_thread's business */
         }
+        if (aicwf_usbh_busy && aicwf_usbh_busy())
+        {
+            /* the USB host is resetting the controller or re-enumerating: its recovery first */
+            pthread_mutex_lock(&g_lock);
+            g_heal_skips++;
+            g_progress = rt_tick_get();
+            pthread_mutex_unlock(&g_lock);
+            continue;
+        }
         streak = __atomic_load_n(&g_cmd_fail_streak, __ATOMIC_RELAXED);
         if (aicwf_usbh_in_silence_ms)
         {
@@ -761,6 +1054,11 @@ static void heal_thread(void *parameter)
         else if (g_want && !g_link_up && (rt_int32_t)(now - g_progress) >= WLAN_HEAL_STALL_MS)
         {
             reason = g_sta_ready ? "no scan/join progress" : "station did not start";
+        }
+        if (reason && (g_start_running || (rt_int32_t)(now - g_registered_at) < WLAN_HEAL_SETTLE_MS))
+        {
+            g_heal_skips++; /* a station start in progress, or a device that just arrived */
+            reason = RT_NULL;
         }
         if (!reason || (rt_int32_t)(now - g_heal_next) < 0)
         {
@@ -828,10 +1126,11 @@ void aicwf_wifi_fwdiag(void)
 {
     static const char *const modes[] = { "auto (MCU1 -> legacy SDK V3)", "SDK 5.0", "legacy SDK V3" };
 
-    printf("wifi: D80 firmware set: %s; log level %s; self-heal %s, %u done (firmware command "
-           "failure streak %d)\n", modes[aicwf_d80_fw_mode % 3],
+    printf("wifi: D80 firmware set: %s; log level %s; self-heal %s, %u done, %u deferred (firmware command "
+           "failure streak %d); station registrations %u, start failures %u%s\n", modes[aicwf_d80_fw_mode % 3],
            rt_shim_log_level >= DBG_LOG ? "debug" : "normal", aicwf_self_heal ? "on" : "off", g_heals,
-           __atomic_load_n(&g_cmd_fail_streak, __ATOMIC_RELAXED));
+           g_heal_skips, __atomic_load_n(&g_cmd_fail_streak, __ATOMIC_RELAXED), g_registrations, g_start_fails,
+           aic8800_firmware_warm_attach() ? ", firmware attached warm" : "");
     aicwf_fw_dump();
     aicwf_usbh_dump();
 }
@@ -947,7 +1246,7 @@ int aicwf_wifi_scan(struct aicwf_wifi_bss *out, int max, int timeout_ms)
         return -RT_EINVAL;
     }
     pthread_mutex_lock(&g_scan_lock);
-    count = do_scan(RT_NULL, timeout_ms > 0 ? timeout_ms : WLAN_SCAN_TIMEOUT_MS);
+    count = do_scan(RT_NULL, timeout_ms > 0 ? timeout_ms : WLAN_SCAN_TIMEOUT_MS, 0, RT_802_11_BAND_UNKNOWN);
     if (count > 0)
     {
         pthread_mutex_lock(&g_lock);
