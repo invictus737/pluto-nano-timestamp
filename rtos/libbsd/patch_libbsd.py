@@ -168,6 +168,59 @@ def ehci_c(s):
         return s
     return s + """
 """ + POLL_MARK + """
+unsigned ehci_zynq_ring_repairs;
+
+/*
+ * The async ring as the controller walks it must match the software list (head -> next ... ->
+ * sc_async_p_last -> head). Seen on the Pluto: the head QH linked to itself while the live QHs
+ * hung off a removed one, so the controller never fetched them and every transfer timed out.
+ * Re-link from the software list; splice a chain left behind a removed QH back after the last
+ * reachable one. Bus lock held.
+ */
+static void
+ehci_zynq_async_check(ehci_softc_t *sc)
+{
+	struct usb_page_search buf_res;
+	ehci_qh_t *head, *q, *z;
+	int n;
+
+	usbd_get_page(&sc->sc_hw.async_start_pc, 0, &buf_res);
+	head = buf_res.buffer;
+	q = head;
+	for (n = 0; q->next != NULL && n < 128; ++n) {
+		if (q->qh_link != q->next->qh_self) {
+			q->qh_link = q->next->qh_self;
+			usb_pc_cpu_flush(q->page_cache);
+			ehci_zynq_ring_repairs++;
+		}
+		q = q->next;
+	}
+	if (q != sc->sc_async_p_last && sc->sc_async_p_last != NULL) {
+		/* the tail is not reachable: find the detached root behind it */
+		for (z = sc->sc_async_p_last, n = 0; z->prev != NULL && z->prev != q && n < 128; ++n)
+			z = z->prev;
+		if (z->prev == NULL && z != head) {
+			ehci_qh_t *first = z->next;
+			z->next = NULL;
+			if (first != NULL) {
+				q->next = first;
+				first->prev = q;
+				q->qh_link = first->qh_self;
+				usb_pc_cpu_flush(q->page_cache);
+				for (n = 0; q->next != NULL && n < 128; ++n)
+					q = q->next;
+			}
+			ehci_zynq_ring_repairs++;
+		}
+		sc->sc_async_p_last = q;
+	}
+	if (q->qh_link != head->qh_self) {
+		q->qh_link = head->qh_self;
+		usb_pc_cpu_flush(q->page_cache);
+		ehci_zynq_ring_repairs++;
+	}
+}
+
 int
 ehci_zynq_poll(ehci_softc_t *sc)
 {
@@ -175,6 +228,7 @@ ehci_zynq_poll(ehci_softc_t *sc)
 	int done = 0;
 
 	USB_BUS_LOCK(&sc->sc_bus);
+	ehci_zynq_async_check(sc);
 repeat:
 	TAILQ_FOREACH(xfer, &sc->sc_bus.intr_q.head, wait_entry) {
 		if (ehci_check_transfer(xfer)) {
