@@ -1588,6 +1588,9 @@ static void hc_uframe(void)
         if (!(R.usbcmd & CMD_RS)) {
             R.usbsts |= STS_HCH;
             R.usbsts &= ~(STS_AS | STS_PS);
+            if (g_sim_cfg.wedge == 2) {
+                g_sim_cfg.wedge = 0; /* a transient wedge: the halted engine follows its enables again */
+            }
             g_cur = 0;
             cache_drop();
             g_as_epoch++;

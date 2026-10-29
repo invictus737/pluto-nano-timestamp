@@ -52,6 +52,7 @@ static struct usb_setup_packet *g_setup;
 static uint8_t *g_ctlbuf;
 static struct usbh_urb g_ctl_urb;
 static int g_stop;
+static int g_toggle_noise; /* wk_submit: a random urb->data_toggle (a class driver's stale copy) */
 
 static struct usb_endpoint_descriptor g_ep_out_data, g_ep_out_msg, g_ep_in_data, g_ep_in_msg, g_ep_evt,
     g_ep_acl_in, g_ep_acl_out;
@@ -182,7 +183,7 @@ static void wk_submit(struct wk *w)
     } else {
         usbh_bulk_urb_fill(&w->urb, &g_hp, w->ep, w->buf, len, 0, wk_done, w);
     }
-    w->urb.data_toggle = w->st->toggle;
+    w->urb.data_toggle = g_toggle_noise ? (uint8_t)(sim_rand() & 1) : w->st->toggle;
     w->busy = 1;
     rc = usbh_submit_urb(&w->urb);
     if (rc != 0) {
@@ -603,6 +604,43 @@ static void hot_path(int stale, uint32_t nak, const char *tag)
 }
 
 static void t_hot_path(void) { hot_path(0, 0, "hot path"); }
+
+/*
+ * A class driver (the AIC adapter re-applies its per-endpoint toggle before every submit) whose
+ * urb->data_toggle lags or contradicts the QH overlay: the toggle of a linked pipe belongs to
+ * the controller (DTC = 0), so no schedule stop, no toggle error, no data lost.
+ */
+static void t_toggle_stale_every_submit(void)
+{
+    uint32_t astops0, pstops0, ign0;
+
+    bringup();
+    enumerate(22);
+    start_wifi(4, 2);
+    s_out.limit = 3000;
+    w_mout.st->limit = 300;
+    sim_dev_in_enqueue(0x81, 3000, 20, 1600);
+    pump_us(20000); /* every pipe opened with the right toggle */
+    astops0 = H()->stats.async_stops;
+    pstops0 = H()->stats.periodic_stops;
+    ign0 = H()->stats.toggle_ignored;
+    g_toggle_noise = 1;
+    for (int i = 0; i < 3000 && (s_out.frames < 3000 || s_in.frames < 3000 || s_min.frames < 300); i++) {
+        pump_us(1000);
+    }
+    g_toggle_noise = 0;
+    CHECKV(s_out.frames == 3000 && s_in.frames == 3000 && s_min.frames == 300, "OUT %lu IN %lu msg %lu",
+           (unsigned long)s_out.frames, (unsigned long)s_in.frames, (unsigned long)s_min.frames);
+    CHECKV(H()->stats.async_stops == astops0, "%u async schedule stops from URB toggles (causes: toggle %u)",
+           H()->stats.async_stops - astops0, H()->stats.async_stop_cause[EHCI_NXP_STOP_TOGGLE]);
+    CHECK(H()->stats.periodic_stops == pstops0);
+    CHECKV(H()->stats.toggle_ignored > ign0 + 10, "toggle_ignored %u", H()->stats.toggle_ignored - ign0);
+    check_wifi_integrity();
+    check_accounting("stale toggles");
+    check_no_violations();
+    print_stats("stale toggle on every submit");
+    close_all_and_check();
+}
 static void t_hot_path_stale_nak(void) { hot_path(1, 250, "hot path, stale QH cache, 25% NAK"); }
 
 /* several bulk IN URBs queued on one endpoint, NAKing device that answers late */
@@ -1264,7 +1302,16 @@ static void t_selftest_toggle_dma(void)
     wk_submit(&w_out[0]);
     pump_us(2000);
     CHECK(s_out.frames == 1 && s_out.toggle == 1);
-    s_out.toggle = 0; /* bad: the class driver forgets the toggle */
+    /* bad: the toggle of the idle QH changed behind the controller's back (DTC = 0) */
+    {
+        size_t f = usb_osal_enter_critical_section();
+        struct ehci_nxp_pipe *p = ehci_nxp_pipe_find(B, &g_hp, 0x01, USB_ENDPOINT_TYPE_BULK);
+        CHECK(p != NULL);
+        if (p) {
+            p->qh->hw.overlay.token ^= QTD_TOKEN_TOGGLE;
+        }
+        usb_osal_leave_critical_section(f);
+    }
     wk_submit(&w_out[0]);
     pump_us(2000);
     CHECKV(g_viol[V_TOGGLE] > 0, "model missed a data toggle mismatch");
@@ -1291,6 +1338,7 @@ static const struct {
     { "selftest_toggle_dma", t_selftest_toggle_dma },
     { "enumeration", t_enumeration },
     { "hot_path", t_hot_path },
+    { "toggle_stale_every_submit", t_toggle_stale_every_submit },
     { "hot_path_stale_nak", t_hot_path_stale_nak },
     { "multi_in", t_multi_in },
     { "kill", t_kill },

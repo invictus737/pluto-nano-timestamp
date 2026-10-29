@@ -117,7 +117,7 @@
  * no reset was possible)
  */
 #ifndef CONFIG_USB_EHCI_NXP_KILL_WAIT_MS
-#define CONFIG_USB_EHCI_NXP_KILL_WAIT_MS 250
+#define CONFIG_USB_EHCI_NXP_KILL_WAIT_MS 1000
 #endif
 #ifndef CONFIG_USB_EHCI_NXP_RECOVER_WAIT_MS
 #define CONFIG_USB_EHCI_NXP_RECOVER_WAIT_MS 2000
@@ -125,10 +125,39 @@
 #ifndef CONFIG_USB_EHCI_NXP_ORPHAN_MS
 #define CONFIG_USB_EHCI_NXP_ORPHAN_MS 5000
 #endif
-/* deferred work (a stuck stop, a deferred cancel/close) older than this resets the controller */
+/*
+ * A schedule stop that has not completed after this long is a wedged core, not a slow one: the
+ * schedule restart (RUN off/on, ehci_nxp_restart()) follows. EHCI 1.0 4.8 sets no bound on the
+ * AS/PS transition; a slow one (seen > 100 ms on the Zynq ChipIdea) is waited for, deferred,
+ * never answered with a reset.
+ */
 #ifndef CONFIG_USB_EHCI_NXP_PENDING_MAX_MS
-#define CONFIG_USB_EHCI_NXP_PENDING_MAX_MS 250
+#define CONFIG_USB_EHCI_NXP_PENDING_MAX_MS 1000
 #endif
+/*
+ * Schedule restart (level 1, ehci_nxp_restart()): RUN off, wait for HCH, finish the deferred
+ * work on the halted controller, RUN on. The port, the device address and every pipe stay; the
+ * bus carries no SOF only while halted, which must stay below the 3 ms after which a device
+ * suspends (USB 2.0 7.1.7.6): HCH is awaited by spinning at most this long, else RUN goes back
+ * on and the controller reset (level 2) follows.
+ */
+#ifndef CONFIG_USB_EHCI_NXP_HALT_SPIN_US
+#define CONFIG_USB_EHCI_NXP_HALT_SPIN_US 1500
+#endif
+/* a second wedge within this long of a schedule restart goes to the controller reset */
+#ifndef CONFIG_USB_EHCI_NXP_RESTART_QUICK_MS
+#define CONFIG_USB_EHCI_NXP_RESTART_QUICK_MS 10000
+#endif
+/* controller resets within this window: the third one is board level (SLCR + ULPI PHY + VBUS) */
+#ifndef CONFIG_USB_EHCI_NXP_RESET_WINDOW_MS
+#define CONFIG_USB_EHCI_NXP_RESET_WINDOW_MS 60000
+#endif
+/* handshake-miss diagnostics (PORTSC, ULPI PHY registers, the stop ring): once per incident,
+ * an incident ending after this long without a miss */
+#ifndef CONFIG_USB_EHCI_NXP_DIAG_QUIET_MS
+#define CONFIG_USB_EHCI_NXP_DIAG_QUIET_MS 10000
+#endif
+#define EHCI_NXP_STOP_RING 32
 /* hports of the dead controller remembered until their release (stale URBs refused) */
 #ifndef CONFIG_USB_EHCI_NXP_STALE_HPORTS
 #define CONFIG_USB_EHCI_NXP_STALE_HPORTS 8
@@ -207,6 +236,28 @@ struct ehci_nxp_pipe {
     uint32_t gen;                 /* incremented at every open */
 };
 
+/* why a schedule was stopped (struct ehci_nxp_stats async_stop_cause/periodic_stop_cause) */
+enum ehci_nxp_stop_cause {
+    EHCI_NXP_STOP_TOGGLE,    /* data toggle reset of an idle pipe after CLEAR_FEATURE(ENDPOINT_HALT) */
+    EHCI_NXP_STOP_CANCEL,    /* usbh_kill_urb() or a synchronous URB that timed out */
+    EHCI_NXP_STOP_CLOSE,     /* pipe closed (device released, new interrupt interval) */
+    EHCI_NXP_STOP_EP_UPDATE, /* endpoint characteristics rewritten (EP0 address/max packet) */
+    EHCI_NXP_STOP_SERVICE,   /* deferred cancel/close or a stuck stop finished later */
+    EHCI_NXP_STOP_SUSPEND,   /* root port suspend */
+    EHCI_NXP_STOP_CAUSES
+};
+extern const char *const g_ehci_nxp_stop_cause_name[EHCI_NXP_STOP_CAUSES];
+
+/* one schedule stop (ring of the last EHCI_NXP_STOP_RING, printed with the miss diagnostics) */
+struct ehci_nxp_stop_rec {
+    uint32_t t_us;      /* start of the stop */
+    uint32_t lat_us;    /* until AS/PS read 0, or until the caller gave up */
+    uint8_t cause;      /* enum ehci_nxp_stop_cause */
+    uint8_t group;      /* 0 async, 1 periodic */
+    uint8_t ep;         /* endpoint of the pipe (0xff: none) */
+    uint8_t result;     /* 0 stopped, 1 missed (deferred), 2 deferred retry still stuck */
+};
+
 struct ehci_nxp_stats {
     uint32_t pipes_opened, pipes_closed;
     uint32_t submits, completions, errors, kills;
@@ -235,6 +286,18 @@ struct ehci_nxp_stats {
     uint32_t recover_failures;
     uint32_t last_recover_ms;     /* duration of the last reset */
     uint32_t max_handshake_us;
+    uint32_t async_stop_cause[EHCI_NXP_STOP_CAUSES], periodic_stop_cause[EHCI_NXP_STOP_CAUSES];
+    uint32_t toggle_ignored;      /* URB data_toggle differed from the QH overlay: not written (DTC = 0) */
+    uint32_t slow_stops;          /* stops that missed the handshake bound and completed later */
+    uint32_t max_slow_stop_us;    /* longest such stop, start to AS/PS = 0 */
+    uint32_t restarts;            /* schedule restarts (RUN off/on, ehci_nxp_restart()) */
+    uint32_t restart_failures;    /* ... that did not bring the schedules back: controller reset */
+    uint32_t last_restart_us;     /* duration of the last one (HCH-to-RUN window included) */
+    uint32_t max_halt_us;         /* longest bus idle (RUN off to RUN on) of a restart */
+    uint32_t xacterr_in, xacterr_out; /* XACTERR restarts by direction */
+    uint32_t last_xacterr_token;  /* qTD token of the last XACTERR */
+    uint8_t last_xacterr_ep;
+    uint32_t diag_dumps;          /* handshake-miss diagnostics printed */
 };
 
 struct ehci_nxp_hcd {
@@ -268,6 +331,16 @@ struct ehci_nxp_hcd {
     uint8_t gate;                 /* after a reset: no URB until the hub thread resets a root port */
     uint8_t forced_csc;           /* root ports reporting a connection change after a reset */
     uint8_t hs_miss_run;          /* consecutive handshake misses */
+    uint8_t restart_req;          /* schedule restart wanted (a stop or cancel that never completes) */
+    uint8_t restarting;           /* ehci_nxp_restart() running */
+    uint8_t diag_req;             /* a handshake miss opened an incident: the glue prints diagnostics */
+    uint8_t stop_head;            /* next slot of stop_ring */
+    uint32_t first_miss_us;       /* first miss of the current run */
+    uint32_t last_miss_us;
+    uint32_t stuck_since_us[2];   /* start of the stop that left the group stuck */
+    uint32_t last_restart_at_us;  /* when the last schedule restart ran (0: never) */
+    uint32_t reset_at_us[3];      /* the last three controller resets (oldest first) */
+    struct ehci_nxp_stop_rec stop_ring[EHCI_NXP_STOP_RING];
     uint32_t recover_after_us;    /* backoff: not before this time */
     uint32_t last_recover_us;
     uint32_t backoff_ms;
@@ -302,6 +375,19 @@ void ehci_nxp_service(struct usbh_bus *bus);
 void ehci_nxp_recover(struct usbh_bus *bus);
 /* ask for a controller reset (run by ehci_nxp_service(): interrupt thread or glue poll) */
 void ehci_nxp_request_recover(struct usbh_bus *bus);
+/*
+ * Schedule restart (level 1; run by the glue poll like the reset): RUN off, HCH within
+ * CONFIG_USB_EHCI_NXP_HALT_SPIN_US, the deferred cancels/closes finished on the halted
+ * controller, RUN on, AS/PS awaited. Port, device and pipes stay. A failure, or a second wedge
+ * within CONFIG_USB_EHCI_NXP_RESTART_QUICK_MS, asks for the controller reset (level 2).
+ */
+void ehci_nxp_request_restart(struct usbh_bus *bus);
+/*
+ * Glue poll: 1 once per handshake-miss incident (clears the request); the glue then prints
+ * PORTSC, the ULPI PHY registers and ehci_nxp_dump_stops().
+ */
+int ehci_nxp_take_diag(struct usbh_bus *bus);
+void ehci_nxp_dump_stops(struct usbh_bus *bus);
 
 /* glue (port/usb_glue_zynq.c) */
 /* weak, default none: drive VBUS again after a board-level reset (ULPI PHY reset) */

@@ -37,7 +37,8 @@ struct sim_cfg {
                                   outermost critical section (models the IRQ thread) */
     uint32_t port_reset_ms;    /* ChipIdea: PORTSC.PR self-clears after this */
     unsigned seed;
-    int wedge;                 /* USBSTS.AS/PS stop following ASE/PSE until HCRESET (wedged core) */
+    int wedge;                 /* USBSTS.AS/PS stop following ASE/PSE until HCRESET (wedged core);
+                                  2: until the controller halts (RUN off) */
 };
 extern struct sim_cfg g_sim_cfg;
 

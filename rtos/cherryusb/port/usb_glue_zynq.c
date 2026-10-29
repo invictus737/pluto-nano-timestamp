@@ -321,6 +321,44 @@ void usb_dcache_flush(uintptr_t addr, size_t size)
 }
 #endif
 
+#ifdef USB_HC_EHCI_NXP
+/*
+ * Once per schedule-handshake-miss incident (ehci_nxp_take_diag()), from the poll thread with no
+ * lock held: the root port and the ULPI PHY as the controller sees them, to tell a slow or wedged
+ * async engine on a healthy link from a PHY that lost its clock, VBUS or reset (supply
+ * disturbance), then the last schedule stops with their causes and AS/PS latencies.
+ */
+static void zynq_usb_miss_diag(struct usbh_bus *bus)
+{
+    static const struct {
+        uint8_t addr;
+        const char *name;
+    } regs[] = { { 0x00, "VID.L" }, { 0x01, "VID.H" }, { 0x02, "PID.L" }, { 0x03, "PID.H" },
+                 { 0x04, "FuncCtrl" }, { 0x07, "IfCtrl" }, { 0x0a, "OTGCtrl" }, { 0x13, "IntStatus" },
+                 { 0x14, "IntLatch" }, { 0x15, "Debug" } };
+    uint32_t ps = REG32(ZY7_USB_PORTSC1);
+    const struct ehci_nxp_stats *ns = &g_ehci_nxp[0].stats;
+    char line[200];
+    int o = 0;
+
+    printf("usbh: schedule handshake missed (%lu so far, longest %lu us, slow stops %lu longest %lu us): "
+           "USBCMD 0x%08lx USBSTS 0x%08lx PORTSC1 0x%08lx (CCS %lu PE %lu SUSP %lu PR %lu PP %lu line %lu%lu "
+           "speed %lu PHCD %lu)\n", (unsigned long)ns->handshake_timeouts, (unsigned long)ns->max_handshake_us,
+           (unsigned long)ns->slow_stops, (unsigned long)ns->max_slow_stop_us, (unsigned long)REG32(ZY7_USB_USBCMD),
+           (unsigned long)REG32(ZY7_USB_USBSTS), (unsigned long)ps, (unsigned long)(ps & 1),
+           (unsigned long)((ps >> 2) & 1), (unsigned long)((ps >> 7) & 1), (unsigned long)((ps >> 8) & 1),
+           (unsigned long)((ps >> 12) & 1), (unsigned long)((ps >> 11) & 1), (unsigned long)((ps >> 10) & 1),
+           (unsigned long)((ps >> PORTSC_PSPD_SHIFT) & 3), (unsigned long)((ps >> 23) & 1));
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]) && o < (int)sizeof(line) - 20; i++) {
+        int v = zynq_ulpi_read(regs[i].addr);
+
+        o += snprintf(line + o, sizeof(line) - o, v < 0 ? " %s=--" : " %s=%02x", regs[i].name, v);
+    }
+    printf("usbh: ULPI PHY:%s (-- = no viewport answer: PHY clock lost?)\n", line);
+    ehci_nxp_dump_stops(bus);
+}
+#endif
+
 /* ---- interrupt handler thread (also the lost-interrupt and IAA watchdog poll) ---- */
 
 static void *zynq_usb_irq_thread(void *arg)
@@ -340,7 +378,7 @@ static void *zynq_usb_irq_thread(void *arg)
     for (;;) {
         size_t flags;
         uint32_t sts, now;
-        bool woken;
+        bool woken, diag = false;
         const struct usbh_ehci_iaa_stats *st = &g_ehci_iaa_stats[bus->hcd.hcd_id];
 
         /* while a cycle runs, wake at least every 2 ms so the 10 ms watchdog is not late */
@@ -378,6 +416,9 @@ static void *zynq_usb_irq_thread(void *arg)
         (void)usbh_ehci_iaa_watchdog(bus->hcd.hcd_id);
         /* a parked asynchronous engine: schedule off/on with the ASS handshake (patches/0006) */
         (void)usbh_ehci_async_watchdog(bus->hcd.hcd_id);
+#ifdef USB_HC_EHCI_NXP
+        diag = ehci_nxp_take_diag(bus) != 0;
+#endif
 
         /* async engine parked on one QH (diagnostic only: ASYNCLISTADDR frozen while busy) */
         {
@@ -397,6 +438,13 @@ static void *zynq_usb_irq_thread(void *arg)
         if (woken) {
             (void)rtems_interrupt_vector_enable(ZYNQ_IRQ_USB_0);
         }
+#ifdef USB_HC_EHCI_NXP
+        if (diag) {
+            zynq_usb_miss_diag(bus);
+        }
+#else
+        (void)diag;
+#endif
 
         /* port change without its interrupt: let the hub thread look (twice a second at most) */
         if ((uint32_t)(now - last_port_kick) >= 500000U && (REG32(ZY7_USB_PORTSC1) & PORTSC_CSC)) {
@@ -598,6 +646,23 @@ int nexus_cherryusb_shell(int argc, char **argv)
         printf("ehci-nxp: board-level resets %lu, stuck deferred work %lu, stale-device URBs refused %lu, "
                "DMA halts %lu\n", (unsigned long)ns->board_resets, (unsigned long)ns->stuck_pending,
                (unsigned long)ns->stale_refused, (unsigned long)ns->dma_halts);
+        printf("ehci-nxp: async stops by cause:");
+        for (int c = 0; c < EHCI_NXP_STOP_CAUSES; c++) {
+            printf(" %s %lu", g_ehci_nxp_stop_cause_name[c], (unsigned long)ns->async_stop_cause[c]);
+        }
+        printf("; periodic:");
+        for (int c = 0; c < EHCI_NXP_STOP_CAUSES; c++) {
+            printf(" %s %lu", g_ehci_nxp_stop_cause_name[c], (unsigned long)ns->periodic_stop_cause[c]);
+        }
+        printf("\nehci-nxp: URB toggles ignored %lu, slow stops %lu (longest %lu us), schedule restarts %lu "
+               "(failed %lu, last %lu us, longest bus idle %lu us), miss diagnostics %lu\n",
+               (unsigned long)ns->toggle_ignored, (unsigned long)ns->slow_stops, (unsigned long)ns->max_slow_stop_us,
+               (unsigned long)ns->restarts, (unsigned long)ns->restart_failures, (unsigned long)ns->last_restart_us,
+               (unsigned long)ns->max_halt_us, (unsigned long)ns->diag_dumps);
+        printf("ehci-nxp: XACTERR restarts IN %lu OUT %lu, last on ep 0x%02x token 0x%08lx\n",
+               (unsigned long)ns->xacterr_in, (unsigned long)ns->xacterr_out, (unsigned)ns->last_xacterr_ep,
+               (unsigned long)ns->last_xacterr_token);
+        ehci_nxp_dump_stops(&g_usbhost_bus[0]);
     }
 #endif
     if (aicwf_cherry_stats) {

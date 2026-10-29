@@ -1140,6 +1140,109 @@ static void t_qa_stuck_stop(void)
     close_all_and_check();
 }
 
+/*
+ * A slow schedule handshake (AS follows ASE only after 300 ms, beyond the 100 ms bound) is not a
+ * fault: the cancel is deferred and completes when AS reads 0; no schedule restart, no reset.
+ */
+static void t_qa_slow_handshake(void)
+{
+    uint32_t r, rs, slow0, opened0;
+    struct wk *w = NULL;
+
+    bringup();
+    enumerate(96);
+    start_wifi(4, 2);
+    pump_glue_us(20000);
+    traffic_flows("before");
+    r = H()->stats.recoveries;
+    rs = H()->stats.restarts;
+    slow0 = H()->stats.slow_stops;
+    opened0 = H()->stats.pipes_opened;
+    for (int i = 0; i < 4 && !w; i++) {
+        if (w_in[i].busy) {
+            w = &w_in[i];
+        }
+    }
+    CHECK(w != NULL);
+    g_sim_cfg.as_delay_uf = 2400; /* 300 ms */
+    if (w) {
+        w->want = 0;
+        wk_kill(w);
+        CHECK(!w->busy);
+        w->want = 1;
+        wk_submit(w);
+    }
+    pump_glue_us(800000);
+    g_sim_cfg.as_delay_uf = 1;
+    pump_glue_us(20000);
+    printf("  slow handshake: misses %u, slow stops %u (longest %u us), restarts %u, resets %u, deferred %u\n",
+           H()->stats.handshake_timeouts, H()->stats.slow_stops - slow0, H()->stats.max_slow_stop_us,
+           H()->stats.restarts - rs, H()->stats.recoveries - r, H()->stats.deferred);
+    CHECK(H()->stats.handshake_timeouts > 0);
+    CHECK(H()->stats.slow_stops > slow0 && H()->stats.max_slow_stop_us >= 250000);
+    CHECKV(H()->stats.restarts == rs && H()->stats.recoveries == r, "restarts %u resets %u",
+           H()->stats.restarts - rs, H()->stats.recoveries - r);
+    CHECK(H()->stats.pipes_opened == opened0); /* the same pipes: no re-enumeration */
+    traffic_flows("after a slow handshake");
+    check_accounting("slow handshake");
+    sim_viol_clear(); /* the forced AS lag is not a driver violation */
+    close_all_and_check();
+}
+
+/*
+ * A core whose AS stops following ASE until it halts: the stuck cancel ends with a schedule
+ * restart (RUN off/on within the 3 ms suspend bound); the device, its address and its pipes
+ * stay, traffic resumes, no controller reset.
+ */
+static void t_qa_transient_wedge(void)
+{
+    uint32_t r, rs, opened0;
+    struct wk *w = NULL;
+    uint64_t t0;
+
+    bringup();
+    enumerate(97);
+    start_wifi(4, 2);
+    pump_glue_us(20000);
+    traffic_flows("before");
+    r = H()->stats.recoveries;
+    rs = H()->stats.restarts;
+    opened0 = H()->stats.pipes_opened;
+    for (int i = 0; i < 4 && !w; i++) {
+        if (w_in[i].busy) {
+            w = &w_in[i];
+        }
+    }
+    CHECK(w != NULL);
+    g_sim_cfg.wedge = 2;
+    t0 = sim_now_ns();
+    if (w) {
+        w->want = 0;
+        wk_kill(w);
+    }
+    for (int ms = 0; ms < 5000 && (H()->stats.restarts == rs || (w && w->busy)); ms++) {
+        pump_glue_us(1000);
+    }
+    printf("  transient wedge: restart after %.0f ms (last %u us, longest bus idle %u us), resets %u\n",
+           (sim_now_ns() - t0) / 1e6, H()->stats.last_restart_us, H()->stats.max_halt_us,
+           H()->stats.recoveries - r);
+    CHECK(g_sim_cfg.wedge == 0);
+    CHECK(w && !w->busy);
+    CHECKV(H()->stats.restarts == rs + 1 && H()->stats.restart_failures == 0, "restarts %u failures %u",
+           H()->stats.restarts - rs, H()->stats.restart_failures);
+    CHECKV(H()->stats.recoveries == r, "controller resets %u", H()->stats.recoveries - r);
+    CHECK(H()->stats.max_halt_us < 3000);
+    CHECK(H()->stats.pipes_opened == opened0);
+    if (w) {
+        w->want = 1;
+        wk_submit(w);
+    }
+    traffic_flows("after the schedule restart");
+    check_accounting("transient wedge");
+    sim_viol_clear();
+    close_all_and_check();
+}
+
 /* USB-C hot swap: unplug/replug every 5..60 ms, also in the middle of enumeration and transfers */
 static void t_qa_hotplug_rate(void)
 {
@@ -1245,6 +1348,8 @@ static const struct {
     { "qa_unplug_during_reset", t_qa_unplug_during_reset },
     { "qa_gate_stale_window", t_qa_gate_stale_window },
     { "qa_stuck_stop", t_qa_stuck_stop },
+    { "qa_slow_handshake", t_qa_slow_handshake },
+    { "qa_transient_wedge", t_qa_transient_wedge },
     { "qa_hotplug_rate", t_qa_hotplug_rate },
     { "qa_soak", t_qa_soak },
 };

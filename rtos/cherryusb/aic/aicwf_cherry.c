@@ -371,6 +371,8 @@ static void ep_kick(struct nx_ep *ep)
         urb->transfer_buffer = req->bounce ? req->bounce : req->buf;
         urb->transfer_buffer_length = req->len;
         urb->timeout = 0;
+        /* the controller keeps the toggle of an open pipe (EHCI QH overlay, DTC = 0): ehci_nxp
+         * uses this one only when the endpoint's pipe is (re)opened, never on a live QH */
         urb->data_toggle = ep->toggle;
         urb->errorcode = 0;
         urb->hcpriv = NULL;
