@@ -1,0 +1,672 @@
+/*
+ * QA tests of the ehci_nxp driver, on top of the base harness (test_ehci_nxp.c is included
+ * unchanged, its main renamed). Built by qa_run.sh with a counting register hook (qa_regs.h)
+ * and the critical section wrapped (-Wl,--wrap) to measure its hold time in simulated time.
+ *
+ *   qa_idle_60s        armed Wi-Fi/BT receive URBs, NAKing device, 60 s: interrupts, register
+ *                      accesses, schedule stops, glue wakeups (1 s watchdog model)
+ *   qa_steady_cost     BT events + ACL + Wi-Fi: per-completion register accesses, barriers,
+ *                      critical-section hold, no schedule stop/toggle rewrite in steady state
+ *   qa_int_interval    HS interrupt bInterval 1..16: frame list placement, S-mask, measured poll rate
+ *   qa_pages_zlp       bulk OUT/IN 1..60000 bytes at any 32-byte offset (page crossing, several
+ *                      qTDs, short packet via alt-next), 512-multiple OUT followed by a ZLP URB
+ *   qa_deferred_kill   the AIC adapter's kill loop (aicwf_cherry_kill_urb: usbh_kill_urb() under
+ *                      the critical section until the request leaves REQ_HW) when the schedule
+ *                      handshake is missed
+ *   qa_error_storm     XACTERR/NAK/STALL storm on every pipe, then recovery without reset
+ *   qa_soak            replug + re-enumeration WITHOUT controller reset, random NAK/latency/
+ *                      errors/AS lag/kills, until QA_SOAK completions (default 300000)
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#define main ehci_nxp_base_main
+#include "test_ehci_nxp.c"
+#undef main
+
+uint64_t g_qa_reg_rd, g_qa_reg_wr;
+
+/* ---- critical section hold time (simulated ns; register accesses and spins advance time) ---- */
+size_t __real_usb_osal_enter_critical_section(void);
+void __real_usb_osal_leave_critical_section(size_t flag);
+static uint64_t g_crit_t0, g_crit_max_ns, g_crit_total_ns, g_crit_enters;
+
+size_t __wrap_usb_osal_enter_critical_section(void)
+{
+    if (g_sim_crit == 0) {
+        g_crit_t0 = sim_now_ns();
+        g_crit_enters++;
+    }
+    return __real_usb_osal_enter_critical_section();
+}
+
+void __wrap_usb_osal_leave_critical_section(size_t flag)
+{
+    if (g_sim_crit == 1) {
+        uint64_t d = sim_now_ns() - g_crit_t0;
+        g_crit_total_ns += d;
+        if (d > g_crit_max_ns) {
+            g_crit_max_ns = d;
+        }
+    }
+    __real_usb_osal_leave_critical_section(flag);
+}
+
+struct qa_snap {
+    uint64_t rd, wr, irq, barriers, crit_enters, uframes;
+    struct ehci_nxp_stats st;
+};
+
+static struct qa_snap qa_snap(void)
+{
+    struct qa_snap s = { g_qa_reg_rd, g_qa_reg_wr, g_sim_stats.irq_calls, g_sim_barriers, g_crit_enters,
+                         g_sim_stats.uframes, H()->stats };
+    return s;
+}
+
+/* the glue's poll (usb_glue_zynq.c): every 1 s, every 2 ms while work is pending */
+static uint32_t g_glue_wakeups, g_glue_fast_wakeups;
+static void glue_poll(void)
+{
+    size_t f = usb_osal_enter_critical_section();
+    g_glue_wakeups++;
+    if (usbh_ehci_iaa_pending(0)) {
+        g_glue_fast_wakeups++;
+    }
+    (void)usbh_ehci_async_watchdog(0);
+    usb_osal_leave_critical_section(f);
+}
+
+/* pump with the glue poll modelled (1 s idle period, 2 ms while pending) */
+static void pump_glue_us(uint64_t us)
+{
+    static uint64_t next_poll;
+    uint64_t end = sim_now_ns() + us * 1000ULL;
+    while (sim_now_ns() < end) {
+        pump_us(125);
+        if (next_poll == 0 || sim_now_ns() >= next_poll) {
+            glue_poll();
+            next_poll = sim_now_ns() + (usbh_ehci_iaa_pending(0) ? 2000000ULL : 1000000000ULL);
+        } else if (usbh_ehci_iaa_pending(0) && next_poll > sim_now_ns() + 2000000ULL) {
+            next_poll = sim_now_ns() + 2000000ULL;
+        }
+    }
+}
+
+static void arm_receivers(void)
+{
+    stream_init(&s_in, 0x81, 0, 0);
+    stream_init(&s_min, 0x82, 0, 0);
+    stream_init(&s_evt, 0x83, 0, 0);
+    stream_init(&s_ain, 0x84, 0, 0);
+    for (int i = 0; i < 4; i++) {
+        wk_init(&w_in[i], &g_ep_in_data, &s_in, 4096);
+        w_in[i].want = 1;
+        wk_register(&w_in[i]);
+    }
+    for (int i = 0; i < 2; i++) {
+        wk_init(&w_min[i], &g_ep_in_msg, &s_min, 1024);
+        w_min[i].want = 1;
+        wk_register(&w_min[i]);
+        wk_init(&w_ain[i], &g_ep_acl_in, &s_ain, 4096);
+        w_ain[i].want = 1;
+        wk_register(&w_ain[i]);
+    }
+    wk_init(&w_evt, &g_ep_evt, &s_evt, 4096);
+    w_evt.rx = rx_events;
+    w_evt.want = 1;
+    wk_register(&w_evt);
+}
+
+/* ================= idle ================= */
+static void t_qa_idle_60s(void)
+{
+    struct qa_snap a, b;
+
+    bringup();
+    enumerate(30);
+    g_cc_expected = g_cc_got = g_ncp_pkts = g_evt_bad = 0;
+    g_cc_head = g_cc_tail = 0;
+    arm_receivers();
+    pump_us(20000);
+    CHECK(busy_workers() == 9);
+    g_glue_wakeups = g_glue_fast_wakeups = 0;
+    a = qa_snap();
+    g_crit_max_ns = 0;
+    pump_glue_us(60ULL * 1000000ULL);
+    b = qa_snap();
+    printf("  idle 60 s, 9 receive URBs armed (4 Wi-Fi data, 2 msg, BT event, 2 ACL), device NAKs:\n"
+           "    interrupts %lu, driver register reads %lu writes %lu, barriers %lu, critical sections %lu,\n"
+           "    async stops %u periodic stops %u toggle rewrites %u handshake sleeps %u, glue wakeups %u (fast %u),\n"
+           "    HC NAKed polls %lu (no CPU), max critical section %.1f us\n",
+           (unsigned long)(b.irq - a.irq), (unsigned long)(b.rd - a.rd), (unsigned long)(b.wr - a.wr),
+           (unsigned long)(b.barriers - a.barriers), (unsigned long)(b.crit_enters - a.crit_enters),
+           b.st.async_stops - a.st.async_stops, b.st.periodic_stops - a.st.periodic_stops,
+           b.st.toggle_sets - a.st.toggle_sets, b.st.handshake_sleeps - a.st.handshake_sleeps, g_glue_wakeups,
+           g_glue_fast_wakeups, (unsigned long)g_sim_stats.naks, g_crit_max_ns / 1e3);
+    CHECKV(b.irq == a.irq, "%lu interrupts while idle", (unsigned long)(b.irq - a.irq));
+    CHECKV(b.rd + b.wr == a.rd + a.wr, "%lu driver register accesses while idle",
+           (unsigned long)(b.rd + b.wr - a.rd - a.wr));
+    CHECK(b.st.async_stops == a.st.async_stops && b.st.periodic_stops == a.st.periodic_stops);
+    CHECKV(g_glue_wakeups <= 61 && g_glue_fast_wakeups == 0, "glue wakeups %u fast %u", g_glue_wakeups,
+           g_glue_fast_wakeups);
+    CHECK(busy_workers() == 9);
+    check_accounting("idle");
+    check_no_violations();
+    close_all_and_check();
+}
+
+/* ================= steady-state cost ================= */
+static void t_qa_steady_cost(void)
+{
+    struct qa_snap a, b;
+    uint64_t compl;
+    uint32_t acl_sent = 0;
+
+    bringup();
+    enumerate(31);
+    g_sim_cfg.stale_cache = 1;
+    g_dev_cfg.nak_permille = 50;
+    g_cc_expected = g_cc_got = g_ncp_pkts = g_evt_bad = 0;
+    g_cc_head = g_cc_tail = 0;
+    start_wifi(4, 2);
+    sim_dev_in_enqueue(0x81, 1000000, 20, 1600);
+    stream_init(&s_evt, 0x83, 0, 0);
+    wk_init(&w_evt, &g_ep_evt, &s_evt, 4096);
+    w_evt.rx = rx_events;
+    w_evt.want = 1;
+    wk_register(&w_evt);
+    stream_init(&s_ain, 0x84, 0, 0);
+    wk_init(&w_ain[0], &g_ep_acl_in, &s_ain, 4096);
+    w_ain[0].want = 1;
+    wk_register(&w_ain[0]);
+    stream_init(&s_aout, 0x03, 300, 1000);
+    wk_init(&w_aout, &g_ep_acl_out, &s_aout, 1024);
+    wk_register(&w_aout);
+    wk_submit(&w_aout);
+    acl_sent++;
+    pump_us(20000);
+    a = qa_snap();
+    g_crit_max_ns = 0;
+    g_crit_total_ns = 0;
+    for (int ms = 0; ms < 5000; ms++) {
+        if (ms % 25 == 3) {
+            CHECK(hci_cmd((uint16_t)(0x0C00 + (ms & 0xff))) == 4);
+        }
+        if (ms % 10 == 0 && !w_aout.busy) {
+            wk_submit(&w_aout);
+            acl_sent++;
+        }
+        if (ms % 20 == 0) {
+            sim_dev_in_enqueue(0x84, 1, 30, 1000);
+        }
+        pump_us(1000);
+    }
+    b = qa_snap();
+    compl = b.st.completions - a.st.completions;
+    printf("  steady 5 s Wi-Fi + BT: %lu completions, %lu interrupts (%.2f compl/irq)\n"
+           "    per completion: %.2f register reads %.2f writes, %.2f DMA barriers, %.2f critical sections\n"
+           "    critical section max %.1f us, total %.1f ms (%.2f %% of time, simulated MMIO cost)\n"
+           "    async stops %u periodic stops %u toggle rewrites %u handshake sleeps %u xacterr %u\n",
+           (unsigned long)compl, (unsigned long)(b.irq - a.irq), (double)compl / (double)(b.irq - a.irq + 1),
+           (double)(b.rd - a.rd) / compl, (double)(b.wr - a.wr) / compl, (double)(b.barriers - a.barriers) / compl,
+           (double)(b.crit_enters - a.crit_enters) / compl, g_crit_max_ns / 1e3, g_crit_total_ns / 1e6,
+           g_crit_total_ns / 1e7 / 5.0 * 1.0, b.st.async_stops - a.st.async_stops,
+           b.st.periodic_stops - a.st.periodic_stops, b.st.toggle_sets - a.st.toggle_sets,
+           b.st.handshake_sleeps - a.st.handshake_sleeps, b.st.xacterr_restarts - a.st.xacterr_restarts);
+    CHECK(b.st.async_stops == a.st.async_stops);
+    CHECK(b.st.periodic_stops == a.st.periodic_stops);
+    CHECK(b.st.toggle_sets == a.st.toggle_sets);
+    CHECKV(g_cc_got == g_cc_expected, "Command Complete %u of %u", g_cc_got, g_cc_expected);
+    CHECK(g_evt_bad == 0);
+    check_wifi_integrity();
+    check_accounting("steady");
+    check_no_violations();
+    close_all_and_check();
+}
+
+/* ================= interrupt interval ================= */
+static void t_qa_int_interval(void)
+{
+    for (uint8_t bi = 1; bi <= 16; bi++) {
+        struct usb_endpoint_descriptor e;
+        struct ehci_nxp_pipe *p;
+        uint32_t uf = 1U << (bi - 1), eff = uf > 8192 ? 8192 : uf, nent = 0, bad = 0, sm;
+        uint64_t polls0, polls;
+
+        bringup();
+        enumerate(40);
+        mk_ep(&e, 0x83, USB_ENDPOINT_TYPE_INTERRUPT, 16, bi);
+        stream_init(&s_evt, 0x83, 0, 0);
+        wk_init(&w_evt, &e, &s_evt, 64);
+        w_evt.rx = NULL;
+        w_evt.want = 1;
+        wk_register(&w_evt);
+        wk_submit(&w_evt);
+        pump_us(3000);
+        p = pipe_of(0x83, USB_ENDPOINT_TYPE_INTERRUPT);
+        CHECK(p != NULL);
+        if (!p) {
+            close_all_and_check();
+            continue;
+        }
+        for (uint32_t f = 0; f < CONFIG_USB_EHCI_FRAME_LIST_SIZE; f++) {
+            int has = (H()->framelist[f] & ~0x1FU) == ((uint32_t)(uintptr_t)&p->qh->hw & ~0x1FU);
+            int want = (f % (eff >= 8 ? eff / 8 : 1)) == 0;
+            nent += has;
+            bad += has != want;
+        }
+        sm = p->qh->hw.epcap & 0xff;
+        polls0 = g_dev_stats.in[3].naks + g_dev_stats.in[3].packets;
+        pump_us(2048000);
+        polls = g_dev_stats.in[3].naks + g_dev_stats.in[3].packets - polls0;
+        {
+            uint64_t expect = 16384 / eff;
+            int ok = polls + 1 >= expect && polls <= expect + 1;
+            printf("  bInterval %2u: %5u uframes, frame list entries %4u, S-mask %02x, polls in 2.048 s %lu "
+                   "(expected %lu)%s\n",
+                   bi, uf, nent, sm, (unsigned long)polls, (unsigned long)expect,
+                   uf > 8192 ? " [capped at the 1024-frame list]" : "");
+            CHECKV(bad == 0, "bInterval %u: %u frame list entries misplaced", bi, bad);
+            CHECKV(ok, "bInterval %u: %lu polls, expected %lu", bi, (unsigned long)polls, (unsigned long)expect);
+        }
+        check_no_violations();
+        close_all_and_check();
+    }
+}
+
+/* ================= page crossing and ZLP ================= */
+static struct usbh_urb g_qu;
+static volatile int g_qu_done, g_qu_res;
+static void qu_done(void *arg, int n)
+{
+    (void)arg;
+    g_qu_done = 1;
+    g_qu_res = n;
+}
+
+static int qu_run(struct usb_endpoint_descriptor *ep, uint8_t *buf, uint32_t len, uint8_t *toggle)
+{
+    memset(&g_qu, 0, sizeof(g_qu));
+    usbh_bulk_urb_fill(&g_qu, &g_hp, ep, buf, len, 0, qu_done, NULL);
+    g_qu.data_toggle = *toggle;
+    g_qu_done = 0;
+    if (usbh_submit_urb(&g_qu) != 0) {
+        return -1000;
+    }
+    for (int i = 0; i < 2000 && !g_qu_done; i++) {
+        pump_us(250);
+    }
+    if (!g_qu_done) {
+        size_t f = usb_osal_enter_critical_section();
+        usbh_kill_urb(&g_qu);
+        usb_osal_leave_critical_section(f);
+        return -2000;
+    }
+    *toggle = g_qu.data_toggle;
+    return g_qu_res;
+}
+
+static void t_qa_pages_zlp(void)
+{
+    const uint32_t sz = 3 * 65536;
+    uint8_t *ob, *ib, tog_o = 0, tog_i = 0;
+    uint32_t sent = 0, zlps = 0, got = 0, rx_bad = 0, multi = 0;
+
+    bringup();
+    enumerate(41);
+    g_dev_cfg.nak_permille = 100;
+    ob = sim_dma_alloc(sz, 4096);
+    ib = sim_dma_alloc(sz, 4096);
+    sim_cache_track(ob, sz, 0);
+    sim_cache_track(ib, sz, 1);
+    for (int i = 0; i < 400; i++) {
+        uint32_t off = (sim_rand() % 128) * 32, len;
+        int rc;
+
+        switch (i % 4) {
+        case 0: len = 512 * (1 + sim_rand() % 32); break;      /* 512-multiple: ZLP needed */
+        case 1: len = 16384; break;                            /* one full qTD, 5 pages if unaligned */
+        case 2: len = 8 + sim_rand() % 16376; break;
+        default: len = 4096 - off + sim_rand() % 64; break;    /* ends right after a page */
+        }
+        /* the device model keeps 16 KiB per OUT frame (sim_dev.c g_outbuf): multi-qTD OUT is
+           covered by the IN side (same qTD builder) and the base suite's 2 KiB frames */
+        len = sim_frame_wifi(ob + off, len, sent, 0x01);
+        sim_cache_cpu_wrote(ob + off, len);
+        multi += len > 16384;
+        rc = qu_run(&g_ep_out_data, ob + off, len, &tog_o);
+        CHECKV(rc == (int)len, "OUT %u bytes at offset %u: %d", len, off, rc);
+        if (len % 512 == 0) {
+            rc = qu_run(&g_ep_out_data, NULL, 0, &tog_o); /* the adapter's URB_ZERO_PACKET */
+            CHECKV(rc == 0, "ZLP after %u bytes: %d", len, rc);
+            zlps++;
+        }
+        sent++;
+        /* IN: a frame of any size into a 61440-byte URB at any offset */
+        sim_dev_in_enqueue(0x81, 1, 1, 60000);
+        rc = qu_run(&g_ep_in_data, ib + off, 61440, &tog_i);
+        if (rc > 0) {
+            int64_t seq;
+            sim_cache_invalidate((uintptr_t)(ib + off), (size_t)rc);
+            seq = sim_frame_check(ib + off, (uint32_t)rc, 0x81);
+            if (seq != (int64_t)got) {
+                rx_bad++;
+            }
+            got++;
+        } else {
+            CHECKV(0, "IN at offset %u: %d", off, rc);
+        }
+    }
+    printf("  page/ZLP: %u OUT frames (%u > 16 KiB, %u ZLPs), device got %lu (bad %lu order %lu); IN %u frames, "
+           "%u bad\n",
+           sent, multi, zlps, (unsigned long)g_dev_stats.out[1].frames, (unsigned long)g_dev_stats.out[1].bad,
+           (unsigned long)g_dev_stats.out[1].dup_or_gap, got, rx_bad);
+    CHECK(g_dev_stats.out[1].frames == sent && g_dev_stats.out[1].bad == 0 && g_dev_stats.out[1].dup_or_gap == 0);
+    CHECK(rx_bad == 0 && got == 400);
+    CHECK(g_dev_stats.toggle_errors == 0);
+    CHECKV(g_viol[V_CPAGE] == 0, "%u buffer page overruns", g_viol[V_CPAGE]);
+    check_no_violations();
+    sim_cache_untrack(ob);
+    sim_cache_untrack(ib);
+    sim_dma_free(ob);
+    sim_dma_free(ib);
+    close_all_and_check();
+}
+
+/* ================= deferred cancel under the adapter's kill loop ================= */
+static void t_qa_deferred_kill(void)
+{
+    uint32_t loops = 0;
+    uint64_t t0;
+    size_t f;
+
+    bringup();
+    enumerate(42);
+    stream_init(&s_in, 0x81, 0, 0);
+    wk_init(&w_in[0], &g_ep_in_data, &s_in, 4096);
+    wk_register(&w_in[0]);
+    wk_submit(&w_in[0]);
+    pump_us(5000);
+    CHECK(w_in[0].busy);
+    g_sim_cfg.as_delay_uf = 1600; /* USBSTS.AS follows USBCMD.ASE after 200 ms (> 100 ms bound) */
+    t0 = sim_now_ns();
+    /* aicwf_cherry_kill_urb(): CRIT_ENTER; for (;;) { REQ_HW: usbh_kill_urb(); continue; } */
+    f = usb_osal_enter_critical_section();
+    while (w_in[0].busy && loops < 100000) {
+        usbh_kill_urb(&w_in[0].urb);
+        loops++;
+    }
+    usb_osal_leave_critical_section(f);
+    printf("  deferred kill: %u usbh_kill_urb() calls under the critical section in %.1f ms simulated, "
+           "URB %s, handshake misses %u, deferred %u\n",
+           loops, (sim_now_ns() - t0) / 1e6, w_in[0].busy ? "STILL IN THE CONTROLLER (adapter loop spins forever)" :
+                                                            "completed",
+           H()->stats.handshake_timeouts, H()->stats.deferred);
+    CHECKV(!w_in[0].busy, "usbh_kill_urb() returned 0 %u times without completing the URB: "
+                          "aicwf_cherry_kill_urb() would spin with the critical section held, the "
+                          "usbh_irq thread (ehci_nxp_service) can never run", loops);
+    /* with the lock released, the glue's 2 ms poll finishes the cancel */
+    pump_glue_us(400000);
+    CHECKV(!w_in[0].busy, "deferred cancel never finished");
+    g_sim_cfg.as_delay_uf = 1;
+    check_accounting("deferred kill");
+    sim_viol_clear(); /* the forced AS lag is not a driver violation */
+    close_all_and_check();
+}
+
+/* ================= error storm and recovery ================= */
+static void t_qa_error_storm(void)
+{
+    uint64_t f0;
+
+    bringup();
+    enumerate(43);
+    g_sim_cfg.stale_cache = 1;
+    g_cc_expected = g_cc_got = g_ncp_pkts = g_evt_bad = 0;
+    g_cc_head = g_cc_tail = 0;
+    start_wifi(4, 2);
+    stream_init(&s_evt, 0x83, 0, 0);
+    wk_init(&w_evt, &g_ep_evt, &s_evt, 4096);
+    w_evt.rx = rx_events;
+    w_evt.want = 1;
+    wk_register(&w_evt);
+    sim_dev_in_enqueue(0x81, 1000000, 20, 1600);
+    g_dev_cfg.noresp_permille = 400;
+    g_dev_cfg.nak_permille = 300;
+    for (int ms = 0; ms < 2000; ms++) {
+        if (ms % 150 == 0) {
+            sim_dev_halt_ep(0x81);
+        }
+        if (ms % 150 == 75) {
+            int rc = ctrl(0x02, 1, 0, 0x81, 0, 500);
+            if (rc == 0) {
+                s_in.toggle = 0;
+            }
+        }
+        pump_us(1000);
+    }
+    g_dev_cfg.noresp_permille = 0;
+    g_dev_cfg.nak_permille = 0;
+    while (ctrl(0x02, 1, 0, 0x81, 0, 500) != 0) {
+        pump_us(1000);
+    }
+    s_in.toggle = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!w_in[i].busy) {
+            wk_submit(&w_in[i]);
+        }
+    }
+    pump_us(50000);
+    f0 = s_in.frames;
+    {
+        uint64_t o0 = s_out.frames, d0 = g_dev_stats.out[1].frames, bad0 = g_dev_stats.out[1].bad, tg0 = g_dev_stats.toggle_errors;
+        uint32_t cc0 = g_cc_expected;
+        for (int ms = 0; ms < 1000; ms++) {
+            if (ms % 50 == 0) {
+                CHECK(hci_cmd((uint16_t)(0x3000 + ms)) == 4);
+            }
+            pump_us(1000);
+        }
+        printf("  storm: xacterr restarts %u stalls %u errors %u; after: IN %lu OUT %lu frames, HCI %u/%u, "
+               "toggle errors during %lu after %lu\n",
+               H()->stats.xacterr_restarts, H()->stats.stalls, H()->stats.errors,
+               (unsigned long)(s_in.frames - f0), (unsigned long)(s_out.frames - o0), g_cc_got, g_cc_expected,
+               (unsigned long)tg0, (unsigned long)(g_dev_stats.toggle_errors - tg0));
+        CHECK(s_in.frames - f0 > 1000);
+        CHECK(s_out.frames - o0 > 1000);
+        CHECK(g_dev_stats.out[1].frames - d0 == s_out.frames - o0);
+        CHECK(g_dev_stats.out[1].bad == bad0);
+        CHECK(g_dev_stats.toggle_errors == tg0);
+        CHECK(g_cc_expected > cc0);
+    }
+    check_accounting("error storm");
+    check_no_violations();
+    close_all_and_check();
+}
+
+/* ================= soak: replug/re-enumeration without controller reset ================= */
+static void replug(uint8_t addr)
+{
+    struct pools p;
+    uint32_t st;
+
+    g_stop = 1;
+    for (int i = 0; i < g_nwk; i++) {
+        g_wk[i]->want = 0;
+    }
+    sim_port_disconnect();
+    pump_us(3000);
+    g_hp.connected = false;
+    {
+        size_t f = usb_osal_enter_critical_section();
+        usbh_kill_urb(&g_ctl_urb);
+        usb_osal_leave_critical_section(f);
+    }
+    pump_glue_us(5000);
+    p = pools_now();
+    CHECKV(p.pipes == 0 && p.xfers == 0 && p.qtds_free == CONFIG_USB_EHCI_QTD_NUM,
+           "after unplug: pipes %u xfers %u qtds %u", p.pipes, p.xfers, p.qtds_free);
+    CHECKV(busy_workers() == 0, "%d URBs never handed back", busy_workers());
+    for (int i = 0; i < g_nwk; i++) {
+        wk_free(g_wk[i]);
+    }
+    g_nwk = 0;
+    memset(&g_dev_stats, 0, sizeof(g_dev_stats));
+    sim_port_connect();
+    sim_advance_ms(2);
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_CLEAR_FEATURE,
+                 HUB_PORT_FEATURE_C_CONNECTION, 1, NULL) == 0);
+    CHECK(rh_req(USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_OTHER, HUB_REQUEST_SET_FEATURE, HUB_PORT_FEATURE_RESET, 1,
+                 NULL) == 0);
+    st = port_status();
+    CHECK(st & (1U << HUB_PORT_FEATURE_ENABLE));
+    hport_init();
+    g_stop = 0;
+    enumerate(addr);
+}
+
+static void t_qa_soak(void)
+{
+    const char *e = getenv("QA_SOAK");
+    uint64_t target = e && *e ? strtoull(e, NULL, 0) : 300000, total = 0;
+    uint32_t cycle = 0, fails0;
+    uint64_t kills = 0, tmo = 0;
+
+    bringup();
+    enumerate(50);
+    while (total < target && g_fail < 10) {
+        uint32_t ms_run = 300 + sim_rand() % 1200;
+        uint64_t c0 = H()->stats.completions;
+        uint64_t in_kills = 0;
+        char cfgdesc[96];
+
+        fails0 = g_fail;
+        g_sim_cfg.stale_cache = sim_rand() & 1;
+        g_sim_cfg.irq_latency_uf = sim_rand() % 4;
+        g_sim_cfg.as_lag_max_uf = (sim_rand() % 3 == 0) ? sim_rand() % 40 : 0;
+        g_sim_cfg.preempt = sim_rand() & 1;
+        g_dev_cfg.nak_permille = sim_rand() % 500;
+        g_dev_cfg.noresp_permille = sim_rand() % 8;
+        g_dev_cfg.msg_latency_uf = sim_rand() % 128;
+        g_cc_expected = g_cc_got = g_ncp_pkts = g_evt_bad = 0;
+        g_cc_head = g_cc_tail = 0;
+        start_wifi(1 + sim_rand() % 4, 1 + sim_rand() % 2);
+        for (int i = 0; i < 4; i++) {
+            w_in[i].timeout_ms = (sim_rand() % 3 == 0) ? 2 + sim_rand() % 30 : 0;
+        }
+        stream_init(&s_evt, 0x83, 0, 0);
+        wk_init(&w_evt, &g_ep_evt, &s_evt, 4096);
+        w_evt.rx = rx_events;
+        w_evt.want = 1;
+        wk_register(&w_evt);
+        stream_init(&s_ain, 0x84, 0, 0);
+        wk_init(&w_ain[0], &g_ep_acl_in, &s_ain, 4096);
+        w_ain[0].want = 1;
+        wk_register(&w_ain[0]);
+        for (uint32_t ms = 0; ms < ms_run; ms++) {
+            if (sim_rand() % 4 == 0) {
+                sim_dev_in_enqueue(0x81, 1 + sim_rand() % 6, 1, 4000);
+            }
+            if (ms % 40 == 0) {
+                sim_dev_in_enqueue(0x84, 1, 10, 900);
+            }
+            if (ms % 61 == 0) {
+                int n = hci_cmd((uint16_t)(0x2000 + (ms & 0xff)));
+                CHECKV(n == 4, "cycle %u HCI command %d", cycle, n);
+            }
+            pump_glue_us(1000);
+        }
+        /* quiesce: no new URBs, no errors, no timeouts, drain */
+        snprintf(cfgdesc, sizeof(cfgdesc), "nak %u noresp %u lag %u preempt %d stale %d irqlat %u",
+                 g_dev_cfg.nak_permille, g_dev_cfg.noresp_permille, g_sim_cfg.as_lag_max_uf, g_sim_cfg.preempt,
+                 g_sim_cfg.stale_cache, g_sim_cfg.irq_latency_uf);
+        for (int i = 0; i < g_nwk; i++) {
+            g_wk[i]->want = 0;
+        }
+        g_dev_cfg.nak_permille = 0;
+        g_dev_cfg.noresp_permille = 0;
+        for (int i = 0; i < 4; i++) {
+            in_kills += w_in[i].tmo;
+            w_in[i].timeout_ms = 0;
+        }
+        pump_glue_us(60000);
+        kills += in_kills;
+        tmo += in_kills;
+        CHECKV(s_in.bad <= in_kills, "cycle %u: %lu corrupt IN frames, %lu cancels", cycle, (unsigned long)s_in.bad,
+               (unsigned long)in_kills);
+        CHECKV(g_dev_stats.out[1].bad == 0 && g_dev_stats.out[1].dup_or_gap == 0, "cycle %u: OUT %lu bad %lu order",
+               cycle, (unsigned long)g_dev_stats.out[1].bad, (unsigned long)g_dev_stats.out[1].dup_or_gap);
+        CHECKV(g_dev_stats.out[1].frames == s_out.frames, "cycle %u: device %lu OUT frames, host %lu", cycle,
+               (unsigned long)g_dev_stats.out[1].frames, (unsigned long)s_out.frames);
+        CHECKV(g_dev_stats.toggle_errors == 0, "cycle %u: %lu toggle errors", cycle,
+               (unsigned long)g_dev_stats.toggle_errors);
+        CHECKV(g_cc_got == g_cc_expected && g_evt_bad == 0, "cycle %u: HCI %u/%u bad %u", cycle, g_cc_got,
+               g_cc_expected, g_evt_bad);
+        CHECKV(s_ain.bad == 0 && s_ain.gap == 0, "cycle %u: ACL IN bad %lu gap %lu", cycle, (unsigned long)s_ain.bad,
+               (unsigned long)s_ain.gap);
+        check_accounting("soak");
+        if (sim_viol_total()) {
+            printf("  cycle %u: violations\n", cycle);
+            check_no_violations();
+            sim_viol_clear();
+        }
+        total += H()->stats.completions - c0;
+        cycle++;
+        if (g_fail != fails0) {
+            printf("  cycle %u failed (%s)\n", cycle - 1, cfgdesc);
+        }
+        replug((uint8_t)(1 + cycle % 120));
+    }
+    printf("  soak: %u replug cycles without controller reset, %lu completions, %lu timeout kills, "
+           "kills %u, handshake misses %u, deferred %u, xacterr %u, max handshake %u us, t=%.1f s simulated\n",
+           cycle, (unsigned long)total, (unsigned long)tmo, H()->stats.kills, H()->stats.handshake_timeouts,
+           H()->stats.deferred, H()->stats.xacterr_restarts, H()->stats.max_handshake_us, sim_now_ns() / 1e9);
+    CHECK(total >= target);
+    check_no_violations();
+    close_all_and_check();
+}
+
+/* ================= runner ================= */
+static const struct {
+    const char *name;
+    void (*fn)(void);
+} k_qa[] = {
+    { "qa_idle_60s", t_qa_idle_60s },
+    { "qa_steady_cost", t_qa_steady_cost },
+    { "qa_int_interval", t_qa_int_interval },
+    { "qa_pages_zlp", t_qa_pages_zlp },
+    { "qa_deferred_kill", t_qa_deferred_kill },
+    { "qa_error_storm", t_qa_error_storm },
+    { "qa_soak", t_qa_soak },
+};
+
+int main(int argc, char **argv)
+{
+    int failed = 0, ran = 0;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    sim_init();
+    signal(SIGALRM, on_alarm);
+    for (unsigned i = 0; i < sizeof(k_qa) / sizeof(k_qa[0]); i++) {
+        int sel = argc < 2;
+        for (int a = 1; a < argc; a++) {
+            if (strstr(k_qa[i].name, argv[a])) {
+                sel = 1;
+            }
+        }
+        if (!sel) {
+            continue;
+        }
+        g_test = k_qa[i].name;
+        g_fail = 0;
+        printf("== %s\n", g_test);
+        alarm(3600);
+        k_qa[i].fn();
+        alarm(0);
+        printf("%s %s\n", g_fail ? "FAIL" : "PASS", g_test);
+        failed += g_fail != 0;
+        ran++;
+    }
+    printf("%d/%d qa tests passed\n", ran - failed, ran);
+    return failed ? 1 : 0;
+}
