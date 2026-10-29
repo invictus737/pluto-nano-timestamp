@@ -46,6 +46,9 @@
 #include "config_store.h"
 #include "netcmd.h"
 #include "ssh_server.h"
+/* ---- Bluetooth (rtos/bt) ---- */
+#include "nexus_bt.h"
+/* ---- end Bluetooth ---- */
 
 int nexus_wifi_start(const char *ssid, const char *psk);
 static void wifi80211_start(const char *ssid, const char *psk);
@@ -644,6 +647,10 @@ static void Init(rtems_task_argument arg)
   }
   nexus_config_shell_register();
   rtems_shell_add_cmd("abi", "misc", "abi [-v]: C layouts/constants vs the Rust libc crate", nexus_shell_abi);
+  /* ---- Bluetooth (rtos/bt): `bt` command; powers on when bt.enabled, reconnects the last sink ---- */
+  nexus_bt_shell_register();
+  nexus_bt_start();
+  /* ---- end Bluetooth ---- */
 #ifdef NEXUS_RUST_MAIN
   rtems_shell_add_cmd("nexus", "misc", "nexus start|stop|status: the nexus2 station", shell_nexus);
   nexus2_start();

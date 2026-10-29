@@ -80,6 +80,8 @@ clean:
 FORCE:
 .PHONY: all clean FORCE
 include ../libbsd/aic8800/aicwf.mk
+# Bluetooth (rtos/bt): BTstack A2DP source; must precede the libnexusrtos.a rule
+include ../bt/bt.mk
 
 # nexus2 build (rtos/ci/nexus2-link.sh): the C side as one library, Init starting nexus2's main().
 AR := $(RTEMS_TOOLS)/bin/arm-rtems6-ar
