@@ -53,6 +53,8 @@ static const uint8_t cdb_pandora_f2[16] = { 0xfd, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0xf2 };
 
 static eventhandler_tag aicms_etag;
+/* [USB] usb_aic_dc_switch=0 leaves the a69c:5721 driver CD alone (set by the app from the config) */
+int nexus_aicms_dc_switch = 1;
 
 /*
  * Mode switch as the AIC vendor tooling does it (sequence decoded by the RT-Smart K230 port,
@@ -179,6 +181,11 @@ aicms_autoinst(void *arg, struct usb_device *udev, struct usb_attach_arg *uaa)
 	    iface->idesc->bInterfaceClass != UICLASS_MASS)
 		return;
 
+	if (vid == AIC_VID && pid == 0x5721 && !nexus_aicms_dc_switch) {
+		printf("aic8800: %04x:%04x driver CD left alone (usb_aic_dc_switch=0)\n", vid, pid);
+		uaa->dev_state = UAA_DEV_EJECTING;
+		return;
+	}
 	err = aicms_switch(udev, iface->idesc->bInterfaceNumber, vid, pid);
 	printf("aic8800: %04x:%04x storage mode, switch command %s\n", vid, pid,
 	    err == 0 ? "sent" : usbd_errstr(err));

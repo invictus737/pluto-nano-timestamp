@@ -595,6 +595,32 @@ static void spawn(void *(*fn)(void *), int prio, size_t stack)
   pthread_attr_destroy(&at);
 }
 
+/* [USB] tuning keys: ChipIdea TXFILLTUNING (TX FIFO threshold, bits 21:16), SBUSCFG (AHB burst
+ * mode), BURSTSIZE; written live, every following transaction uses them */
+extern int nexus_aicms_dc_switch;
+static void usb_tunables_apply(void)
+{
+  struct { const char *key; uint32_t reg; uint32_t mask; unsigned shift; } t[] = {
+    {"usb_txfill", 0xE0002164u, 0x3fu << 16, 16},
+    {"usb_sbuscfg", 0xE0002090u, 0x7u, 0},
+    {"usb_burstsize", 0xE0002160u, 0xffffu, 0},
+  };
+  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); ++i) {
+    const char *v = nexus_config_get(t[i].key);
+    if (v != NULL && v[0] != '\0') {
+      volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)t[i].reg;
+      uint32_t val = (uint32_t)strtoul(v, NULL, 0);
+      *r = (*r & ~t[i].mask) | ((val << t[i].shift) & t[i].mask);
+      printf("usb: %s = 0x%x (reg 0x%08lx now 0x%08lx)\n", t[i].key, (unsigned)val,
+             (unsigned long)t[i].reg, (unsigned long)*r);
+    }
+  }
+  const char *dc = nexus_config_get("usb_aic_dc_switch");
+  if (dc != NULL && dc[0] == '0') {
+    nexus_aicms_dc_switch = 0;
+  }
+}
+
 static void Init(rtems_task_argument arg)
 {
   (void)arg;
@@ -623,6 +649,8 @@ static void Init(rtems_task_argument arg)
   if (nexus_config_init() != 0) {
     printf("config: init failed, running with defaults\n");
   }
+  usb_tunables_apply();
+
   {
     const char *hn = nexus_config_get("hostname"); /* [NETWORK] hostname, sent with DHCP */
     if (hn != NULL && hn[0] != '\0' && strlen(hn) <= 63) {

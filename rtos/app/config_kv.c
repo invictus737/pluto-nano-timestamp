@@ -371,6 +371,16 @@ static int v_01(char *v)
   return in_list(v, l);
 }
 
+static int v_u32(char *v)
+{
+  char *end = NULL;
+  if (v[0] == '\0') {
+    return -1;
+  }
+  (void)strtoul(v, &end, 0);
+  return (end != NULL && *end == '\0') ? 0 : -1;
+}
+
 static int v_usb_eth_mode(char *v)
 {
   static const char *const l[] = {"rndis", "ncm", "ecm", NULL};
@@ -388,6 +398,11 @@ typedef struct {
 
 static const keydef_t keys[] = {
   {"hostname", "NETWORK", CFG_F_UBOOT, v_hostname},
+  /* USB host controller tuning (Zynq ChipIdea), applied after the config loads */
+  {"usb_txfill", "USB", 0, v_u32},
+  {"usb_sbuscfg", "USB", 0, v_u32},
+  {"usb_burstsize", "USB", 0, v_u32},
+  {"usb_aic_dc_switch", "USB", 0, v_01},
   {"ipaddr", "NETWORK", CFG_F_UBOOT, v_ipv4},
   {"ipaddr_host", "NETWORK", CFG_F_UBOOT, v_ipv4},
   {"netmask", "NETWORK", CFG_F_UBOOT, v_netmask},
